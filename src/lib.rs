@@ -2,9 +2,11 @@ pub mod approval;
 #[cfg(feature = "cli")]
 pub mod cli;
 pub mod config;
+#[cfg(feature = "runtime")]
 pub mod engine;
 pub mod esaa;
 pub mod events;
+#[cfg(feature = "runtime")]
 pub mod llm;
 pub mod policy;
 #[cfg(feature = "python")]
@@ -42,5 +44,6 @@ pub use services::{
     langfuse::LangfuseService, start_configured_services, EventService, ServiceError,
     ServiceRunner,
 };
+#[cfg(feature = "runtime")]
 pub use llm::{create_provider, ChatRequest, ChatResponse, LlmError, LlmProvider};
 pub use types::{Message, StreamEvent, TokenUsage, ToolCallInfo, ToolDefinition};

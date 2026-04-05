@@ -22,7 +22,7 @@ regex = "1"
 log = "0.4"
 serde_yml = "0.0.12"
 miette = { version = "7", features = ["fancy"] }
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false, optional = true }
 pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 axum = { version = "0.7", optional = true }
@@ -30,9 +30,10 @@ axum = { version = "0.7", optional = true }
 [features]
 default = []
 python = ["pyo3"]
-cli = ["clap"]
-webhook = ["axum"]
-services = []
+cli = ["clap", "runtime"]
+runtime = ["reqwest"]
+webhook = ["axum", "runtime"]
+services = ["runtime"]
 
 [lib]
 name = "zymi_core"
