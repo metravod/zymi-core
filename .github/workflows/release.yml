@@ -18,9 +18,10 @@ jobs:
           # Linux x86_64
           - os: ubuntu-latest
             target: x86_64
-          # Linux aarch64
+          # Linux aarch64 (Docker/QEMU — need explicit -i)
           - os: ubuntu-latest
             target: aarch64
+            args-extra: -i python3.11
           # macOS x86_64 (Intel, cross-compiled on Apple Silicon)
           - os: macos-14
             target: x86_64
@@ -39,7 +40,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist
+          args: --release --out dist ${{ matrix.args-extra }}
           manylinux: auto
       - uses: actions/upload-artifact@v4
         with:
@@ -82,7 +83,7 @@ jobs:
 
   publish:
     name: Publish to PyPI
-    needs: [build, sdist, publish-testpypi]
+    needs: [publish-testpypi]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
