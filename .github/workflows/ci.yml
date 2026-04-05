@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust (test + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --features services,webhook
+      - run: cargo clippy --all-features -- -D warnings
+
+  python-smoke:
+    name: Python ${{ matrix.python }} smoke
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.9", "3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: pip install maturin
+      - run: maturin build --out dist
+      - run: pip install dist/*.whl
+      - name: Smoke test
+        run: |
+          python -c "
+          from zymi_core import Event, EventStore, EventBus, ToolRegistry
+          import tempfile, os
+          db = os.path.join(tempfile.mkdtemp(), 'test.db')
+          store = EventStore(db)
+          bus = EventBus(store)
+          sub = bus.subscribe()
+          event = Event(
+              stream_id='ci-test',
+              kind={'type': 'UserMessageReceived', 'data': {'content': {'User': 'hello'}, 'connector': 'ci'}},
+              source='ci',
+          )
+          bus.publish(event)
+          received = sub.try_recv()
+          assert received.kind_tag == 'user_message_received'
+          print('smoke test OK')
+          "

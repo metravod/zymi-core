@@ -1,0 +1,55 @@
+[package]
+name = "zymi-core"
+version = "0.1.0"
+edition = "2021"
+description = "Event-sourced agent engine with boundary contracts, hash-chain audit, and declarative pipelines"
+repository = "https://github.com/metravod/zymi-core"
+license = "MIT"
+keywords = ["ai", "agent", "event-sourcing", "llm", "orchestration"]
+categories = ["asynchronous", "database"]
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.34", features = ["bundled"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+sha2 = "0.10"
+regex = "1"
+log = "0.4"
+serde_yml = "0.0.12"
+miette = { version = "7", features = ["fancy"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
+axum = { version = "0.7", optional = true }
+
+[features]
+default = []
+python = ["pyo3"]
+cli = ["clap"]
+webhook = ["axum"]
+services = []
+
+[lib]
+name = "zymi_core"
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "zymi"
+path = "src/bin/zymi.rs"
+required-features = ["cli"]
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["full", "test-util"] }
+futures = "0.3"
+tower = { version = "0.5", features = ["util"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

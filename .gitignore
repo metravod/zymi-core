@@ -1,0 +1,25 @@
+/target
+/dist
+*.swp
+*.swo
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.so
+*.pyd
+
+# Project-local
+/.drift
+/.claude
+CLAUDE.md
+AGENTS.md
+TESTING.md
