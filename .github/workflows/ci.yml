@@ -38,6 +38,7 @@ jobs:
       - run: maturin build --out dist
       - run: pip install dist/*.whl
       - name: Smoke test
+        working-directory: /tmp
         run: |
           python -c "
           from zymi_core import Event, EventStore, EventBus, ToolRegistry
