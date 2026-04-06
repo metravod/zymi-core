@@ -99,8 +99,15 @@ enum Command {
 
 /// Run the CLI. Called from the binary entry point.
 pub fn run() {
-    let cli = Cli::parse();
+    dispatch(Cli::parse());
+}
 
+/// Run the CLI with explicit arguments (used by the Python entry point).
+pub fn run_from_args(args: impl IntoIterator<Item = String>) {
+    dispatch(Cli::parse_from(args));
+}
+
+fn dispatch(cli: Cli) {
     let result = match cli.command {
         Command::Init { name, example } => init::exec(name, example.as_deref()),
         Command::Run {

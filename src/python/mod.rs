@@ -25,6 +25,13 @@ pub(crate) fn runtime() -> &'static Runtime {
     })
 }
 
+/// Run the CLI from Python with explicit argv (e.g. `["zymi", "init"]`).
+#[cfg(feature = "cli")]
+#[pyfunction]
+fn cli_main(args: Vec<String>) {
+    crate::cli::run_from_args(args);
+}
+
 /// The native Python module. Importable as `import _zymi_core`.
 #[pymodule]
 fn _zymi_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -33,5 +40,7 @@ fn _zymi_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyEventBus>()?;
     m.add_class::<PySubscription>()?;
     m.add_class::<PyToolRegistry>()?;
+    #[cfg(feature = "cli")]
+    m.add_function(wrap_pyfunction!(cli_main, m)?)?;
     Ok(())
 }

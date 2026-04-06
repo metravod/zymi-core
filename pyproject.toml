@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "zymi-core"
 version = "0.1.0"
-description = "Event-sourced agent engine — Python bindings for event store, event bus, and tool registry"
+description = "Event-sourced agent engine — CLI and Python bindings for auditable AI workflows"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.9"
@@ -27,10 +27,13 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
 ]
 
+[project.scripts]
+zymi = "zymi_core._cli:main"
+
 [project.urls]
 Repository = "https://github.com/metravod/zymi-core"
 
 [tool.maturin]
-features = ["python"]
+features = ["python", "cli"]
 module-name = "zymi_core._zymi_core"
 python-source = "."
