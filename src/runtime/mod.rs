@@ -18,18 +18,18 @@
 //! pipeline run; the `Runtime` is the single canonical wiring point those
 //! entrypoints share.
 //!
-//! What this slice deliberately does **not** do (tracked under "Runtime
-//! unification" in `.drift/project.json`):
-//!
-//! - Pull the Python bridge through `Runtime` — Python still goes via the
-//!   CLI subprocess path. That is slice 2.
-//! - Introduce a standalone `EventCommandRouter` for cross-process command
-//!   delivery. The `BUS → CMD` translation in `zymi serve` is still inline
-//!   in `cli/serve.rs`. That is slice 3, when there is a second caller.
-//! - Multi-provider routing, projection-backed aggregates, recovery — all
-//!   downstream goals.
+//! Slices 1–3 of the runtime unification have landed: slice 1 introduced
+//! `Runtime` + `RunPipeline` handler + `ActionExecutor`, slice 2 ported the
+//! Python bridge to the same wiring (see `python/py_runtime.rs`), and slice
+//! 3 lifted the `BUS → CMD` translation out of `cli/serve.rs` into
+//! [`event_router::EventCommandRouter`]. What this module deliberately still
+//! does **not** do (tracked under "Runtime unification" in
+//! `.drift/project.json`): multi-provider routing, projection-backed
+//! aggregates, recovery, and a real backpressure / lag policy for
+//! [`crate::events::store::StoreTailWatcher`].
 
 pub mod action_executor;
+pub mod event_router;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -45,6 +45,7 @@ use crate::llm::{self, LlmProvider};
 use crate::policy::PolicyEngine;
 
 pub use action_executor::{ActionContext, ActionExecutor, BuiltinActionExecutor};
+pub use event_router::EventCommandRouter;
 
 /// Default polling interval for [`crate::events::store::StoreTailWatcher`]
 /// when a `Runtime` is built without an explicit override. Matches the

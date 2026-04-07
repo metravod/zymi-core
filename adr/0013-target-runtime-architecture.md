@@ -2,7 +2,7 @@
 
 Date: 2026-04-07
 
-Status: Partially implemented — slices 1 and 2 landed on 2026-04-07 (Runtime/AppContext + RunPipeline command/handler + ActionExecutor split; PyO3 `Runtime` bridge). See "Slice 1 — what landed" and "Slice 2 — what landed" below. Slice 3 (`EventCommandRouter` extraction) is still open and tracked under "Runtime unification" in `.drift/project.json`. Once slice 3 lands or is retired, this draft will be promoted to a binding ADR.
+Status: Implemented — slices 1, 2 and 3 landed on 2026-04-07 (Runtime/AppContext + `RunPipeline` command/handler + `ActionExecutor` split; PyO3 `Runtime` bridge; `EventCommandRouter` for the `BUS → CMD` path). See the "Slice 1/2/3 — what landed" sections below. The remaining "Open questions" (aggregate rehydration, projection-backed handlers, `StoreTailWatcher` lag policy) stay open as downstream goals; once at least the `StoreTailWatcher` lag policy is decided, this draft will be promoted to a binding ADR.
 
 ## Context
 
@@ -209,6 +209,27 @@ Python stops shelling out to `cli_main`: it builds a [`Runtime`] and dispatches 
 - **`zymi_core/__init__.py`** — re-exports `Runtime`, `RunPipelineResult`, `StepResult` alongside the existing classes, so `from zymi_core import Runtime` works in user scripts.
 
 Pluggable Python approval handlers (where a Python callable is invoked from inside the tokio runtime under the GIL) and asyncio integration are **not** in slice 2 — they are follow-ups. Python users today get the same fail-closed terminal prompt the CLI uses, or `approval="none"`.
+
+## Slice 3 — what landed (2026-04-07)
+
+Slice 1 had explicitly deferred the `EventCommandRouter` extraction "until a second async command type appears, since premature extraction would be a one-caller abstraction". Slice 3 lands the extraction *anyway*, with one async command type, on a deliberate call from the project owner. Recording the reasoning so a future reader does not assume the original deferral was wrong:
+
+- The translation block in `cli/serve.rs` had grown to ~120 lines (workspace check, correlation/stream id derivation, spawn, completion publish, error mapping). It was no longer "one match arm" — it was a serve-specific subsystem that happened to live in the adapter.
+- Every future cross-process command (`DecideApproval`, `ProcessConversation`, …) now has an obvious extension point — a sibling match arm and `handle_*` method on [`EventCommandRouter`] — instead of forcing the next contributor to first reverse-engineer the inline version inside `cli/serve.rs`.
+- The cost is small: one new file, one re-export, and `cli/serve.rs` shrinks to startup wiring + ctrl_c. There is no new trait, no plugin system, no registry — premature only in the strict "one-caller" sense, not in the "speculative abstraction" sense.
+
+What changed:
+
+- **`src/runtime/event_router.rs`** — new module owning the `BUS → CMD` translation. [`EventCommandRouter::new(runtime)`] subscribes to `runtime.bus()` on [`run`](crate::runtime::EventCommandRouter::run); [`with_pipeline_filter`](crate::runtime::EventCommandRouter::with_pipeline_filter) preserves the `zymi serve <pipeline>` semantics where one serve process is bound to one pipeline. `dispatch` matches on event kind, spawns one tokio task per accepted request, and publishes the matching `PipelineCompleted` on the originating `correlation_id`/`stream_id` (or fabricates them if the inbound event was missing them, same fallback the inline version had). `publish_completion` moved into this module as a private helper.
+- **`src/runtime/mod.rs`** — registers and re-exports `EventCommandRouter`. The "slice 3 deferred" paragraph in the module-level doc was replaced with a one-line summary of where slices 1–3 landed and what is still open.
+- **`src/lib.rs`** — adds `EventCommandRouter` to the `runtime::*` re-export so external callers (future schedulers, Python hosts, integration tests) can import it from the crate root.
+- **`src/cli/serve.rs`** — `serve_loop` is now build-runtime, spawn-watcher, `EventCommandRouter::new(rt).with_pipeline_filter(name).run()`, ctrl_c, stop watcher. The unused `mpsc`/`Uuid`/`run_pipeline`/`Event`/`EventKind`/`commands::RunPipeline` imports are gone. Operator-facing `"received PipelineRequested..."` log line moved into the router so any future BUS→CMD adapter (not just `cli/serve.rs`) gets it for free.
+
+What slice 3 explicitly does **not** do:
+
+- It does not introduce a registry / trait / plugin model for routes. Adding a second route is still "edit the `dispatch` match and add a `handle_*` method", because that's all the second route will need until a third caller appears.
+- It does not change the watcher contract or the lag policy — that is the next item under "Runtime unification" in `.drift/project.json`.
+- It does not change the public Python or HTTP surface.
 
 ## Consequences
 

@@ -59,7 +59,7 @@ pub use llm::{create_provider, ChatRequest, ChatResponse, LlmError, LlmProvider}
 pub use commands::RunPipeline;
 #[cfg(feature = "runtime")]
 pub use runtime::{
-    ActionContext, ActionExecutor, BuiltinActionExecutor, Runtime, RuntimeBuilder,
-    DEFAULT_TAIL_POLL_INTERVAL,
+    ActionContext, ActionExecutor, BuiltinActionExecutor, EventCommandRouter, Runtime,
+    RuntimeBuilder, DEFAULT_TAIL_POLL_INTERVAL,
 };
 pub use types::{Message, StreamEvent, TokenUsage, ToolCallInfo, ToolDefinition};
