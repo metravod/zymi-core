@@ -1,8 +1,12 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
+use crate::approval::ApprovalHandler;
 use crate::config::load_project_dir;
 use crate::engine;
+
+use super::approval::TerminalApprovalHandler;
 
 pub fn exec(pipeline: &str, raw_inputs: &[String], root: impl AsRef<Path>) -> Result<(), String> {
     let root = root.as_ref();
@@ -47,12 +51,15 @@ pub fn exec(pipeline: &str, raw_inputs: &[String], root: impl AsRef<Path>) -> Re
         inputs.insert(key.to_string(), value.to_string());
     }
 
+    let approval_handler: Arc<dyn ApprovalHandler> = Arc::new(TerminalApprovalHandler::new());
+
     let rt = super::runtime();
     let result = rt.block_on(engine::run_pipeline(
         &workspace,
         &pipeline_config,
         root,
         &inputs,
+        Some(approval_handler),
     ))?;
 
     // Print final output

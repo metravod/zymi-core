@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use uuid::Uuid;
 
+use crate::approval::ApprovalHandler;
 use crate::config::{AgentConfig, PipelineConfig, WorkspaceConfig};
 use crate::esaa::contracts::ContractEngine;
 use crate::esaa::orchestrator::{Orchestrator, OrchestratorResult};
@@ -41,11 +42,17 @@ pub struct PipelineResult {
 
 /// Execute a full pipeline end-to-end. Used by `zymi run` — owns its own
 /// store/bus and generates a fresh correlation_id.
+///
+/// `approval_handler` is honoured for any tool call that the contract layer
+/// flags as `RequiresHumanApproval`. Pass `None` only in non-interactive
+/// contexts (tests, dry runs); production entrypoints must pass a real
+/// handler so the safety contract is not silently downgraded.
 pub async fn run_pipeline(
     workspace: &WorkspaceConfig,
     pipeline: &PipelineConfig,
     project_root: &Path,
     inputs: &HashMap<String, String>,
+    approval_handler: Option<Arc<dyn ApprovalHandler>>,
 ) -> Result<PipelineResult, String> {
     // 1. Create infrastructure
     let store_dir = project_root.join(".zymi");
@@ -64,6 +71,7 @@ pub async fn run_pipeline(
         bus,
         store,
         Uuid::new_v4(),
+        approval_handler,
     )
     .await
 }
@@ -72,6 +80,9 @@ pub async fn run_pipeline(
 /// correlation_id. This is the entry point used by `zymi serve` so that the
 /// store and bus are shared across many requests, and correlation_ids match
 /// the originating `PipelineRequested` events.
+///
+/// See [`run_pipeline`] for the `approval_handler` contract.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_pipeline_for_request(
     workspace: &WorkspaceConfig,
     pipeline: &PipelineConfig,
@@ -80,6 +91,7 @@ pub async fn run_pipeline_for_request(
     bus: Arc<EventBus>,
     _store: Arc<dyn EventStore>,
     correlation_id: Uuid,
+    approval_handler: Option<Arc<dyn ApprovalHandler>>,
 ) -> Result<PipelineResult, String> {
     let policy = Arc::new(PolicyEngine::new(workspace.project.policy.clone()));
     let contracts = Arc::new(ContractEngine::new(
@@ -169,6 +181,7 @@ pub async fn run_pipeline_for_request(
             let stream_id = stream_id.clone();
             let project_root = project_root.to_path_buf();
             let defaults = workspace.project.defaults.clone();
+            let approval_handler = approval_handler.clone();
 
             handles.push(tokio::spawn(async move {
                 run_agent_step(
@@ -184,6 +197,7 @@ pub async fn run_pipeline_for_request(
                     correlation_id,
                     &project_root,
                     defaults.max_iterations,
+                    approval_handler,
                 )
                 .await
             }));
@@ -259,6 +273,7 @@ async fn run_agent_step(
     correlation_id: Uuid,
     project_root: &Path,
     default_max_iterations: usize,
+    approval_handler: Option<Arc<dyn ApprovalHandler>>,
 ) -> Result<StepResult, String> {
     let max_iterations = agent.max_iterations.unwrap_or(default_max_iterations);
     let tool_defs = tool_definitions_for_agent(&agent.tools);
@@ -424,7 +439,7 @@ async fn run_agent_step(
                             &intention,
                             stream_id,
                             correlation_id,
-                            None, // No approval handler in CLI mode for now
+                            approval_handler.as_deref(),
                         )
                         .await;
 

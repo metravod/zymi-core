@@ -1,3 +1,4 @@
+mod approval;
 mod events;
 mod init;
 mod replay;

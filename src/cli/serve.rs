@@ -5,12 +5,14 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use crate::approval::ApprovalHandler;
 use crate::config::load_project_dir;
 use crate::engine;
 use crate::events::bus::EventBus;
 use crate::events::store::{open_store, StoreBackend, StoreTailWatcher};
 use crate::events::{Event, EventKind};
 
+use super::approval::TerminalApprovalHandler;
 use super::store_path;
 
 /// Run a pipeline as a long-lived event-driven service.
@@ -85,6 +87,10 @@ async fn serve_loop(
         .with_interval(Duration::from_millis(poll_interval_ms))
         .spawn();
 
+    // Single shared handler so prompts from concurrent pipeline runs are
+    // serialised on the operator's terminal.
+    let approval_handler: Arc<dyn ApprovalHandler> = Arc::new(TerminalApprovalHandler::new());
+
     let mut requests: mpsc::Receiver<Arc<Event>> = bus.subscribe().await;
 
     println!(
@@ -116,6 +122,7 @@ async fn serve_loop(
             let store = Arc::clone(&store);
             let root = root.clone();
             let pipeline_name = pipeline.clone();
+            let approval_handler = Arc::clone(&approval_handler);
 
             println!(
                 "  -> received PipelineRequested for '{pipeline}' (corr={correlation_id}, stream={stream_id})"
@@ -147,6 +154,7 @@ async fn serve_loop(
                     Arc::clone(&bus),
                     Arc::clone(&store),
                     correlation_id,
+                    Some(approval_handler),
                 )
                 .await;
 
