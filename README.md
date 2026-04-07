@@ -9,7 +9,7 @@ Event-sourced agent engine for auditable AI workflows in Rust, YAML, and Python.
 - **Auditable by default**: every state change is persisted as an event with hash-chain verification.
 - **Safer side effects**: agents emit intentions first; contracts and approvals decide what is allowed to execute.
 - **Practical workflows**: define agents and DAG pipelines in YAML, then run them from a small CLI.
-- **Flexible integration points**: use the Rust crate, Python bindings, or both.
+- **Flexible integration points**: use the Rust crate, Python bindings, or both — Python can drive pipelines directly via `Runtime.for_project(...).run_pipeline(...)`, no subprocess.
 - **LLM-provider ready**: OpenAI-compatible providers, Anthropic support, Python tools, and LangFuse event services.
 
 ## Installation
@@ -139,7 +139,30 @@ output:
 
 ## Python Bindings
 
-The same `pip install zymi-core` that gives you the CLI also exposes `Event`, `EventBus`, `EventStore`, `Subscription`, and `ToolRegistry` for programmatic use.
+The same `pip install zymi-core` that gives you the CLI also exposes a `Runtime` for running pipelines directly, plus the lower-level `Event`, `EventBus`, `EventStore`, `Subscription`, and `ToolRegistry` primitives for custom integrations.
+
+### Run a pipeline from Python
+
+```python
+from zymi_core import Runtime
+
+# Loads project.yml + agents/ + pipelines/ from the given directory and
+# builds the same Runtime `zymi run` and `zymi serve` use. `approval` is
+# either "terminal" (fail-closed prompt on stdin, matches `zymi run`) or
+# "none" (intentions tagged RequiresHumanApproval resolve to a deny).
+rt = Runtime.for_project(".", approval="terminal")
+
+result = rt.run_pipeline("research", {"topic": "rust event sourcing"})
+print(result.success, result.final_output)
+for step in result.step_results:
+    print(step.step_id, step.iterations, step.success)
+```
+
+`rt.bus()` and `rt.store()` hand out Python wrappers over the runtime's
+own `Arc`s, so any subscriber you attach there sees exactly the events
+the handler publishes — there is no second bus over the same SQLite file.
+
+### Tool registry and event primitives
 
 ```python
 from zymi_core import ToolRegistry
@@ -228,6 +251,13 @@ print(result.kind)  # {"type": "PipelineCompleted", "data": {...}}
 Because the SQLite store is the single source of truth, you also get
 free auditing: `zymi events --stream web-req-...` shows everything that
 happened during the run, and `zymi verify` checks the hash chain.
+
+Inside `zymi serve` the `PipelineRequested → RunPipeline` translation is
+done by `EventCommandRouter` (see
+[ADR-0013](adr/0013-target-runtime-architecture.md)). It is re-exported
+from `zymi_core::runtime`, so if you are building your own scheduler or
+bot adapter you can wire the same router against your own `Runtime`
+without copy-pasting `cli/serve.rs`.
 
 ## Rust Crate
 
