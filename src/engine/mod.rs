@@ -12,7 +12,7 @@ use crate::esaa::contracts::ContractEngine;
 use crate::esaa::orchestrator::{Orchestrator, OrchestratorResult};
 use crate::esaa::Intention;
 use crate::events::bus::EventBus;
-use crate::events::store::SqliteEventStore;
+use crate::events::store::{open_store, EventStore, StoreBackend};
 use crate::events::{Event, EventKind};
 use crate::llm::{self, ChatRequest, ChatResponse, LlmProvider};
 use crate::policy::PolicyEngine;
@@ -39,7 +39,8 @@ pub struct PipelineResult {
     pub success: bool,
 }
 
-/// Execute a full pipeline end-to-end.
+/// Execute a full pipeline end-to-end. Used by `zymi run` — owns its own
+/// store/bus and generates a fresh correlation_id.
 pub async fn run_pipeline(
     workspace: &WorkspaceConfig,
     pipeline: &PipelineConfig,
@@ -51,12 +52,35 @@ pub async fn run_pipeline(
     std::fs::create_dir_all(&store_dir)
         .map_err(|e| format!("failed to create .zymi directory: {e}"))?;
     let db_path = store_dir.join("events.db");
-    let store = Arc::new(
-        SqliteEventStore::new(&db_path)
-            .map_err(|e| format!("failed to create event store: {e}"))?,
-    );
-    let bus = Arc::new(EventBus::new(store));
+    let store = open_store(StoreBackend::Sqlite { path: db_path })
+        .map_err(|e| format!("failed to create event store: {e}"))?;
+    let bus = Arc::new(EventBus::new(Arc::clone(&store)));
 
+    run_pipeline_for_request(
+        workspace,
+        pipeline,
+        project_root,
+        inputs,
+        bus,
+        store,
+        Uuid::new_v4(),
+    )
+    .await
+}
+
+/// Execute a pipeline using a pre-existing bus/store and a caller-supplied
+/// correlation_id. This is the entry point used by `zymi serve` so that the
+/// store and bus are shared across many requests, and correlation_ids match
+/// the originating `PipelineRequested` events.
+pub async fn run_pipeline_for_request(
+    workspace: &WorkspaceConfig,
+    pipeline: &PipelineConfig,
+    project_root: &Path,
+    inputs: &HashMap<String, String>,
+    bus: Arc<EventBus>,
+    _store: Arc<dyn EventStore>,
+    correlation_id: Uuid,
+) -> Result<PipelineResult, String> {
     let policy = Arc::new(PolicyEngine::new(workspace.project.policy.clone()));
     let contracts = Arc::new(ContractEngine::new(
         policy,
@@ -82,7 +106,6 @@ pub async fn run_pipeline(
     let stream_id = format!("pipeline-{}-{}", pipeline.name, Uuid::new_v4());
 
     // Emit pipeline start event
-    let correlation_id = Uuid::new_v4();
     emit_event(
         &bus,
         &stream_id,

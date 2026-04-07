@@ -66,6 +66,9 @@ zymi init --example research
 zymi run main -i task="Summarize the architecture"
 zymi run research -i topic="Rust event sourcing"
 
+# Long-running mode: react to PipelineRequested events from any process
+zymi serve research
+
 zymi events
 zymi events --stream conversation-1
 zymi events --kind LlmCallCompleted --json
@@ -174,6 +177,58 @@ bus.publish(event)
 received = subscription.try_recv()
 ```
 
+## Multi-Process Integration (Django, Celery, scripts)
+
+The Python wrapper for `EventStore` opens the same SQLite file the Rust
+side uses. There is no second IPC channel — events written from one
+process are visible to every other process that opens the same store, and
+a long-running `zymi serve` picks them up via a polling tail watcher
+(see [ADR-0012](adr/0012-cross-process-event-delivery.md)).
+
+The canonical pattern: a web app publishes a `PipelineRequested` event,
+`zymi serve` runs the pipeline, and the result comes back as a
+`PipelineCompleted` event with the same `correlation_id`.
+
+Terminal A — long-running Rust service:
+
+```bash
+cd my-zymi-project
+zymi serve research
+```
+
+Terminal B — any Python process (e.g. a Django view):
+
+```python
+import uuid
+from zymi_core import Event, EventBus, EventStore
+
+store = EventStore(".zymi/events.db")
+bus = EventBus(store)
+
+correlation_id = str(uuid.uuid4())
+sub = bus.subscribe_correlation(correlation_id)
+
+event = Event(
+    stream_id=f"web-req-{correlation_id}",
+    kind={"type": "PipelineRequested", "data": {
+        "pipeline": "research",
+        "inputs": {"topic": "rust event sourcing"},
+    }},
+    source="django",
+)
+event.with_correlation(correlation_id)
+bus.publish(event)
+
+# Block until the serve process publishes PipelineCompleted with the
+# same correlation_id (timeout in seconds).
+result = sub.recv(timeout_secs=300)
+print(result.kind)  # {"type": "PipelineCompleted", "data": {...}}
+```
+
+Because the SQLite store is the single source of truth, you also get
+free auditing: `zymi events --stream web-req-...` shows everything that
+happened during the run, and `zymi verify` checks the hash chain.
+
 ## Rust Crate
 
 Add the crate to your `Cargo.toml`:
@@ -187,9 +242,9 @@ Example:
 
 ```rust
 use std::sync::Arc;
-use zymi_core::{Event, EventBus, EventKind, Message, SqliteEventStore};
+use zymi_core::{open_store, Event, EventBus, EventKind, Message, StoreBackend};
 
-let store = Arc::new(SqliteEventStore::new("events.db")?);
+let store = open_store(StoreBackend::Sqlite { path: "events.db".into() })?;
 let bus = EventBus::new(store.clone());
 
 let mut rx = bus.subscribe().await;
@@ -208,6 +263,22 @@ let received = rx.recv().await.unwrap();
 assert_eq!(received.kind_tag(), "user_message_received");
 
 let verified_count = store.verify_chain("conversation-1").await?;
+```
+
+For cross-process delivery in your own binary, spawn a `StoreTailWatcher`
+on the same store/bus — it polls for events written by other processes
+and fans them out into local subscribers without re-persisting them:
+
+```rust
+use std::time::Duration;
+use zymi_core::StoreTailWatcher;
+
+let watcher = StoreTailWatcher::new(store.clone(), bus.clone())
+    .with_interval(Duration::from_millis(100))
+    .spawn();
+
+// ... later, on shutdown:
+watcher.stop().await;
 ```
 
 ## How It Works

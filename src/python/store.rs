@@ -1,19 +1,22 @@
-use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use pyo3::prelude::*;
 
-use crate::events::store::{EventStore, SqliteEventStore};
+use crate::events::store::{open_store, EventStore, StoreBackend};
 
 use super::event::PyEvent;
 use super::runtime;
 
-/// Python wrapper for SqliteEventStore.
+/// Python wrapper for the Rust [`EventStore`] trait.
 ///
-/// All async operations run on a shared tokio runtime with GIL released.
+/// All async operations run on a shared tokio runtime with the GIL released.
+/// The concrete backend is selected by the constructor; today only SQLite is
+/// supported, but `inner` is `Arc<dyn EventStore>` so swapping backends is a
+/// matter of adding a new constructor (e.g. `EventStore.libsql(...)`).
 #[pyclass(name = "EventStore")]
 pub struct PyEventStore {
-    pub(crate) inner: Arc<SqliteEventStore>,
+    pub(crate) inner: Arc<dyn EventStore>,
 }
 
 #[pymethods]
@@ -24,11 +27,9 @@ impl PyEventStore {
     ///     path: Path to the SQLite database file.
     #[new]
     fn new(path: &str) -> PyResult<Self> {
-        let store = SqliteEventStore::new(Path::new(path))
+        let inner = open_store(StoreBackend::Sqlite { path: PathBuf::from(path) })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("{e}")))?;
-        Ok(Self {
-            inner: Arc::new(store),
-        })
+        Ok(Self { inner })
     }
 
     /// Append an event to its stream. Assigns the next sequence number.

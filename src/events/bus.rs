@@ -85,6 +85,37 @@ impl EventBus {
         Ok(())
     }
 
+    /// Deliver an already-persisted event to local subscribers **without** touching
+    /// the store. Used by [`StoreTailWatcher`](super::store::StoreTailWatcher) to
+    /// fan out events produced by other processes.
+    ///
+    /// Calling `publish` here would re-append the event, breaking the hash chain
+    /// and producing a duplicate global cursor entry — `redeliver` is the safe path.
+    pub async fn redeliver(&self, event: Arc<Event>) {
+        let subs = self.subscribers.read().await;
+        if subs.is_empty() {
+            return;
+        }
+        let tag = event.kind_tag();
+        let mut delivered = 0usize;
+        let mut dropped = 0usize;
+        for sub in subs.iter() {
+            if !sub.accepts(&event) {
+                continue;
+            }
+            match sub.tx.try_send(Arc::clone(&event)) {
+                Ok(()) => delivered += 1,
+                Err(_) => dropped += 1,
+            }
+        }
+        if dropped > 0 {
+            log::warn!(
+                "EventBus: {tag} redelivered to {delivered}/{} subscribers ({dropped} dropped)",
+                subs.len()
+            );
+        }
+    }
+
     /// Subscribe to all events. Returns a bounded receiver.
     ///
     /// If the subscriber falls behind by more than `DEFAULT_CHANNEL_CAPACITY` events,

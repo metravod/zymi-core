@@ -2,6 +2,7 @@ mod events;
 mod init;
 mod replay;
 mod run;
+mod serve;
 mod verify;
 
 use std::path::{Path, PathBuf};
@@ -78,6 +79,20 @@ enum Command {
         dir: Option<PathBuf>,
     },
 
+    /// Run a pipeline as a long-lived service that reacts to PipelineRequested events
+    Serve {
+        /// Pipeline name to serve
+        pipeline: String,
+
+        /// Polling interval for the cross-process store watcher (ms)
+        #[arg(long, default_value = "100")]
+        poll_interval_ms: u64,
+
+        /// Project root directory (defaults to cwd)
+        #[arg(short = 'd', long)]
+        dir: Option<PathBuf>,
+    },
+
     /// Replay events from a stream
     Replay {
         /// Stream ID to replay
@@ -131,6 +146,11 @@ fn dispatch(cli: Cli) {
         Command::Verify { stream, dir } => {
             verify::exec(stream.as_deref(), resolve_root(dir.as_deref()))
         }
+        Command::Serve {
+            pipeline,
+            poll_interval_ms,
+            dir,
+        } => serve::exec(&pipeline, poll_interval_ms, resolve_root(dir.as_deref())),
         Command::Replay {
             stream_id,
             from,

@@ -1,6 +1,8 @@
 use std::path::Path;
 
-use crate::events::store::{EventStore, SqliteEventStore};
+use std::sync::Arc;
+
+use crate::events::store::{open_store, EventStore, StoreBackend};
 
 use super::{runtime, store_path};
 
@@ -13,7 +15,7 @@ pub fn exec(stream: Option<&str>, root: impl AsRef<Path>) -> Result<(), String> 
         ));
     }
 
-    let store = SqliteEventStore::new(&db_path)
+    let store = open_store(StoreBackend::Sqlite { path: db_path.clone() })
         .map_err(|e| format!("failed to open event store: {e}"))?;
 
     let rt = runtime();
@@ -56,7 +58,7 @@ pub fn exec(stream: Option<&str>, root: impl AsRef<Path>) -> Result<(), String> 
 }
 
 fn verify_stream(
-    store: &SqliteEventStore,
+    store: &Arc<dyn EventStore>,
     rt: &tokio::runtime::Runtime,
     stream_id: &str,
 ) -> Result<(), String> {

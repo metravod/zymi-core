@@ -6,58 +6,12 @@ use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
-use super::{Event, EventStoreError};
+use crate::events::{Event, EventStoreError};
 
-/// Append-only event store. Events are immutable once written.
-#[async_trait]
-pub trait EventStore: Send + Sync {
-    /// Append an event to its stream. Assigns the next sequence number.
-    /// Returns the assigned sequence number.
-    async fn append(&self, event: &mut Event) -> Result<u64, EventStoreError>;
+use super::event_store::{EventStore, TailedEvent};
 
-    /// Read all events in a stream starting from `from_seq` (inclusive).
-    async fn read_stream(
-        &self,
-        stream_id: &str,
-        from_seq: u64,
-    ) -> Result<Vec<Event>, EventStoreError>;
-
-    /// Read events across all streams, ordered by insertion (global sequence).
-    /// `from_global_seq` is the `id` (autoincrement) lower bound (exclusive).
-    async fn read_all(
-        &self,
-        from_global_seq: u64,
-        limit: usize,
-    ) -> Result<Vec<Event>, EventStoreError>;
-
-    /// Get the last sequence number for a stream, or 0 if empty.
-    async fn last_sequence(&self, stream_id: &str) -> Result<u64, EventStoreError>;
-
-    /// Count events in a stream, optionally filtered by kind tag.
-    async fn count(
-        &self,
-        stream_id: &str,
-        kind_tag: Option<&str>,
-    ) -> Result<u64, EventStoreError>;
-
-    /// Verify the hash chain for a stream. Returns Ok(count) if all hashes are valid,
-    /// or an error describing the first broken link.
-    async fn verify_chain(&self, stream_id: &str) -> Result<u64, EventStoreError>;
-
-    /// List all distinct stream IDs with their event counts.
-    async fn list_streams(&self) -> Result<Vec<(String, u64)>, EventStoreError>;
-
-    /// Find "orphaned" inbound events: events of `inbound_tag` whose correlation_id
-    /// has no corresponding event of `completion_tag` in the store.
-    /// Used for recovery after restart.
-    async fn find_unmatched(
-        &self,
-        inbound_tag: &str,
-        completion_tag: &str,
-    ) -> Result<Vec<Event>, EventStoreError>;
-}
-
-/// SQLite-backed event store. Uses the same DB file as ConversationStorage.
+/// SQLite-backed event store. Persists every event with a hash chain
+/// per stream and an autoincrement global cursor used by the watcher.
 pub struct SqliteEventStore {
     conn: Arc<Mutex<Connection>>,
 }
@@ -245,31 +199,57 @@ impl EventStore for SqliteEventStore {
         from_global_seq: u64,
         limit: usize,
     ) -> Result<Vec<Event>, EventStoreError> {
+        let tailed = self.tail(from_global_seq, limit).await?;
+        Ok(tailed.into_iter().map(|t| t.event).collect())
+    }
+
+    async fn tail(
+        &self,
+        after_global_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<TailedEvent>, EventStoreError> {
         let conn = self.conn.clone();
 
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             let mut stmt = conn
                 .prepare(
-                    "SELECT data FROM events WHERE id > ?1 ORDER BY id ASC LIMIT ?2",
+                    "SELECT id, data FROM events WHERE id > ?1 ORDER BY id ASC LIMIT ?2",
                 )
                 .map_err(|e| EventStoreError::Connection(e.to_string()))?;
 
             let rows = stmt
-                .query_map(rusqlite::params![from_global_seq, limit], |row| {
-                    let data: String = row.get(0)?;
-                    Ok(data)
+                .query_map(rusqlite::params![after_global_seq, limit], |row| {
+                    let id: u64 = row.get(0)?;
+                    let data: String = row.get(1)?;
+                    Ok((id, data))
                 })
                 .map_err(|e| EventStoreError::Connection(e.to_string()))?;
 
             let mut events = Vec::new();
             for row in rows {
-                let data = row.map_err(|e| EventStoreError::Connection(e.to_string()))?;
+                let (global_seq, data) =
+                    row.map_err(|e| EventStoreError::Connection(e.to_string()))?;
                 let event: Event = serde_json::from_str(&data)
                     .map_err(|e| EventStoreError::Serialization(e.to_string()))?;
-                events.push(event);
+                events.push(TailedEvent { global_seq, event });
             }
             Ok(events)
+        })
+        .await
+        .map_err(|e| EventStoreError::Connection(e.to_string()))?
+    }
+
+    async fn current_global_seq(&self) -> Result<u64, EventStoreError> {
+        let conn = self.conn.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let seq: u64 = conn
+                .prepare("SELECT COALESCE(MAX(id), 0) FROM events")
+                .and_then(|mut s| s.query_row([], |row| row.get(0)))
+                .map_err(|e| EventStoreError::Connection(e.to_string()))?;
+            Ok(seq)
         })
         .await
         .map_err(|e| EventStoreError::Connection(e.to_string()))?
@@ -450,8 +430,8 @@ impl EventStore for SqliteEventStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Message;
     use crate::events::EventKind;
+    use crate::types::Message;
     use tempfile::TempDir;
 
     async fn setup() -> (TempDir, SqliteEventStore) {
@@ -590,6 +570,88 @@ mod tests {
 
         let limited = store.read_all(0, 1).await.unwrap();
         assert_eq!(limited.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn tail_returns_in_global_order() {
+        let (_dir, store) = setup().await;
+        let mut e1 = make_event(
+            "s1",
+            EventKind::AgentProcessingStarted {
+                conversation_id: "s1".into(),
+            },
+        );
+        let mut e2 = make_event(
+            "s2",
+            EventKind::AgentProcessingStarted {
+                conversation_id: "s2".into(),
+            },
+        );
+        let mut e3 = make_event(
+            "s1",
+            EventKind::AgentProcessingCompleted {
+                conversation_id: "s1".into(),
+                success: true,
+            },
+        );
+
+        store.append(&mut e1).await.unwrap();
+        store.append(&mut e2).await.unwrap();
+        store.append(&mut e3).await.unwrap();
+
+        let tailed = store.tail(0, 100).await.unwrap();
+        assert_eq!(tailed.len(), 3);
+        assert_eq!(tailed[0].global_seq, 1);
+        assert_eq!(tailed[1].global_seq, 2);
+        assert_eq!(tailed[2].global_seq, 3);
+        assert_eq!(tailed[0].event.kind_tag(), "agent_processing_started");
+        assert_eq!(tailed[2].event.kind_tag(), "agent_processing_completed");
+    }
+
+    #[tokio::test]
+    async fn tail_respects_after_cursor() {
+        let (_dir, store) = setup().await;
+        for i in 0..5 {
+            let mut e = make_event(
+                "s1",
+                EventKind::AgentProcessingStarted {
+                    conversation_id: format!("c{i}"),
+                },
+            );
+            store.append(&mut e).await.unwrap();
+        }
+
+        let after_two = store.tail(2, 100).await.unwrap();
+        assert_eq!(after_two.len(), 3);
+        assert_eq!(after_two[0].global_seq, 3);
+
+        let limited = store.tail(0, 2).await.unwrap();
+        assert_eq!(limited.len(), 2);
+        assert_eq!(limited[0].global_seq, 1);
+        assert_eq!(limited[1].global_seq, 2);
+    }
+
+    #[tokio::test]
+    async fn current_global_seq_matches_last_tailed() {
+        let (_dir, store) = setup().await;
+        assert_eq!(store.current_global_seq().await.unwrap(), 0);
+
+        let mut e1 = make_event(
+            "s1",
+            EventKind::AgentProcessingStarted {
+                conversation_id: "s1".into(),
+            },
+        );
+        let mut e2 = make_event(
+            "s2",
+            EventKind::AgentProcessingStarted {
+                conversation_id: "s2".into(),
+            },
+        );
+        store.append(&mut e1).await.unwrap();
+        store.append(&mut e2).await.unwrap();
+
+        assert_eq!(store.current_global_seq().await.unwrap(), 2);
     }
 
     #[tokio::test]

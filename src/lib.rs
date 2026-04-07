@@ -29,7 +29,10 @@ pub use esaa::{
 pub use events::{
     bus::EventBus,
     connector::{ConnectorError, EventDrivenConnector},
-    store::{EventStore, SqliteEventStore},
+    store::{
+        open_store, EventStore, SqliteEventStore, StoreBackend, StoreTailWatcher, TailedEvent,
+        WatcherHandle,
+    },
     stream_registry::StreamRegistry,
     Event, EventKind, EventStoreError,
 };

@@ -3,6 +3,8 @@ pub mod connector;
 pub mod store;
 pub mod stream_registry;
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -150,6 +152,23 @@ pub enum EventKind {
     WorkflowCompleted {
         success: bool,
     },
+
+    // -- Pipeline service contract (cross-process trigger/result) --
+    /// External request to run a named pipeline. Published by clients
+    /// (e.g. Django) and consumed by `zymi serve <pipeline>`.
+    /// `correlation_id` on the envelope is used to match the response.
+    PipelineRequested {
+        pipeline: String,
+        inputs: HashMap<String, String>,
+    },
+    /// Result of a pipeline run, published by `zymi serve` with the same
+    /// `correlation_id` as the originating [`PipelineRequested`].
+    PipelineCompleted {
+        pipeline: String,
+        success: bool,
+        final_output: Option<String>,
+        error: Option<String>,
+    },
 }
 
 impl EventKind {
@@ -173,6 +192,8 @@ impl EventKind {
             EventKind::WorkflowNodeStarted { .. } => "workflow_node_started",
             EventKind::WorkflowNodeCompleted { .. } => "workflow_node_completed",
             EventKind::WorkflowCompleted { .. } => "workflow_completed",
+            EventKind::PipelineRequested { .. } => "pipeline_requested",
+            EventKind::PipelineCompleted { .. } => "pipeline_completed",
         }
     }
 }
@@ -217,6 +238,38 @@ mod tests {
         assert_eq!(event.stream_id, "conv-1");
         assert_eq!(event.correlation_id, Some(corr));
         assert_eq!(event.kind_tag(), "agent_processing_started");
+    }
+
+    #[test]
+    fn pipeline_requested_serialization_roundtrip() {
+        let mut inputs = HashMap::new();
+        inputs.insert("topic".into(), "rust event sourcing".into());
+        let kind = EventKind::PipelineRequested {
+            pipeline: "research".into(),
+            inputs,
+        };
+        let json = serde_json::to_string(&kind).unwrap();
+        let back: EventKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.tag(), "pipeline_requested");
+        if let EventKind::PipelineRequested { pipeline, inputs } = back {
+            assert_eq!(pipeline, "research");
+            assert_eq!(inputs.get("topic").unwrap(), "rust event sourcing");
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn pipeline_completed_serialization_roundtrip() {
+        let kind = EventKind::PipelineCompleted {
+            pipeline: "research".into(),
+            success: true,
+            final_output: Some("done".into()),
+            error: None,
+        };
+        let json = serde_json::to_string(&kind).unwrap();
+        let back: EventKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.tag(), "pipeline_completed");
     }
 
     #[test]

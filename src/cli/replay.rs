@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::events::store::{EventStore, SqliteEventStore};
+use crate::events::store::{open_store, StoreBackend};
 use crate::events::EventKind;
 
 use super::{runtime, store_path};
@@ -19,7 +19,7 @@ pub fn exec(
         ));
     }
 
-    let store = SqliteEventStore::new(&db_path)
+    let store = open_store(StoreBackend::Sqlite { path: db_path.clone() })
         .map_err(|e| format!("failed to open event store: {e}"))?;
 
     let rt = runtime();

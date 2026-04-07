@@ -10,12 +10,12 @@ ADR-0005 established that Python components are event-driven participants on the
 
 The PyO3 bridge lives behind an optional `python` Cargo feature and exposes four classes:
 
-| Python class   | Rust type          | Purpose                                   |
-|----------------|--------------------|--------------------------------------------|
-| `Event`        | `events::Event`    | Create, inspect, serialize/deserialize events |
-| `EventStore`   | `SqliteEventStore` | Open/create SQLite store, read/write events   |
-| `EventBus`     | `EventBus`         | Publish events, create subscriptions          |
-| `Subscription` | `mpsc::Receiver`   | Blocking/non-blocking receive, Python iteration |
+| Python class   | Rust type           | Purpose                                   |
+|----------------|---------------------|--------------------------------------------|
+| `Event`        | `events::Event`     | Create, inspect, serialize/deserialize events |
+| `EventStore`   | `Arc<dyn EventStore>` | Open/create a store, read/write events. Concrete backend (SQLite today) is selected by the constructor; see ADR-0012. |
+| `EventBus`     | `EventBus`          | Publish events, create subscriptions          |
+| `Subscription` | `mpsc::Receiver`    | Blocking/non-blocking receive, Python iteration |
 
 Key design choices:
 
