@@ -2,7 +2,7 @@
 
 Date: 2026-04-07
 
-Status: Draft — proposed direction for the runtime unification work tracked in `.drift/project.json`. Not yet a committed decision; will be refined into a binding ADR once the first slice (Runtime/AppContext + command/handler shape) lands.
+Status: Partially implemented — slice 1 (Runtime/AppContext + RunPipeline command/handler + ActionExecutor split) landed on 2026-04-07; see "Slice 1 — what landed" below. Slices 2 and 3 (Python bridge port, EventCommandRouter extraction) are still open and tracked under "Runtime unification" in `.drift/project.json`. Once slice 2 lands this draft will be promoted to a binding ADR.
 
 ## Context
 
@@ -180,6 +180,24 @@ flowchart TB
 - **Crate boundaries vs module boundaries.** The four layers can be enforced as separate crates (`zymi-domain`, `zymi-app`, `zymi-infra`, `zymi-adapters`) or as modules inside `zymi-core` with discipline. Splitting crates pays for itself only if we expect external consumers of the domain layer.
 - **`StoreTailWatcher` poll/lag policy** is currently a hidden default (~100ms). It belongs in the runtime contract, not in `events::store::watcher.rs` as a constant. Will be promoted as part of runtime unification.
 - **Backpressure on projections.** If a projection lags the bus, do we drop, block, or buffer? Undecided; depends on whether projections become load-bearing (memory read model) or stay read-mostly (audit).
+
+## Slice 1 — what landed (2026-04-07)
+
+The smallest viable slice from the "Next steps" section is now in `main`:
+
+- **`src/runtime/`** — `Runtime` + `RuntimeBuilder` own the per-project wiring (workspace, project root, store, bus, LLM provider, contracts, orchestrator, approval handler, action executor, tail poll interval). Defaults match the inline construction the old engine entrypoints did, so behaviour is preserved.
+- **`src/commands.rs`** — only [`RunPipeline`] is shipped; the other three commands from v1.1 are deferred until they have a real caller.
+- **`src/handlers/run_pipeline.rs`** — canonical pipeline execution path. Body is the former `engine::run_pipeline_for_request` loop, but it pulls every dependency from the runtime instead of constructing it locally, and routes approved tool calls through `ActionExecutor` instead of calling `execute_builtin_tool` directly.
+- **`src/runtime/action_executor.rs`** — `ActionExecutor` trait + `BuiltinActionExecutor` default implementation. Per-call `ActionContext` carries the per-run `MemoryStore` so memory stays isolated between runs even when many runs share one runtime (preserves today's `zymi serve` behaviour).
+- **`src/engine/mod.rs`** — `engine::run_pipeline` and `engine::run_pipeline_for_request` survive as `#[deprecated]` thin wrappers that build a `Runtime` and dispatch the new handler. Existing tests and external callers keep working.
+- **`src/cli/run.rs`** — builds a `Runtime` once with a `TerminalApprovalHandler`, dispatches `RunPipeline::new(...)`. No more direct `engine::run_pipeline` call.
+- **`src/cli/serve.rs`** — builds a `Runtime` once at startup, spawns the `StoreTailWatcher` against `runtime.store()/bus()` with `runtime.tail_poll_interval()`, and on each matching `PipelineRequested` event dispatches `RunPipeline::from_request(...)`. The poll interval is now a runtime field, not a hidden 100 ms constant.
+
+What this **does not** include (still under "Runtime unification" in `.drift/project.json`):
+
+- **Python bridge port (slice 2).** Python still drives pipelines through `cli_main`, not through `Runtime` directly. A `PyRuntime` / `PyRunPipeline` surface is the next slice.
+- **`EventCommandRouter` extraction (slice 3).** The `PipelineRequested → RunPipeline` translation is still inlined in `cli/serve.rs`. Extraction is deferred until a second async command type appears, since premature extraction would be a one-caller abstraction.
+- Aggregate rehydration vs read-model-backed handlers, projection-backed memory, recovery — all still downstream of the event-sourced workflow memory goal.
 
 ## Consequences
 

@@ -3,8 +3,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::approval::ApprovalHandler;
+use crate::commands::RunPipeline;
 use crate::config::load_project_dir;
-use crate::engine;
+use crate::handlers::run_pipeline;
+use crate::runtime::Runtime;
 
 use super::approval::TerminalApprovalHandler;
 
@@ -21,21 +23,17 @@ pub fn exec(pipeline: &str, raw_inputs: &[String], root: impl AsRef<Path>) -> Re
     let workspace =
         load_project_dir(root).map_err(|e| format!("failed to load project: {e}"))?;
 
-    let pipeline_config = workspace
-        .pipelines
-        .get(pipeline)
-        .ok_or_else(|| {
-            let available: Vec<&str> = workspace.pipelines.keys().map(|s| s.as_str()).collect();
-            format!(
-                "pipeline '{pipeline}' not found. Available: {}",
-                if available.is_empty() {
-                    "(none)".to_string()
-                } else {
-                    available.join(", ")
-                }
-            )
-        })?
-        .clone();
+    let pipeline_config = workspace.pipelines.get(pipeline).ok_or_else(|| {
+        let available: Vec<&str> = workspace.pipelines.keys().map(|s| s.as_str()).collect();
+        format!(
+            "pipeline '{pipeline}' not found. Available: {}",
+            if available.is_empty() {
+                "(none)".to_string()
+            } else {
+                available.join(", ")
+            }
+        )
+    })?;
 
     println!("Pipeline: {}", pipeline_config.name);
     if let Some(desc) = &pipeline_config.description {
@@ -53,16 +51,15 @@ pub fn exec(pipeline: &str, raw_inputs: &[String], root: impl AsRef<Path>) -> Re
 
     let approval_handler: Arc<dyn ApprovalHandler> = Arc::new(TerminalApprovalHandler::new());
 
-    let rt = super::runtime();
-    let result = rt.block_on(engine::run_pipeline(
-        &workspace,
-        &pipeline_config,
-        root,
-        &inputs,
-        Some(approval_handler),
-    ))?;
+    let runtime = Runtime::builder(workspace, root.to_path_buf())
+        .with_approval_handler(approval_handler)
+        .build()?;
 
-    // Print final output
+    let cmd = RunPipeline::new(pipeline.to_string(), inputs);
+
+    let rt = super::runtime();
+    let result = rt.block_on(run_pipeline::handle(&runtime, cmd))?;
+
     println!("---");
     if result.success {
         println!("Pipeline completed successfully.");

@@ -6,25 +6,34 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::approval::ApprovalHandler;
+use crate::commands::RunPipeline;
 use crate::config::load_project_dir;
-use crate::engine;
 use crate::events::bus::EventBus;
-use crate::events::store::{open_store, StoreBackend, StoreTailWatcher};
+use crate::events::store::StoreTailWatcher;
 use crate::events::{Event, EventKind};
+use crate::handlers::run_pipeline;
+use crate::runtime::Runtime;
 
 use super::approval::TerminalApprovalHandler;
 use super::store_path;
 
 /// Run a pipeline as a long-lived event-driven service.
 ///
-/// On startup, opens the project's event store, spawns a [`StoreTailWatcher`]
-/// to fan out cross-process events into the local bus, then subscribes to
+/// On startup, builds a [`Runtime`] for the project (which opens the event
+/// store and creates the in-process bus), spawns a [`StoreTailWatcher`] to
+/// fan out cross-process events into the local bus, then subscribes to
 /// [`EventKind::PipelineRequested`] events targeted at `pipeline_name`.
-/// Each matching request spawns a pipeline run; on completion the service
+/// Each matching request is translated into a [`RunPipeline`] command and
+/// dispatched at [`run_pipeline::handle`]; on completion the service
 /// publishes a [`EventKind::PipelineCompleted`] event with the same
-/// `correlation_id`, allowing clients (Django, scripts, etc.) to await
-/// the result with [`EventBus::subscribe_correlation`] or via
+/// `correlation_id`, allowing clients (Django, scripts, etc.) to await the
+/// result with [`EventBus::subscribe_correlation`] or via
 /// [`crate::events::EventDrivenConnector`].
+///
+/// Slice 1 of the runtime unification (ADR-0013) keeps the
+/// `PipelineRequested → RunPipeline` translation inline here. Slice 3 will
+/// extract it into a standalone `EventCommandRouter` once a second async
+/// command type appears.
 pub fn exec(
     pipeline_name: &str,
     poll_interval_ms: u64,
@@ -74,31 +83,29 @@ async fn serve_loop(
     root: PathBuf,
     poll_interval_ms: u64,
 ) -> Result<(), String> {
-    let store_dir = root.join(".zymi");
-    std::fs::create_dir_all(&store_dir)
-        .map_err(|e| format!("failed to create .zymi directory: {e}"))?;
-    let db_path = store_path(&root);
-
-    let store = open_store(StoreBackend::Sqlite { path: db_path.clone() })
-        .map_err(|e| format!("failed to open event store: {e}"))?;
-    let bus = Arc::new(EventBus::new(Arc::clone(&store)));
-
-    let watcher = StoreTailWatcher::new(Arc::clone(&store), Arc::clone(&bus))
-        .with_interval(Duration::from_millis(poll_interval_ms))
-        .spawn();
-
     // Single shared handler so prompts from concurrent pipeline runs are
     // serialised on the operator's terminal.
     let approval_handler: Arc<dyn ApprovalHandler> = Arc::new(TerminalApprovalHandler::new());
 
-    let mut requests: mpsc::Receiver<Arc<Event>> = bus.subscribe().await;
+    let runtime = Arc::new(
+        Runtime::builder(workspace, root.clone())
+            .with_approval_handler(Arc::clone(&approval_handler))
+            .with_tail_poll_interval(Duration::from_millis(poll_interval_ms))
+            .build()?,
+    );
 
+    let watcher = StoreTailWatcher::new(Arc::clone(runtime.store()), Arc::clone(runtime.bus()))
+        .with_interval(runtime.tail_poll_interval())
+        .spawn();
+
+    let mut requests: mpsc::Receiver<Arc<Event>> = runtime.bus().subscribe().await;
+
+    let db_path = store_path(&root);
     println!(
         "zymi serve: listening for PipelineRequested events targeting '{pipeline_name}'\n  store: {}\n  poll:  {poll_interval_ms}ms\n  press Ctrl+C to stop",
         db_path.display()
     );
 
-    let workspace = Arc::new(workspace);
     let pipeline_filter = pipeline_name.clone();
 
     let run_loop = async {
@@ -117,54 +124,41 @@ async fn serve_loop(
             let correlation_id = event.correlation_id.unwrap_or_else(Uuid::new_v4);
             let stream_id = event.stream_id.clone();
 
-            let workspace = Arc::clone(&workspace);
-            let bus = Arc::clone(&bus);
-            let store = Arc::clone(&store);
-            let root = root.clone();
-            let pipeline_name = pipeline.clone();
-            let approval_handler = Arc::clone(&approval_handler);
+            let runtime = Arc::clone(&runtime);
 
             println!(
                 "  -> received PipelineRequested for '{pipeline}' (corr={correlation_id}, stream={stream_id})"
             );
 
             tokio::spawn(async move {
-                let pipeline_config = match workspace.pipelines.get(&pipeline_name) {
-                    Some(p) => p.clone(),
-                    None => {
-                        publish_completion(
-                            &bus,
-                            &stream_id,
-                            correlation_id,
-                            &pipeline_name,
-                            false,
-                            None,
-                            Some(format!("pipeline '{pipeline_name}' not found")),
-                        )
-                        .await;
-                        return;
-                    }
-                };
+                if !runtime.workspace().pipelines.contains_key(&pipeline) {
+                    publish_completion(
+                        runtime.bus(),
+                        &stream_id,
+                        correlation_id,
+                        &pipeline,
+                        false,
+                        None,
+                        Some(format!("pipeline '{pipeline}' not found")),
+                    )
+                    .await;
+                    return;
+                }
 
-                let result = engine::run_pipeline_for_request(
-                    &workspace,
-                    &pipeline_config,
-                    &root,
-                    &inputs,
-                    Arc::clone(&bus),
-                    Arc::clone(&store),
+                let cmd = RunPipeline::from_request(
+                    pipeline.clone(),
+                    inputs,
                     correlation_id,
-                    Some(approval_handler),
-                )
-                .await;
+                    stream_id.clone(),
+                );
 
-                match result {
+                match run_pipeline::handle(&runtime, cmd).await {
                     Ok(pr) => {
                         publish_completion(
-                            &bus,
+                            runtime.bus(),
                             &stream_id,
                             correlation_id,
-                            &pipeline_name,
+                            &pipeline,
                             pr.success,
                             pr.final_output,
                             None,
@@ -173,10 +167,10 @@ async fn serve_loop(
                     }
                     Err(err) => {
                         publish_completion(
-                            &bus,
+                            runtime.bus(),
                             &stream_id,
                             correlation_id,
-                            &pipeline_name,
+                            &pipeline,
                             false,
                             None,
                             Some(err),
@@ -227,4 +221,3 @@ async fn publish_completion(
         log::error!("failed to publish PipelineCompleted: {e}");
     }
 }
-

@@ -1,17 +1,23 @@
 pub mod approval;
 #[cfg(feature = "cli")]
 pub mod cli;
+#[cfg(feature = "runtime")]
+pub mod commands;
 pub mod config;
 #[cfg(feature = "runtime")]
 pub mod engine;
 pub mod esaa;
 pub mod events;
 #[cfg(feature = "runtime")]
+pub mod handlers;
+#[cfg(feature = "runtime")]
 pub mod llm;
 pub mod policy;
 #[cfg(feature = "python")]
 #[allow(clippy::useless_conversion)]
 pub mod python;
+#[cfg(feature = "runtime")]
+pub mod runtime;
 pub mod types;
 #[cfg(feature = "services")]
 pub mod services;
@@ -49,4 +55,11 @@ pub use services::{
 };
 #[cfg(feature = "runtime")]
 pub use llm::{create_provider, ChatRequest, ChatResponse, LlmError, LlmProvider};
+#[cfg(feature = "runtime")]
+pub use commands::RunPipeline;
+#[cfg(feature = "runtime")]
+pub use runtime::{
+    ActionContext, ActionExecutor, BuiltinActionExecutor, Runtime, RuntimeBuilder,
+    DEFAULT_TAIL_POLL_INTERVAL,
+};
 pub use types::{Message, StreamEvent, TokenUsage, ToolCallInfo, ToolDefinition};
