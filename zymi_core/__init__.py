@@ -7,6 +7,9 @@ from zymi_core._zymi_core import (
     Event,
     EventBus,
     EventStore,
+    RunPipelineResult,
+    Runtime,
+    StepResult,
     Subscription,
     ToolRegistry,
 )
@@ -15,6 +18,9 @@ __all__ = [
     "Event",
     "EventBus",
     "EventStore",
+    "RunPipelineResult",
+    "Runtime",
+    "StepResult",
     "Subscription",
     "ToolRegistry",
 ]

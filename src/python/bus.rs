@@ -20,6 +20,17 @@ pub struct PyEventBus {
     pub(crate) inner: Arc<EventBus>,
 }
 
+impl PyEventBus {
+    /// Wrap a pre-existing `Arc<EventBus>`. Used by
+    /// [`super::runtime::PyRuntime`] so Python subscribers see the same
+    /// events the runtime publishes, without constructing a second bus on
+    /// top of the same store.
+    #[cfg(feature = "runtime")]
+    pub(crate) fn from_arc(inner: Arc<EventBus>) -> Self {
+        Self { inner }
+    }
+}
+
 #[pymethods]
 impl PyEventBus {
     /// Create a new EventBus backed by the given EventStore.

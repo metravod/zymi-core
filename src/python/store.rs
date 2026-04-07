@@ -19,6 +19,16 @@ pub struct PyEventStore {
     pub(crate) inner: Arc<dyn EventStore>,
 }
 
+impl PyEventStore {
+    /// Wrap a pre-existing `Arc<dyn EventStore>`. Used by [`super::runtime::PyRuntime`]
+    /// so Python callers can inspect the same store the runtime uses, instead
+    /// of opening a fresh one that would race on SQLite.
+    #[cfg(feature = "runtime")]
+    pub(crate) fn from_arc(inner: Arc<dyn EventStore>) -> Self {
+        Self { inner }
+    }
+}
+
 #[pymethods]
 impl PyEventStore {
     /// Open or create a SQLite-backed event store.

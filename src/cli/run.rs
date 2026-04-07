@@ -2,13 +2,11 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::approval::ApprovalHandler;
+use crate::approval::{ApprovalHandler, TerminalApprovalHandler};
 use crate::commands::RunPipeline;
 use crate::config::load_project_dir;
 use crate::handlers::run_pipeline;
 use crate::runtime::Runtime;
-
-use super::approval::TerminalApprovalHandler;
 
 pub fn exec(pipeline: &str, raw_inputs: &[String], root: impl AsRef<Path>) -> Result<(), String> {
     let root = root.as_ref();

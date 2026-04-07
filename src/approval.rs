@@ -75,6 +75,93 @@ impl ApprovalHandler for ContextualApprovalHandler {
     }
 }
 
+/// Terminal-based [`ApprovalHandler`] for interactive operators.
+///
+/// Prompts on stdout / reads y/N from stdin. Used by `zymi run`,
+/// `zymi serve`, and the Python `Runtime` binding when
+/// `approval="terminal"` (the default). Lives at the root of the
+/// approval module so it is available to any caller that enables the
+/// `runtime` feature, not just the `cli` feature.
+///
+/// The blocking IO runs inside [`tokio::task::spawn_blocking`] so the
+/// runtime is not stalled, and a [`tokio::sync::Mutex`] serialises
+/// prompts across parallel agent steps so concurrent loops do not
+/// interleave on the terminal.
+///
+/// Default policy on EOF / non-tty / IO error: **deny**. If we cannot
+/// ask the human, we do not approve — that is the whole point of
+/// having a handler in the first place.
+pub struct TerminalApprovalHandler {
+    /// Serialises prompts so parallel agent steps don't interleave
+    /// their questions on the terminal.
+    lock: tokio::sync::Mutex<()>,
+}
+
+impl TerminalApprovalHandler {
+    pub fn new() -> Self {
+        Self {
+            lock: tokio::sync::Mutex::new(()),
+        }
+    }
+}
+
+impl Default for TerminalApprovalHandler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl ApprovalHandler for TerminalApprovalHandler {
+    async fn request_approval(
+        &self,
+        tool_description: &str,
+        explanation: Option<&str>,
+    ) -> Result<bool, String> {
+        let _guard = self.lock.lock().await;
+
+        let description = tool_description.to_string();
+        let explanation = explanation.map(|s| s.to_string());
+
+        tokio::task::spawn_blocking(move || {
+            terminal_prompt_blocking(&description, explanation.as_deref())
+        })
+        .await
+        .map_err(|e| format!("approval prompt task failed: {e}"))?
+    }
+}
+
+fn terminal_prompt_blocking(
+    description: &str,
+    explanation: Option<&str>,
+) -> Result<bool, String> {
+    use std::io::{self, BufRead, Write};
+
+    {
+        let stdout = io::stdout();
+        let mut out = stdout.lock();
+        writeln!(out).ok();
+        writeln!(out, "--- approval required ----------------------------").ok();
+        writeln!(out, "  {description}").ok();
+        if let Some(reason) = explanation {
+            writeln!(out, "  reason: {reason}").ok();
+        }
+        write!(out, "  approve? [y/N]: ").ok();
+        out.flush().ok();
+    }
+
+    let stdin = io::stdin();
+    let mut line = String::new();
+    match stdin.lock().read_line(&mut line) {
+        Ok(0) => Ok(false), // EOF — deny
+        Ok(_) => {
+            let answer = line.trim().to_ascii_lowercase();
+            Ok(matches!(answer.as_str(), "y" | "yes"))
+        }
+        Err(_) => Ok(false), // IO error — deny
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

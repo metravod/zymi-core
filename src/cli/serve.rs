@@ -5,7 +5,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::approval::ApprovalHandler;
+use crate::approval::{ApprovalHandler, TerminalApprovalHandler};
 use crate::commands::RunPipeline;
 use crate::config::load_project_dir;
 use crate::events::bus::EventBus;
@@ -14,7 +14,6 @@ use crate::events::{Event, EventKind};
 use crate::handlers::run_pipeline;
 use crate::runtime::Runtime;
 
-use super::approval::TerminalApprovalHandler;
 use super::store_path;
 
 /// Run a pipeline as a long-lived event-driven service.

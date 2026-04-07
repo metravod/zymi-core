@@ -2,7 +2,7 @@
 
 Date: 2026-04-07
 
-Status: Partially implemented — slice 1 (Runtime/AppContext + RunPipeline command/handler + ActionExecutor split) landed on 2026-04-07; see "Slice 1 — what landed" below. Slices 2 and 3 (Python bridge port, EventCommandRouter extraction) are still open and tracked under "Runtime unification" in `.drift/project.json`. Once slice 2 lands this draft will be promoted to a binding ADR.
+Status: Partially implemented — slices 1 and 2 landed on 2026-04-07 (Runtime/AppContext + RunPipeline command/handler + ActionExecutor split; PyO3 `Runtime` bridge). See "Slice 1 — what landed" and "Slice 2 — what landed" below. Slice 3 (`EventCommandRouter` extraction) is still open and tracked under "Runtime unification" in `.drift/project.json`. Once slice 3 lands or is retired, this draft will be promoted to a binding ADR.
 
 ## Context
 
@@ -195,9 +195,20 @@ The smallest viable slice from the "Next steps" section is now in `main`:
 
 What this **does not** include (still under "Runtime unification" in `.drift/project.json`):
 
-- **Python bridge port (slice 2).** Python still drives pipelines through `cli_main`, not through `Runtime` directly. A `PyRuntime` / `PyRunPipeline` surface is the next slice.
+- **Python bridge port (slice 2).** Landed on 2026-04-07; see next section.
 - **`EventCommandRouter` extraction (slice 3).** The `PipelineRequested → RunPipeline` translation is still inlined in `cli/serve.rs`. Extraction is deferred until a second async command type appears, since premature extraction would be a one-caller abstraction.
 - Aggregate rehydration vs read-model-backed handlers, projection-backed memory, recovery — all still downstream of the event-sourced workflow memory goal.
+
+## Slice 2 — what landed (2026-04-07)
+
+Python stops shelling out to `cli_main`: it builds a [`Runtime`] and dispatches [`RunPipeline`] commands through the same handler `zymi run` and `zymi serve` use. The "Adapters → Application Layer" arrow in v1.1 now has three concrete callers (CLI, Python, `zymi serve`), not two.
+
+- **`src/python/py_runtime.rs`** — new PyO3 module behind `#[cfg(feature = "runtime")]` exposing `Runtime`, `RunPipelineResult`, `StepResult` Python classes. `Runtime.for_project(path, approval="terminal")` loads a project from disk and builds the runtime; `approval` accepts `"terminal"` (default, matches `zymi run`) or `"none"`. `run_pipeline(name, inputs)` blocks on the shared tokio runtime and returns a `RunPipelineResult`. `bus()` / `store()` return `PyEventBus` / `PyEventStore` wrapping the runtime's own `Arc`s, so Python subscribers see the events the handler publishes — no second bus over the same SQLite file.
+- **`src/python/bus.rs`, `src/python/store.rs`** — added `pub(crate) fn from_arc(...)` constructors so the new `Runtime` class can hand out Python wrappers over its shared infrastructure instead of constructing fresh ones.
+- **`src/approval.rs`** — `TerminalApprovalHandler` moved out of `src/cli/approval.rs` into the root approval module. It never had a real dependency on the `cli` feature, and keeping it behind the `cli` gate would have forced the new Python `Runtime.for_project(..., approval="terminal")` path to pull in clap. `src/cli/run.rs` / `src/cli/serve.rs` updated to import it from `crate::approval`; `src/cli/approval.rs` deleted.
+- **`zymi_core/__init__.py`** — re-exports `Runtime`, `RunPipelineResult`, `StepResult` alongside the existing classes, so `from zymi_core import Runtime` works in user scripts.
+
+Pluggable Python approval handlers (where a Python callable is invoked from inside the tokio runtime under the GIL) and asyncio integration are **not** in slice 2 — they are follow-ups. Python users today get the same fail-closed terminal prompt the CLI uses, or `approval="none"`.
 
 ## Consequences
 

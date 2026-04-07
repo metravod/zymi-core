@@ -1,5 +1,7 @@
 pub mod bus;
 pub mod event;
+#[cfg(feature = "runtime")]
+pub mod py_runtime;
 pub mod store;
 pub mod tool;
 
@@ -10,6 +12,8 @@ use tokio::runtime::Runtime;
 
 use bus::{PyEventBus, PySubscription};
 use event::PyEvent;
+#[cfg(feature = "runtime")]
+use py_runtime::{PyRunPipelineResult, PyRuntime, PyStepResult};
 use store::PyEventStore;
 use tool::PyToolRegistry;
 
@@ -40,6 +44,12 @@ fn _zymi_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyEventBus>()?;
     m.add_class::<PySubscription>()?;
     m.add_class::<PyToolRegistry>()?;
+    #[cfg(feature = "runtime")]
+    {
+        m.add_class::<PyRuntime>()?;
+        m.add_class::<PyRunPipelineResult>()?;
+        m.add_class::<PyStepResult>()?;
+    }
     #[cfg(feature = "cli")]
     m.add_function(wrap_pyfunction!(cli_main, m)?)?;
     Ok(())
