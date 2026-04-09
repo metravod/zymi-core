@@ -18,39 +18,35 @@
 //! pipeline run; the `Runtime` is the single canonical wiring point those
 //! entrypoints share.
 //!
-//! Slices 1–3 of the runtime unification have landed: slice 1 introduced
+//! Slices 1–4 of the runtime unification have landed: slice 1 introduced
 //! `Runtime` + `RunPipeline` handler + `ActionExecutor`, slice 2 ported the
-//! Python bridge to the same wiring (see `python/py_runtime.rs`), and slice
-//! 3 lifted the `BUS → CMD` translation out of `cli/serve.rs` into
-//! [`event_router::EventCommandRouter`]. What this module deliberately still
-//! does **not** do (tracked under "Runtime unification" in
-//! `.drift/project.json`): multi-provider routing, projection-backed
-//! aggregates, recovery, and a real backpressure / lag policy for
-//! [`crate::events::store::StoreTailWatcher`].
+//! Python bridge to the same wiring (see `python/py_runtime.rs`), slice 3
+//! lifted the `BUS → CMD` translation out of `cli/serve.rs` into
+//! [`event_router::EventCommandRouter`], and slice 4 promoted the
+//! [`crate::events::store::StoreTailWatcher`] poll/lag policy from a hidden
+//! constant into a typed runtime contract via
+//! [`crate::events::store::TailWatcherPolicy`]. What this module
+//! deliberately still does **not** do (tracked under remaining open goals
+//! in `.drift/project.json`): multi-provider routing, projection-backed
+//! aggregates, and recovery.
 
 pub mod action_executor;
 pub mod event_router;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use crate::approval::ApprovalHandler;
 use crate::config::WorkspaceConfig;
 use crate::esaa::contracts::ContractEngine;
 use crate::esaa::orchestrator::Orchestrator;
 use crate::events::bus::EventBus;
-use crate::events::store::{open_store, EventStore, StoreBackend};
+use crate::events::store::{open_store, EventStore, StoreBackend, TailWatcherPolicy};
 use crate::llm::{self, LlmProvider};
 use crate::policy::PolicyEngine;
 
 pub use action_executor::{ActionContext, ActionExecutor, BuiltinActionExecutor};
 pub use event_router::EventCommandRouter;
-
-/// Default polling interval for [`crate::events::store::StoreTailWatcher`]
-/// when a `Runtime` is built without an explicit override. Matches the
-/// previous hard-coded value used by `zymi serve`.
-pub const DEFAULT_TAIL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Per-project bundle of infrastructure shared by command handlers.
 ///
@@ -67,7 +63,7 @@ pub struct Runtime {
     orchestrator: Arc<Orchestrator>,
     approval: Option<Arc<dyn ApprovalHandler>>,
     action_executor: Arc<dyn ActionExecutor>,
-    tail_poll_interval: Duration,
+    tail_policy: TailWatcherPolicy,
 }
 
 impl Runtime {
@@ -81,7 +77,7 @@ impl Runtime {
             bus: None,
             approval: None,
             action_executor: None,
-            tail_poll_interval: None,
+            tail_policy: None,
         }
     }
 
@@ -121,8 +117,13 @@ impl Runtime {
         &self.action_executor
     }
 
-    pub fn tail_poll_interval(&self) -> Duration {
-        self.tail_poll_interval
+    /// The cross-process [`crate::events::store::StoreTailWatcher`] policy
+    /// (poll interval, batch size, catch-up cap, lag warn threshold) used
+    /// when this runtime spawns a watcher. Slice 4 of the runtime
+    /// unification (ADR-0013) lifted these knobs from a hidden constant in
+    /// `events::store::watcher.rs` into this typed runtime contract.
+    pub fn tail_policy(&self) -> &TailWatcherPolicy {
+        &self.tail_policy
     }
 }
 
@@ -134,10 +135,11 @@ impl Runtime {
 /// - LLM provider built from `workspace.project.llm`
 /// - [`BuiltinActionExecutor`] for approved tool calls
 /// - No approval handler (callers that need one pass it explicitly)
-/// - 100 ms tail poll interval
+/// - Default [`TailWatcherPolicy`] (100 ms poll, 256-event batches,
+///   16-batch catch-up cap, warn at 4096 events lag)
 ///
 /// Tests / advanced callers may inject their own store, bus, action
-/// executor, or poll interval via the `with_*` methods.
+/// executor, or tail policy via the `with_*` methods.
 pub struct RuntimeBuilder {
     workspace: WorkspaceConfig,
     project_root: PathBuf,
@@ -145,7 +147,7 @@ pub struct RuntimeBuilder {
     bus: Option<Arc<EventBus>>,
     approval: Option<Arc<dyn ApprovalHandler>>,
     action_executor: Option<Arc<dyn ActionExecutor>>,
-    tail_poll_interval: Option<Duration>,
+    tail_policy: Option<TailWatcherPolicy>,
 }
 
 impl RuntimeBuilder {
@@ -182,10 +184,11 @@ impl RuntimeBuilder {
     }
 
     /// Override the cross-process [`crate::events::store::StoreTailWatcher`]
-    /// poll interval. Lower values cut delivery latency at the cost of CPU
-    /// and SQLite contention. Defaults to [`DEFAULT_TAIL_POLL_INTERVAL`].
-    pub fn with_tail_poll_interval(mut self, interval: Duration) -> Self {
-        self.tail_poll_interval = Some(interval);
+    /// policy. Use this to tune poll interval, batch size, the catch-up
+    /// cap, or the lag-warn threshold; defaults to
+    /// [`TailWatcherPolicy::default`].
+    pub fn with_tail_policy(mut self, policy: TailWatcherPolicy) -> Self {
+        self.tail_policy = Some(policy);
         self
     }
 
@@ -199,7 +202,7 @@ impl RuntimeBuilder {
             bus,
             approval,
             action_executor,
-            tail_poll_interval,
+            tail_policy,
         } = self;
 
         // 1. Store + bus — either injected together, or build the SQLite
@@ -253,7 +256,7 @@ impl RuntimeBuilder {
             orchestrator,
             approval,
             action_executor,
-            tail_poll_interval: tail_poll_interval.unwrap_or(DEFAULT_TAIL_POLL_INTERVAL),
+            tail_policy: tail_policy.unwrap_or_default(),
         })
     }
 }

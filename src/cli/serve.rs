@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use crate::approval::{ApprovalHandler, TerminalApprovalHandler};
 use crate::config::load_project_dir;
-use crate::events::store::StoreTailWatcher;
+use crate::events::store::{StoreTailWatcher, TailWatcherPolicy};
 use crate::runtime::{EventCommandRouter, Runtime};
 
 use super::store_path;
@@ -76,15 +76,23 @@ async fn serve_loop(
     // serialised on the operator's terminal.
     let approval_handler: Arc<dyn ApprovalHandler> = Arc::new(TerminalApprovalHandler::new());
 
+    // Operator can override poll interval from the CLI; the rest of the
+    // tail policy (batch size, catch-up cap, lag warn threshold) takes the
+    // runtime defaults from `TailWatcherPolicy::default()`.
+    let tail_policy = TailWatcherPolicy {
+        poll_interval: Duration::from_millis(poll_interval_ms),
+        ..TailWatcherPolicy::default()
+    };
+
     let runtime = Arc::new(
         Runtime::builder(workspace, root.clone())
             .with_approval_handler(Arc::clone(&approval_handler))
-            .with_tail_poll_interval(Duration::from_millis(poll_interval_ms))
+            .with_tail_policy(tail_policy)
             .build()?,
     );
 
     let watcher = StoreTailWatcher::new(Arc::clone(runtime.store()), Arc::clone(runtime.bus()))
-        .with_interval(runtime.tail_poll_interval())
+        .with_policy(runtime.tail_policy().clone())
         .spawn();
 
     let db_path = store_path(&root);

@@ -2,7 +2,7 @@
 
 Date: 2026-04-07
 
-Status: Implemented — slices 1, 2 and 3 landed on 2026-04-07 (Runtime/AppContext + `RunPipeline` command/handler + `ActionExecutor` split; PyO3 `Runtime` bridge; `EventCommandRouter` for the `BUS → CMD` path). See the "Slice 1/2/3 — what landed" sections below. The remaining "Open questions" (aggregate rehydration, projection-backed handlers, `StoreTailWatcher` lag policy) stay open as downstream goals; once at least the `StoreTailWatcher` lag policy is decided, this draft will be promoted to a binding ADR.
+Status: Accepted (binding) — slices 1, 2, 3 and 4 landed on 2026-04-07 (Runtime/AppContext + `RunPipeline` command/handler + `ActionExecutor` split; PyO3 `Runtime` bridge; `EventCommandRouter` for the `BUS → CMD` path; typed `TailWatcherPolicy` runtime contract). See the "Slice 1/2/3/4 — what landed" sections below. The remaining "Open questions" (aggregate rehydration, projection-backed handlers, projection backpressure) stay open as downstream goals tracked separately in `.drift/project.json`.
 
 ## Context
 
@@ -178,8 +178,8 @@ flowchart TB
 - **Aggregates: rehydrate-from-store or read-model-backed?** v1.1 shows handlers loading aggregates by replay from the store. For long-lived pipelines that may be too expensive — a snapshot/projection-backed aggregate is the natural follow-up, but it conflates the "Recovery and projections" goal with this one. We will pick a side once event-sourced memory lands.
 - **Where does the async-command router live?** v1.1 draws `BUS → CMD` as one edge, but in code that needs a small subscriber that maps event types to commands. Whether it sits in Application as `EventCommandRouter` or inside each handler is undecided.
 - **Crate boundaries vs module boundaries.** The four layers can be enforced as separate crates (`zymi-domain`, `zymi-app`, `zymi-infra`, `zymi-adapters`) or as modules inside `zymi-core` with discipline. Splitting crates pays for itself only if we expect external consumers of the domain layer.
-- **`StoreTailWatcher` poll/lag policy** is currently a hidden default (~100ms). It belongs in the runtime contract, not in `events::store::watcher.rs` as a constant. Will be promoted as part of runtime unification.
-- **Backpressure on projections.** If a projection lags the bus, do we drop, block, or buffer? Undecided; depends on whether projections become load-bearing (memory read model) or stay read-mostly (audit).
+- **~~`StoreTailWatcher` poll/lag policy~~** — resolved by slice 4 (see below). The watcher contract now lives in [`crate::events::store::TailWatcherPolicy`] and `Runtime::tail_policy()`.
+- **Backpressure on projections.** If a projection lags the bus, do we drop, block, or buffer? Undecided; depends on whether projections become load-bearing (memory read model) or stay read-mostly (audit). Note that the *watcher* side of backpressure is settled — see slice 4 — what is open is the *projection* side.
 
 ## Slice 1 — what landed (2026-04-07)
 
@@ -228,8 +228,28 @@ What changed:
 What slice 3 explicitly does **not** do:
 
 - It does not introduce a registry / trait / plugin model for routes. Adding a second route is still "edit the `dispatch` match and add a `handle_*` method", because that's all the second route will need until a third caller appears.
-- It does not change the watcher contract or the lag policy — that is the next item under "Runtime unification" in `.drift/project.json`.
+- It does not change the watcher contract or the lag policy — that landed in slice 4 below.
 - It does not change the public Python or HTTP surface.
+
+## Slice 4 — what landed (2026-04-07)
+
+Closes the last open subtask under "Runtime unification" in `.drift/project.json` and is the trigger that moved this ADR from "Implemented draft" to "Accepted (binding)". Slice 4 promotes the [`StoreTailWatcher`](crate::events::store::StoreTailWatcher) poll / batch / catch-up / lag knobs from a hidden module-level constant into a typed runtime contract.
+
+What changed:
+
+- **`src/events/store/watcher.rs`** — introduces `TailWatcherPolicy { poll_interval, batch_size, max_catchup_batches, lag_warn_threshold }` with a `Default` impl (`100 ms / 256 / 16 / Some(4096)`) and a single `StoreTailWatcher::with_policy(...)` setter. The `with_interval` / `with_batch_size` per-knob setters survive as test/embedded conveniences but the production wiring path is one method now. The polling task tracks a `burst_batches` counter and forces a yield once `max_catchup_batches` consecutive full batches have been drained — this gives the cancel signal a chance to fire and prevents the watcher from monopolising the tokio worker under a sustained write storm. On exit from a capped burst the watcher samples `current_global_seq` once and emits a single `warn!("StoreTailWatcher: lag={N} ...")` line if `head − cursor` exceeds the configured threshold. Drop-on-slow-subscriber on the *publish* side is **kept** and now documented at the module level: blocking the watcher on one slow subscriber would starve every other subscriber on the bus and stall cancellation, and the store remains the source of truth so a lagging subscriber can recover by replaying. Re-exported as `crate::events::store::TailWatcherPolicy` and `zymi_core::TailWatcherPolicy`.
+- **`src/runtime/mod.rs`** — `Runtime` field `tail_poll_interval: Duration` is replaced by `tail_policy: TailWatcherPolicy`; `Runtime::tail_policy() -> &TailWatcherPolicy` is the new accessor. `RuntimeBuilder::with_tail_policy(...)` replaces the previous single-knob `with_tail_poll_interval(...)` (deleted, not deprecated — slice 1 only shipped two days earlier and the API had one external caller). `DEFAULT_TAIL_POLL_INTERVAL` is gone; the default is now `TailWatcherPolicy::default()` so all four knobs travel together.
+- **`src/cli/serve.rs`** — builds a `TailWatcherPolicy` from the operator's `--poll-interval-ms` flag (rest of the policy = defaults), passes it via `with_tail_policy`, and spawns the watcher with `with_policy(runtime.tail_policy().clone())`. The `--poll-interval-ms` operator flag and its semantics are unchanged.
+- **`src/lib.rs`** — re-exports `TailWatcherPolicy`; drops `DEFAULT_TAIL_POLL_INTERVAL`.
+- **Test added.** `burst_cap_yields_but_delivers_all_events_in_order` configures `batch_size=2 / max_catchup_batches=2`, pre-writes 10 events, and asserts all 10 arrive in order — proving the cap forces yields between bursts without losing events.
+
+Pluggable-store consequence (asked at design time): the policy is store-agnostic. `StoreTailWatcher` already operated on `Arc<dyn EventStore>`, the `TailWatcherPolicy` only references methods on the `EventStore` trait (`tail`, `current_global_seq`), and the `StoreBackend` enum already reserves space for libSQL/Postgres per ADR-0012. A future Postgres backend that wants `LISTEN/NOTIFY` will be a *sibling* watcher type (`PgNotifyWatcher` or similar) with its own policy struct, not a change to this contract — `TailWatcherPolicy` is the polling-watcher contract, not "the" watcher contract.
+
+What slice 4 explicitly does **not** do:
+
+- It does not change the drop-on-slow-subscriber decision on the publish side (still right, now just documented).
+- It does not introduce metrics / observability beyond the existing `log` crate. A `Runtime::tail_lag()` accessor was discussed and rejected — first-class metrics belong in the still-open "Streaming runtime contract" goal, not bolted onto the watcher.
+- It does not address projection backpressure — that is a separate open question above and stays open until projections become load-bearing.
 
 ## Consequences
 

@@ -21,4 +21,4 @@ pub mod watcher;
 pub use event_store::{EventStore, TailedEvent};
 pub use factory::{open_store, StoreBackend};
 pub use sqlite::SqliteEventStore;
-pub use watcher::{StoreTailWatcher, WatcherHandle};
+pub use watcher::{StoreTailWatcher, TailWatcherPolicy, WatcherHandle};

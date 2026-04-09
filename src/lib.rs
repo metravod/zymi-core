@@ -36,8 +36,8 @@ pub use events::{
     bus::EventBus,
     connector::{ConnectorError, EventDrivenConnector},
     store::{
-        open_store, EventStore, SqliteEventStore, StoreBackend, StoreTailWatcher, TailedEvent,
-        WatcherHandle,
+        open_store, EventStore, SqliteEventStore, StoreBackend, StoreTailWatcher,
+        TailWatcherPolicy, TailedEvent, WatcherHandle,
     },
     stream_registry::StreamRegistry,
     Event, EventKind, EventStoreError,
@@ -60,6 +60,6 @@ pub use commands::RunPipeline;
 #[cfg(feature = "runtime")]
 pub use runtime::{
     ActionContext, ActionExecutor, BuiltinActionExecutor, EventCommandRouter, Runtime,
-    RuntimeBuilder, DEFAULT_TAIL_POLL_INTERVAL,
+    RuntimeBuilder,
 };
 pub use types::{Message, StreamEvent, TokenUsage, ToolCallInfo, ToolDefinition};
