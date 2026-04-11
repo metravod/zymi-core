@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::error::{parse_error, ConfigError};
 use super::template;
 
 /// Custom tool configuration (`tools/*.yml`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ToolConfig {
     pub name: String,
     pub description: String,
@@ -22,7 +23,7 @@ pub struct ToolConfig {
 }
 
 /// Implementation backend for a declarative tool.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind")]
 pub enum ImplementationConfig {
     /// HTTP request. `${args.X}` placeholders in url, headers, and
@@ -38,7 +39,7 @@ pub enum ImplementationConfig {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum HttpMethod {
     Get,

@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::error::{parse_error, ConfigError};
 use super::template;
 
 /// Pipeline configuration (`pipelines/*.yml`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct PipelineConfig {
     pub name: String,
     #[serde(default)]
@@ -20,7 +21,7 @@ pub struct PipelineConfig {
 }
 
 /// A declared input parameter for the pipeline.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct PipelineInput {
     pub name: String,
     #[serde(default = "default_input_type")]
@@ -34,7 +35,7 @@ fn default_input_type() -> String {
 }
 
 /// A single step in the pipeline DAG.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct PipelineStep {
     pub id: String,
     pub agent: String,
@@ -44,7 +45,7 @@ pub struct PipelineStep {
 }
 
 /// Declares which step produces the final pipeline output.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct PipelineOutput {
     pub step: String,
 }

@@ -1,10 +1,10 @@
 use std::collections::HashSet;
 
 use regex::Regex;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct PolicyConfig {
     #[serde(default)]
     pub enabled: bool,

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::esaa::contracts::{FileWriteContract, RateLimitConfig};
@@ -10,7 +11,7 @@ use super::error::{parse_error, ConfigError};
 use super::template;
 
 /// Top-level project configuration (`project.yml`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ProjectConfig {
     pub name: String,
     #[serde(default)]
@@ -30,7 +31,7 @@ pub struct ProjectConfig {
 }
 
 /// LLM provider configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LlmConfig {
     pub provider: String,
     #[serde(default)]
@@ -41,7 +42,7 @@ pub struct LlmConfig {
 }
 
 /// Default values inherited by agents unless overridden.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DefaultsConfig {
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
@@ -66,7 +67,7 @@ fn default_max_iterations() -> usize {
 }
 
 /// Boundary contract configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct ContractsConfig {
     #[serde(default)]
     pub file_write: FileWriteContract,
@@ -75,14 +76,14 @@ pub struct ContractsConfig {
 }
 
 /// Services configuration — external integrations that subscribe to the event bus.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct ServicesConfig {
     #[serde(default)]
     pub langfuse: Option<LangfuseConfig>,
 }
 
 /// LangFuse observability service configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LangfuseConfig {
     /// LangFuse API base URL.
     #[serde(default = "default_langfuse_base_url")]

@@ -9,8 +9,10 @@ Event-sourced agent engine for auditable AI workflows in Rust, YAML, and Python.
 - **Auditable by default**: every state change is persisted as an event with hash-chain verification.
 - **Safer side effects**: agents emit intentions first; contracts and approvals decide what is allowed to execute.
 - **Practical workflows**: define agents and DAG pipelines in YAML, then run them from a small CLI.
+- **Declarative custom tools**: add HTTP (and soon shell/Python) tools in `tools/*.yml` — no Rust code required.
 - **Flexible integration points**: use the Rust crate, Python bindings, or both — Python can drive pipelines directly via `Runtime.for_project(...).run_pipeline(...)`, no subprocess.
 - **LLM-provider ready**: OpenAI-compatible providers, Anthropic support, Python tools, and LangFuse event services.
+- **JSON Schemas for configs**: `zymi schema project|agent|pipeline|tool` outputs draft-07 JSON Schema for IDE autocomplete and LLM-assisted config generation.
 
 ## Installation
 
@@ -54,6 +56,7 @@ What this gives you:
 - `project.yml` for provider config, policies, contracts, and defaults
 - `agents/` for agent definitions
 - `pipelines/` for DAG workflows
+- `tools/` for declarative custom tools (optional)
 - `.zymi/events.db` for the append-only event log
 - `output/` and `memory/` directories in the research example
 
@@ -71,11 +74,15 @@ zymi serve research
 
 zymi events
 zymi events --stream conversation-1
-zymi events --kind LlmCallCompleted --json
+zymi events --stream conversation-1 --verbose
+zymi events --kind tool_call_completed --json
 
-zymi replay conversation-1 --from 1
 zymi verify
 zymi verify --stream conversation-1
+
+# JSON Schema for configs (useful for IDE autocomplete / LLM generation)
+zymi schema project
+zymi schema --all
 ```
 
 ## Project Layout
@@ -89,6 +96,8 @@ my-project/
     default.yml
   pipelines/
     main.yml
+  tools/          # optional — declarative custom tools
+    slack_post.yml
   .zymi/
     events.db
 ```
@@ -136,6 +145,44 @@ input:
 output:
   step: process
 ```
+
+### Declarative Custom Tools
+
+Drop a YAML file into `tools/` to give your agents new capabilities without writing code:
+
+```yaml
+# tools/slack_post.yml
+name: slack_post
+description: "Post a message to a Slack channel"
+parameters:
+  type: object
+  properties:
+    channel:
+      type: string
+    text:
+      type: string
+  required: [channel, text]
+implementation:
+  kind: http
+  method: POST
+  url: "https://slack.com/api/chat.postMessage"
+  headers:
+    Authorization: "Bearer ${env.SLACK_TOKEN}"
+    Content-Type: "application/json"
+  body_template: '{"channel": "${args.channel}", "text": "${args.text}"}'
+```
+
+Then reference it in an agent:
+
+```yaml
+# agents/notifier.yml
+name: notifier
+tools:
+  - web_search
+  - slack_post   # ← the custom tool
+```
+
+`${env.*}` variables are resolved at parse time; `${args.*}` are resolved at call time from the LLM's arguments. Name collisions with built-in tools are a hard error.
 
 ## Python Bindings
 
@@ -318,7 +365,8 @@ watcher.stop().await;
 1. **Every meaningful state change becomes an event.** The SQLite event store is the source of truth.
 2. **Agents express intentions, not side effects.** Intentions are evaluated against boundary contracts before execution.
 3. **Pipelines are DAGs.** Independent steps can run in parallel, while dependencies remain explicit.
-4. **Runs stay replayable.** You can inspect events, replay streams, and verify hash-chain integrity later.
+4. **Runs stay replayable.** You can inspect events with `zymi events --stream <id>` and verify hash-chain integrity with `zymi verify`.
+5. **Custom tools are declarative.** HTTP tools live in `tools/*.yml` and are dispatched at runtime — no Rust code, no rebuild.
 
 Core intention types include `ExecuteShellCommand`, `WriteFile`, `ReadFile`, `WebSearch`, `WebScrape`, `WriteMemory`, `SpawnSubAgent`, and `CallCustomTool`.
 

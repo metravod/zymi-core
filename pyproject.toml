@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "zymi-core"
-version = "0.1.4"
+version = "0.1.5"
 description = "Event-sourced agent engine — CLI and Python bindings for auditable AI workflows"
 readme = "README.md"
 license = { text = "MIT" }

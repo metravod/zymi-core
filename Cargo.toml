@@ -1,6 +1,6 @@
 [package]
 name = "zymi-core"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "Event-sourced agent engine with boundary contracts, hash-chain audit, and declarative pipelines"
 repository = "https://github.com/metravod/zymi-core"
@@ -21,6 +21,7 @@ sha2 = "0.10"
 regex = "1"
 log = "0.4"
 serde_yml = "0.0.12"
+schemars = { version = "0.8", features = ["derive"] }
 miette = { version = "7", features = ["fancy"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false, optional = true }
 pyo3 = { version = "0.22", features = ["extension-module"], optional = true }

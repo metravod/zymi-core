@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::policy::PolicyConfig;
@@ -9,7 +10,7 @@ use super::error::{parse_error, ConfigError};
 use super::template;
 
 /// Agent configuration (`agents/*.yml`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AgentConfig {
     pub name: String,
     #[serde(default)]

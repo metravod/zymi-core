@@ -1,7 +1,7 @@
 mod events;
 mod init;
-mod replay;
 mod run;
+mod schema;
 mod serve;
 mod verify;
 
@@ -47,7 +47,7 @@ enum Command {
 
     /// List and inspect events from the store
     Events {
-        /// Filter by stream ID
+        /// Filter by stream ID (replaces the old `replay` command)
         #[arg(short, long)]
         stream: Option<String>,
 
@@ -62,6 +62,10 @@ enum Command {
         /// Output as JSON (one event per line)
         #[arg(long)]
         json: bool,
+
+        /// Show extended detail for each event
+        #[arg(short, long)]
+        verbose: bool,
 
         /// Project root directory
         #[arg(short = 'd', long)]
@@ -93,23 +97,16 @@ enum Command {
         dir: Option<PathBuf>,
     },
 
-    /// Replay events from a stream
-    Replay {
-        /// Stream ID to replay
-        stream_id: String,
+    /// Print JSON Schema for a config kind (project, agent, pipeline, tool)
+    Schema {
+        /// Config kind: project, agent, pipeline, tool
+        kind: Option<String>,
 
-        /// Start from this sequence number
-        #[arg(short, long, default_value = "1")]
-        from: u64,
-
-        /// Output as JSON
+        /// Print schemas for all config kinds
         #[arg(long)]
-        json: bool,
-
-        /// Project root directory
-        #[arg(short = 'd', long)]
-        dir: Option<PathBuf>,
+        all: bool,
     },
+
 }
 
 /// Run the CLI. Called from the binary entry point.
@@ -135,12 +132,14 @@ fn dispatch(cli: Cli) {
             kind,
             limit,
             json,
+            verbose,
             dir,
         } => events::exec(
             stream.as_deref(),
             kind.as_deref(),
             limit,
             json,
+            verbose,
             resolve_root(dir.as_deref()),
         ),
         Command::Verify { stream, dir } => {
@@ -151,12 +150,7 @@ fn dispatch(cli: Cli) {
             poll_interval_ms,
             dir,
         } => serve::exec(&pipeline, poll_interval_ms, resolve_root(dir.as_deref())),
-        Command::Replay {
-            stream_id,
-            from,
-            json,
-            dir,
-        } => replay::exec(&stream_id, from, json, resolve_root(dir.as_deref())),
+        Command::Schema { kind, all } => schema::exec(kind.as_deref(), all),
     };
 
     if let Err(e) = result {

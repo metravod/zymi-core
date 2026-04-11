@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use regex::Regex;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::policy::{PolicyDecision, PolicyEngine};
@@ -8,7 +9,7 @@ use crate::policy::{PolicyDecision, PolicyEngine};
 use super::{Intention, IntentionVerdict};
 
 /// Configuration for file write boundary contracts.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct FileWriteContract {
     /// Directory prefixes where writes are allowed (e.g., "/tmp/", "./memory/").
     /// Empty means all writes require approval.
@@ -20,7 +21,7 @@ pub struct FileWriteContract {
 }
 
 /// Configuration for rate limiting intentions.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct RateLimitConfig {
     /// Maximum shell commands per minute. 0 = unlimited.
     #[serde(default)]
