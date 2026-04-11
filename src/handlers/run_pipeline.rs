@@ -29,9 +29,9 @@ use uuid::Uuid;
 use crate::approval::ApprovalHandler;
 use crate::commands::RunPipeline;
 use crate::config::AgentConfig;
-use crate::engine::tools::{new_memory_store, tool_definitions_for_agent, MemoryStore};
+use crate::engine::tools::{new_memory_store, MemoryStore};
+use crate::runtime::ToolCatalog;
 use crate::esaa::orchestrator::{Orchestrator, OrchestratorResult};
-use crate::esaa::Intention;
 use crate::events::bus::EventBus;
 use crate::events::{Event, EventKind};
 use crate::llm::{ChatRequest, ChatResponse, LlmProvider};
@@ -147,6 +147,7 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
             let orchestrator = Arc::clone(rt.orchestrator());
             let bus = Arc::clone(rt.bus());
             let action_executor = Arc::clone(rt.action_executor());
+            let tool_catalog = Arc::clone(rt.tool_catalog());
             let memory = memory.clone();
             let stream_id = stream_id.clone();
             let project_root = rt.project_root().to_path_buf();
@@ -163,6 +164,7 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
                     &orchestrator,
                     &bus,
                     action_executor.as_ref(),
+                    &tool_catalog,
                     &memory,
                     &stream_id,
                     correlation_id,
@@ -237,6 +239,7 @@ async fn run_agent_step(
     orchestrator: &Orchestrator,
     bus: &EventBus,
     action_executor: &dyn ActionExecutor,
+    tool_catalog: &ToolCatalog,
     memory: &MemoryStore,
     stream_id: &str,
     correlation_id: Uuid,
@@ -245,7 +248,7 @@ async fn run_agent_step(
     approval_handler: Option<Arc<dyn ApprovalHandler>>,
 ) -> Result<StepResult, String> {
     let max_iterations = agent.max_iterations.unwrap_or(default_max_iterations);
-    let tool_defs = tool_definitions_for_agent(&agent.tools);
+    let tool_defs = tool_catalog.definitions_for_agent(&agent.tools);
 
     let mut messages: Vec<Message> = Vec::new();
 
@@ -393,7 +396,7 @@ async fn run_agent_step(
                     )
                     .await;
 
-                    let intention = tool_call_to_intention(&tc.name, &tc.arguments);
+                    let intention = tool_catalog.intention(&tc.name, &tc.arguments);
                     let verdict = orchestrator
                         .process_intention(
                             &intention,
@@ -452,72 +455,6 @@ async fn run_agent_step(
                 return Err(format!("[{step_id}] unexpected message type from LLM"));
             }
         }
-    }
-}
-
-/// Map a tool call to an ESAA Intention for contract evaluation.
-fn tool_call_to_intention(tool_name: &str, arguments_json: &str) -> Intention {
-    let args: serde_json::Value =
-        serde_json::from_str(arguments_json).unwrap_or(serde_json::Value::Null);
-
-    match tool_name {
-        "execute_shell_command" => Intention::ExecuteShellCommand {
-            command: args
-                .get("command")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            timeout_secs: args.get("timeout_secs").and_then(|v| v.as_u64()),
-        },
-        "write_file" => Intention::WriteFile {
-            path: args
-                .get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            content: args
-                .get("content")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-        },
-        "read_file" => Intention::ReadFile {
-            path: args
-                .get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-        },
-        "web_search" => Intention::WebSearch {
-            query: args
-                .get("query")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-        },
-        "web_scrape" => Intention::WebScrape {
-            url: args
-                .get("url")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-        },
-        "write_memory" => Intention::WriteMemory {
-            key: args
-                .get("key")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            content: args
-                .get("content")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-        },
-        _ => Intention::CallCustomTool {
-            tool_name: tool_name.to_string(),
-            arguments: arguments_json.to_string(),
-        },
     }
 }
 
@@ -623,14 +560,16 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_to_intention_shell() {
-        let intention = tool_call_to_intention("execute_shell_command", r#"{"command":"ls"}"#);
+    fn catalog_intention_shell() {
+        let catalog = ToolCatalog::builtin_only();
+        let intention = catalog.intention("execute_shell_command", r#"{"command":"ls"}"#);
         assert_eq!(intention.tag(), "execute_shell_command");
     }
 
     #[test]
-    fn tool_call_to_intention_custom() {
-        let intention = tool_call_to_intention("my_custom_tool", r#"{"arg":"val"}"#);
+    fn catalog_intention_custom() {
+        let catalog = ToolCatalog::builtin_only();
+        let intention = catalog.intention("my_custom_tool", r#"{"arg":"val"}"#);
         assert_eq!(intention.tag(), "call_custom_tool");
     }
 }

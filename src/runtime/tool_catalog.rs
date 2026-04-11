@@ -1,0 +1,476 @@
+//! Tool catalog — the single registry of all tools available to agents.
+//!
+//! Slice 1 of declarative custom tools (ADR-0014). The catalog answers
+//! three questions for any tool name, regardless of its origin (builtin,
+//! declarative YAML, programmatic Python/@tool):
+//!
+//! 1. **`knows(name)`** — is this a valid tool? Used by the config validator
+//!    instead of the old `KNOWN_TOOLS` static slice.
+//! 2. **`definition(name)`** — produce a [`ToolDefinition`] for the LLM's
+//!    `ChatRequest.tools`, replacing `tool_definitions_for_agent`.
+//! 3. **`intention(name, args)`** + **`requires_approval(name)`** — map a tool
+//!    call to an [`Intention`] for ESAA evaluation.
+//!
+//! Lookup precedence: **builtin > declarative > programmatic**. Name
+//! collisions between layers are a hard error at construction time.
+
+use std::collections::HashMap;
+
+use crate::config::tool::ToolConfig;
+use crate::config::validate::ToolNameResolver;
+use crate::esaa::Intention;
+use crate::types::ToolDefinition;
+
+/// Entry for a single built-in tool.
+struct BuiltinEntry {
+    definition: ToolDefinition,
+    /// Build an [`Intention`] from raw JSON arguments.
+    to_intention: fn(&str) -> Intention,
+    requires_approval: bool,
+}
+
+impl std::fmt::Debug for BuiltinEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BuiltinEntry")
+            .field("definition", &self.definition.name)
+            .field("requires_approval", &self.requires_approval)
+            .finish()
+    }
+}
+
+/// Entry for a declarative tool loaded from `tools/*.yml`.
+#[derive(Debug)]
+pub(crate) struct DeclarativeEntry {
+    pub(crate) definition: ToolDefinition,
+    pub(crate) config: ToolConfig,
+}
+
+/// The tool catalog. Constructed once per [`super::Runtime`] and shared by
+/// the config validator, the pipeline handler, and the action executor.
+#[derive(Debug)]
+pub struct ToolCatalog {
+    builtin: HashMap<String, BuiltinEntry>,
+    declarative: HashMap<String, DeclarativeEntry>,
+    // Future: programmatic: HashMap<String, Arc<dyn ProgrammaticTool>>,
+}
+
+impl ToolCatalog {
+    /// Build a catalog seeded with the seven built-in tools.
+    pub fn builtin_only() -> Self {
+        let mut builtin = HashMap::new();
+
+        register_builtin(&mut builtin, "execute_shell_command",
+            "Execute a shell command on the host",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "The shell command to run"},
+                    "timeout_secs": {"type": "integer", "description": "Timeout in seconds (default 30)"}
+                },
+                "required": ["command"]
+            }),
+            |args_json| {
+                let args: serde_json::Value = serde_json::from_str(args_json).unwrap_or_default();
+                Intention::ExecuteShellCommand {
+                    command: args.get("command").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    timeout_secs: args.get("timeout_secs").and_then(|v| v.as_u64()),
+                }
+            },
+            false, // approval is handled by ContractEngine's PolicyEngine
+        );
+
+        register_builtin(&mut builtin, "write_file",
+            "Write content to a file",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Relative path from project root"},
+                    "content": {"type": "string", "description": "File content to write"}
+                },
+                "required": ["path", "content"]
+            }),
+            |args_json| {
+                let args: serde_json::Value = serde_json::from_str(args_json).unwrap_or_default();
+                Intention::WriteFile {
+                    path: args.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    content: args.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                }
+            },
+            false,
+        );
+
+        register_builtin(&mut builtin, "read_file",
+            "Read a file's contents",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Relative path from project root"}
+                },
+                "required": ["path"]
+            }),
+            |args_json| {
+                let args: serde_json::Value = serde_json::from_str(args_json).unwrap_or_default();
+                Intention::ReadFile {
+                    path: args.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                }
+            },
+            false,
+        );
+
+        register_builtin(&mut builtin, "web_search",
+            "Search the web for information",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query"}
+                },
+                "required": ["query"]
+            }),
+            |args_json| {
+                let args: serde_json::Value = serde_json::from_str(args_json).unwrap_or_default();
+                Intention::WebSearch {
+                    query: args.get("query").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                }
+            },
+            false,
+        );
+
+        register_builtin(&mut builtin, "web_scrape",
+            "Fetch the contents of a URL",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "URL to fetch"}
+                },
+                "required": ["url"]
+            }),
+            |args_json| {
+                let args: serde_json::Value = serde_json::from_str(args_json).unwrap_or_default();
+                Intention::WebScrape {
+                    url: args.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                }
+            },
+            false,
+        );
+
+        register_builtin(&mut builtin, "write_memory",
+            "Store a key-value pair in the agent's memory",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string", "description": "Memory key"},
+                    "content": {"type": "string", "description": "Content to store"}
+                },
+                "required": ["key", "content"]
+            }),
+            |args_json| {
+                let args: serde_json::Value = serde_json::from_str(args_json).unwrap_or_default();
+                Intention::WriteMemory {
+                    key: args.get("key").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    content: args.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                }
+            },
+            false,
+        );
+
+        register_builtin(&mut builtin, "spawn_sub_agent",
+            "Spawn a sub-agent to handle a subtask",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Sub-agent name"},
+                    "task": {"type": "string", "description": "Task description for the sub-agent"}
+                },
+                "required": ["name", "task"]
+            }),
+            |args_json| {
+                let args: serde_json::Value = serde_json::from_str(args_json).unwrap_or_default();
+                Intention::SpawnSubAgent {
+                    name: args.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    task: args.get("task").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                }
+            },
+            false,
+        );
+
+        Self {
+            builtin,
+            declarative: HashMap::new(),
+        }
+    }
+
+    /// Build a catalog from built-ins plus declarative tool configs.
+    /// Returns an error if a declarative tool name collides with a built-in.
+    pub fn with_declarative(
+        tools: &HashMap<String, ToolConfig>,
+    ) -> Result<Self, String> {
+        let mut catalog = Self::builtin_only();
+
+        for (name, config) in tools {
+            if catalog.builtin.contains_key(name) {
+                return Err(format!(
+                    "declarative tool '{}' collides with built-in tool of the same name",
+                    name
+                ));
+            }
+
+            let definition = ToolDefinition {
+                name: config.name.clone(),
+                description: config.description.clone(),
+                parameters: config.parameters.clone(),
+            };
+
+            catalog.declarative.insert(
+                name.clone(),
+                DeclarativeEntry {
+                    definition,
+                    config: config.clone(),
+                },
+            );
+        }
+
+        Ok(catalog)
+    }
+
+    /// Is this tool name registered in the catalog?
+    pub fn knows(&self, name: &str) -> bool {
+        self.builtin.contains_key(name) || self.declarative.contains_key(name)
+    }
+
+    /// Is this a declarative (YAML-defined) tool?
+    pub fn is_declarative(&self, name: &str) -> bool {
+        self.declarative.contains_key(name)
+    }
+
+    /// Get the [`ToolConfig`] for a declarative tool.
+    pub(crate) fn declarative_config(&self, name: &str) -> Option<&ToolConfig> {
+        self.declarative.get(name).map(|e| &e.config)
+    }
+
+    /// Get the [`ToolDefinition`] for a tool (sent to the LLM).
+    pub fn definition(&self, name: &str) -> Option<&ToolDefinition> {
+        self.builtin
+            .get(name)
+            .map(|e| &e.definition)
+            .or_else(|| self.declarative.get(name).map(|e| &e.definition))
+    }
+
+    /// Build the tool definition list for an agent's declared tool names.
+    pub fn definitions_for_agent(&self, tools: &[String]) -> Vec<ToolDefinition> {
+        tools
+            .iter()
+            .filter_map(|name| self.definition(name))
+            .cloned()
+            .collect()
+    }
+
+    /// Map a tool call to an [`Intention`] for ESAA evaluation.
+    pub fn intention(&self, name: &str, arguments_json: &str) -> Intention {
+        if let Some(entry) = self.builtin.get(name) {
+            return (entry.to_intention)(arguments_json);
+        }
+
+        // Declarative and unknown tools both map to CallCustomTool.
+        Intention::CallCustomTool {
+            tool_name: name.to_string(),
+            arguments: arguments_json.to_string(),
+        }
+    }
+
+    /// Does this tool require human approval by default?
+    pub fn requires_approval(&self, name: &str) -> bool {
+        if let Some(entry) = self.builtin.get(name) {
+            return entry.requires_approval;
+        }
+        if let Some(entry) = self.declarative.get(name) {
+            return entry.config.effective_requires_approval();
+        }
+        false
+    }
+
+    /// All known tool names (for error messages / help text).
+    pub fn all_tool_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.builtin.keys().map(|s| s.as_str()).collect();
+        names.extend(self.declarative.keys().map(|s| s.as_str()));
+        names.sort_unstable();
+        names
+    }
+}
+
+impl ToolNameResolver for ToolCatalog {
+    fn knows(&self, name: &str) -> bool {
+        self.knows(name)
+    }
+
+    fn all_tool_names(&self) -> Vec<&str> {
+        self.all_tool_names()
+    }
+}
+
+fn register_builtin(
+    map: &mut HashMap<String, BuiltinEntry>,
+    name: &str,
+    description: &str,
+    parameters: serde_json::Value,
+    to_intention: fn(&str) -> Intention,
+    requires_approval: bool,
+) {
+    map.insert(
+        name.to_string(),
+        BuiltinEntry {
+            definition: ToolDefinition {
+                name: name.to_string(),
+                description: description.to_string(),
+                parameters,
+            },
+            to_intention,
+            requires_approval,
+        },
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::tool::{ImplementationConfig, HttpMethod};
+
+    fn make_http_tool(name: &str) -> ToolConfig {
+        ToolConfig {
+            name: name.to_string(),
+            description: format!("Test tool {name}"),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+            requires_approval: None,
+            implementation: ImplementationConfig::Http {
+                method: HttpMethod::Post,
+                url: "https://example.com".into(),
+                headers: HashMap::new(),
+                body_template: None,
+            },
+        }
+    }
+
+    #[test]
+    fn builtin_catalog_knows_all_seven() {
+        let catalog = ToolCatalog::builtin_only();
+        let expected = [
+            "execute_shell_command",
+            "write_file",
+            "read_file",
+            "web_search",
+            "web_scrape",
+            "write_memory",
+            "spawn_sub_agent",
+        ];
+        for name in &expected {
+            assert!(catalog.knows(name), "catalog should know {name}");
+            assert!(catalog.definition(name).is_some(), "catalog should have definition for {name}");
+        }
+        assert_eq!(catalog.all_tool_names().len(), 7);
+    }
+
+    #[test]
+    fn unknown_tool_not_known() {
+        let catalog = ToolCatalog::builtin_only();
+        assert!(!catalog.knows("my_custom_tool"));
+        assert!(catalog.definition("my_custom_tool").is_none());
+    }
+
+    #[test]
+    fn definitions_for_agent_filters_correctly() {
+        let catalog = ToolCatalog::builtin_only();
+        let tools = vec!["web_search".into(), "nonexistent".into(), "read_file".into()];
+        let defs = catalog.definitions_for_agent(&tools);
+        assert_eq!(defs.len(), 2);
+        assert_eq!(defs[0].name, "web_search");
+        assert_eq!(defs[1].name, "read_file");
+    }
+
+    #[test]
+    fn intention_builtin_maps_correctly() {
+        let catalog = ToolCatalog::builtin_only();
+        let intention = catalog.intention("execute_shell_command", r#"{"command":"ls -la"}"#);
+        assert_eq!(intention.tag(), "execute_shell_command");
+
+        let intention = catalog.intention("write_file", r#"{"path":"a.txt","content":"hello"}"#);
+        assert_eq!(intention.tag(), "write_file");
+    }
+
+    #[test]
+    fn intention_unknown_falls_to_custom() {
+        let catalog = ToolCatalog::builtin_only();
+        let intention = catalog.intention("my_api", r#"{"key":"val"}"#);
+        assert_eq!(intention.tag(), "call_custom_tool");
+    }
+
+    #[test]
+    fn requires_approval_defaults() {
+        let catalog = ToolCatalog::builtin_only();
+        assert!(!catalog.requires_approval("execute_shell_command"));
+        assert!(!catalog.requires_approval("write_file"));
+        assert!(!catalog.requires_approval("unknown_tool"));
+    }
+
+    #[test]
+    fn declarative_tool_registered() {
+        let mut tools = HashMap::new();
+        tools.insert("slack_post".into(), make_http_tool("slack_post"));
+
+        let catalog = ToolCatalog::with_declarative(&tools).unwrap();
+        assert!(catalog.knows("slack_post"));
+        assert!(catalog.is_declarative("slack_post"));
+        assert!(!catalog.is_declarative("web_search")); // builtin, not declarative
+        assert_eq!(catalog.all_tool_names().len(), 8); // 7 builtin + 1
+
+        let def = catalog.definition("slack_post").unwrap();
+        assert_eq!(def.name, "slack_post");
+    }
+
+    #[test]
+    fn declarative_tool_in_agent_definitions() {
+        let mut tools = HashMap::new();
+        tools.insert("my_api".into(), make_http_tool("my_api"));
+        let catalog = ToolCatalog::with_declarative(&tools).unwrap();
+
+        let defs = catalog.definitions_for_agent(&["read_file".into(), "my_api".into()]);
+        assert_eq!(defs.len(), 2);
+        assert_eq!(defs[1].name, "my_api");
+    }
+
+    #[test]
+    fn declarative_intention_is_call_custom() {
+        let mut tools = HashMap::new();
+        tools.insert("my_api".into(), make_http_tool("my_api"));
+        let catalog = ToolCatalog::with_declarative(&tools).unwrap();
+
+        let intention = catalog.intention("my_api", r#"{"key":"val"}"#);
+        assert_eq!(intention.tag(), "call_custom_tool");
+    }
+
+    #[test]
+    fn declarative_requires_approval_http_default() {
+        let mut tools = HashMap::new();
+        tools.insert("my_api".into(), make_http_tool("my_api"));
+        let catalog = ToolCatalog::with_declarative(&tools).unwrap();
+        assert!(!catalog.requires_approval("my_api"));
+    }
+
+    #[test]
+    fn declarative_requires_approval_override() {
+        let mut tools = HashMap::new();
+        let mut tool = make_http_tool("sensitive");
+        tool.requires_approval = Some(true);
+        tools.insert("sensitive".into(), tool);
+
+        let catalog = ToolCatalog::with_declarative(&tools).unwrap();
+        assert!(catalog.requires_approval("sensitive"));
+    }
+
+    #[test]
+    fn builtin_name_collision_is_error() {
+        let mut tools = HashMap::new();
+        tools.insert("web_search".into(), make_http_tool("web_search"));
+
+        let err = ToolCatalog::with_declarative(&tools).unwrap_err();
+        assert!(err.contains("collides with built-in"));
+    }
+}

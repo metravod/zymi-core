@@ -32,6 +32,7 @@
 
 pub mod action_executor;
 pub mod event_router;
+pub mod tool_catalog;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -45,8 +46,9 @@ use crate::events::store::{open_store, EventStore, StoreBackend, TailWatcherPoli
 use crate::llm::{self, LlmProvider};
 use crate::policy::PolicyEngine;
 
-pub use action_executor::{ActionContext, ActionExecutor, BuiltinActionExecutor};
+pub use action_executor::{ActionContext, ActionExecutor, BuiltinActionExecutor, CatalogActionExecutor};
 pub use event_router::EventCommandRouter;
+pub use tool_catalog::ToolCatalog;
 
 /// Per-project bundle of infrastructure shared by command handlers.
 ///
@@ -63,6 +65,7 @@ pub struct Runtime {
     orchestrator: Arc<Orchestrator>,
     approval: Option<Arc<dyn ApprovalHandler>>,
     action_executor: Arc<dyn ActionExecutor>,
+    tool_catalog: Arc<ToolCatalog>,
     tail_policy: TailWatcherPolicy,
 }
 
@@ -115,6 +118,10 @@ impl Runtime {
 
     pub fn action_executor(&self) -> &Arc<dyn ActionExecutor> {
         &self.action_executor
+    }
+
+    pub fn tool_catalog(&self) -> &Arc<ToolCatalog> {
+        &self.tool_catalog
     }
 
     /// The cross-process [`crate::events::store::StoreTailWatcher`] policy
@@ -242,9 +249,17 @@ impl RuntimeBuilder {
                 .map_err(|e| format!("failed to create LLM provider: {e}"))?,
         );
 
-        // 4. Action executor — defaults to the built-in tool dispatcher.
+        // 4. Tool catalog — built-in tools + declarative tools from
+        //    workspace.tools (tools/*.yml). Programmatic registrations
+        //    come later via with_programmatic_tool().
+        let tool_catalog = Arc::new(
+            ToolCatalog::with_declarative(&workspace.tools)
+                .map_err(|e| format!("tool catalog error: {e}"))?,
+        );
+
+        // 5. Action executor — defaults to the catalog-aware dispatcher.
         let action_executor: Arc<dyn ActionExecutor> = action_executor
-            .unwrap_or_else(|| Arc::new(BuiltinActionExecutor::new()) as Arc<dyn ActionExecutor>);
+            .unwrap_or_else(|| Arc::new(CatalogActionExecutor::new(Arc::clone(&tool_catalog))) as Arc<dyn ActionExecutor>);
 
         Ok(Runtime {
             workspace: Arc::new(workspace),
@@ -256,6 +271,7 @@ impl RuntimeBuilder {
             orchestrator,
             approval,
             action_executor,
+            tool_catalog,
             tail_policy: tail_policy.unwrap_or_default(),
         })
     }

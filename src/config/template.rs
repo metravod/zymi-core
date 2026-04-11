@@ -35,8 +35,8 @@ pub fn resolve_templates(
                 result.replace_range(full_match.range(), &val);
             }
             None => {
-                // ${inputs.*} are kept as-is for runtime resolution.
-                if !key.starts_with("inputs.") {
+                // ${inputs.*} and ${args.*} are kept as-is for runtime resolution.
+                if !key.starts_with("inputs.") && !key.starts_with("args.") {
                     unresolved = Some(key.to_owned());
                 }
             }
@@ -63,8 +63,8 @@ fn resolve_key(key: &str, vars: &HashMap<String, String>) -> Option<String> {
         return vars.get(&format!("project.{field}")).cloned();
     }
 
-    // Pipeline inputs are left as-is.
-    if key.starts_with("inputs.") {
+    // Pipeline inputs and tool args are left as-is for runtime resolution.
+    if key.starts_with("inputs.") || key.starts_with("args.") {
         return None;
     }
 

@@ -4,6 +4,7 @@ pub mod error;
 pub mod pipeline;
 pub mod project;
 pub mod template;
+pub mod tool;
 pub mod validate;
 
 use std::collections::HashMap;
@@ -14,6 +15,7 @@ pub use error::ConfigError;
 pub use dag::{build_execution_plan, ExecutionPlan};
 pub use pipeline::{PipelineConfig, PipelineInput, PipelineOutput, PipelineStep};
 pub use project::{ContractsConfig, DefaultsConfig, LangfuseConfig, LlmConfig, ProjectConfig, ServicesConfig};
+pub use tool::{ToolConfig, ImplementationConfig, HttpMethod};
 
 /// A fully loaded and validated workspace.
 #[derive(Debug, Clone)]
@@ -21,6 +23,7 @@ pub struct WorkspaceConfig {
     pub project: ProjectConfig,
     pub agents: HashMap<String, AgentConfig>,
     pub pipelines: HashMap<String, PipelineConfig>,
+    pub tools: HashMap<String, tool::ToolConfig>,
 }
 
 /// Load and validate an entire project directory.
@@ -106,13 +109,49 @@ pub fn load_project_dir(root: &Path) -> Result<WorkspaceConfig, ConfigError> {
         }
     }
 
-    // 5. Cross-validate
-    validate::validate_workspace(&agents, &pipelines)?;
+    // 5. Load all tool YAMLs
+    let tools_dir = root.join("tools");
+    let mut tools = HashMap::new();
+    let mut tool_sources: HashMap<String, std::path::PathBuf> = HashMap::new();
+    if tools_dir.is_dir() {
+        for entry in std::fs::read_dir(&tools_dir).map_err(|e| ConfigError::Io {
+            path: tools_dir.clone(),
+            source: e,
+        })? {
+            let entry = entry.map_err(|e| ConfigError::Io {
+                path: tools_dir.clone(),
+                source: e,
+            })?;
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "yml" || ext == "yaml") {
+                let cfg = tool::load_tool(&path, &vars)?;
+                if let Some(first_path) = tool_sources.get(&cfg.name) {
+                    return Err(ConfigError::DuplicateName {
+                        kind: "tool".into(),
+                        name: cfg.name,
+                        first: first_path.clone(),
+                        second: path,
+                    });
+                }
+                tool_sources.insert(cfg.name.clone(), path);
+                tools.insert(cfg.name.clone(), cfg);
+            }
+        }
+    }
+
+    // 6. Cross-validate (uses the static builtin tool list; the Runtime
+    //    re-validates against the full ToolCatalog at build time if needed).
+    validate::validate_workspace(
+        &agents,
+        &pipelines,
+        &validate::BuiltinToolNameResolver,
+    )?;
 
     Ok(WorkspaceConfig {
         project,
         agents,
         pipelines,
+        tools,
     })
 }
 

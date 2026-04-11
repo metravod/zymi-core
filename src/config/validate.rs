@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use super::agent::{AgentConfig, KNOWN_TOOLS};
+use super::agent::AgentConfig;
 use super::error::ConfigError;
 use super::pipeline::PipelineConfig;
 
@@ -12,13 +12,14 @@ use super::pipeline::PipelineConfig;
 /// 2. Pipeline `depends_on` references valid step IDs within the same pipeline.
 /// 3. Pipeline `output.step` references a valid step ID.
 /// 4. No cycles in pipeline DAGs.
-/// 5. Agent tool names are known Intention tags.
+/// 5. Agent tool names are registered in the tool catalog.
 pub fn validate_workspace(
     agents: &HashMap<String, AgentConfig>,
     pipelines: &HashMap<String, PipelineConfig>,
+    known_tools: &dyn ToolNameResolver,
 ) -> Result<(), ConfigError> {
     for agent in agents.values() {
-        validate_agent_tools(agent)?;
+        validate_agent_tools(agent, known_tools)?;
     }
 
     for pipeline in pipelines.values() {
@@ -29,21 +30,48 @@ pub fn validate_workspace(
     Ok(())
 }
 
-/// Check that all tool names in an agent config are known Intention tags.
-fn validate_agent_tools(agent: &AgentConfig) -> Result<(), ConfigError> {
+/// Trait for resolving tool names during validation.
+///
+/// Implemented by [`crate::runtime::ToolCatalog`] in runtime builds, and by
+/// a simple static-set fallback for non-runtime (config-only) validation.
+pub trait ToolNameResolver {
+    fn knows(&self, name: &str) -> bool;
+    fn all_tool_names(&self) -> Vec<&str>;
+}
+
+/// Check that all tool names in an agent config are registered in the catalog.
+fn validate_agent_tools(
+    agent: &AgentConfig,
+    known_tools: &dyn ToolNameResolver,
+) -> Result<(), ConfigError> {
     for tool in &agent.tools {
-        if !KNOWN_TOOLS.contains(&tool.as_str()) {
+        if !known_tools.knows(tool) {
             return Err(ConfigError::Validation {
                 message: format!(
                     "agent `{}` references unknown tool `{}`",
                     agent.name, tool
                 ),
-                help: format!("known tools: {}", KNOWN_TOOLS.join(", ")),
+                help: format!("known tools: {}", known_tools.all_tool_names().join(", ")),
                 path: PathBuf::from(format!("agents/{}.yml", agent.name)),
             });
         }
     }
     Ok(())
+}
+
+/// Default resolver that uses the static [`super::agent::KNOWN_TOOLS`] list.
+/// Used by [`super::load_project_dir`] which runs before a `Runtime` (and
+/// therefore a `ToolCatalog`) exists.
+pub struct BuiltinToolNameResolver;
+
+impl ToolNameResolver for BuiltinToolNameResolver {
+    fn knows(&self, name: &str) -> bool {
+        super::agent::KNOWN_TOOLS.contains(&name)
+    }
+
+    fn all_tool_names(&self) -> Vec<&str> {
+        super::agent::KNOWN_TOOLS.to_vec()
+    }
 }
 
 /// Check that pipeline steps reference existing agents and valid step IDs.
@@ -217,7 +245,7 @@ mod tests {
             ),
         );
 
-        assert!(validate_workspace(&agents, &pipelines).is_ok());
+        assert!(validate_workspace(&agents, &pipelines, &BuiltinToolNameResolver).is_ok());
     }
 
     #[test]
@@ -225,7 +253,7 @@ mod tests {
         let mut agents = HashMap::new();
         agents.insert("a".into(), agent("a", vec!["nonexistent_tool"]));
 
-        let err = validate_workspace(&agents, &HashMap::new()).unwrap_err();
+        let err = validate_workspace(&agents, &HashMap::new(), &BuiltinToolNameResolver).unwrap_err();
         assert!(matches!(err, ConfigError::Validation { .. }));
     }
 
@@ -239,7 +267,7 @@ mod tests {
             pipeline_from_steps("p", vec![("s1", "missing_agent", vec![])]),
         );
 
-        let err = validate_workspace(&agents, &pipelines).unwrap_err();
+        let err = validate_workspace(&agents, &pipelines, &BuiltinToolNameResolver).unwrap_err();
         assert!(matches!(err, ConfigError::Validation { message, .. } if message.contains("missing_agent")));
     }
 
@@ -254,7 +282,7 @@ mod tests {
             pipeline_from_steps("p", vec![("s1", "a", vec!["nonexistent"])]),
         );
 
-        let err = validate_workspace(&agents, &pipelines).unwrap_err();
+        let err = validate_workspace(&agents, &pipelines, &BuiltinToolNameResolver).unwrap_err();
         assert!(matches!(err, ConfigError::Validation { message, .. } if message.contains("nonexistent")));
     }
 
@@ -269,7 +297,7 @@ mod tests {
             pipeline_from_steps("p", vec![("s1", "a", vec!["s1"])]),
         );
 
-        let err = validate_workspace(&agents, &pipelines).unwrap_err();
+        let err = validate_workspace(&agents, &pipelines, &BuiltinToolNameResolver).unwrap_err();
         assert!(matches!(err, ConfigError::CyclicDependency { .. }));
     }
 
@@ -291,7 +319,7 @@ mod tests {
             ),
         );
 
-        let err = validate_workspace(&agents, &pipelines).unwrap_err();
+        let err = validate_workspace(&agents, &pipelines, &BuiltinToolNameResolver).unwrap_err();
         assert!(matches!(err, ConfigError::CyclicDependency { .. }));
     }
 
@@ -314,7 +342,7 @@ mod tests {
             ),
         );
 
-        assert!(validate_workspace(&agents, &pipelines).is_ok());
+        assert!(validate_workspace(&agents, &pipelines, &BuiltinToolNameResolver).is_ok());
     }
 
     #[test]
@@ -329,7 +357,7 @@ mod tests {
         });
         pipelines.insert("p".into(), p);
 
-        let err = validate_workspace(&agents, &pipelines).unwrap_err();
+        let err = validate_workspace(&agents, &pipelines, &BuiltinToolNameResolver).unwrap_err();
         assert!(matches!(err, ConfigError::Validation { message, .. } if message.contains("nonexistent")));
     }
 }
