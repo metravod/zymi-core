@@ -15,9 +15,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux x86_64
+          # Linux x86_64 (Docker/manylinux — need explicit -i)
           - os: ubuntu-latest
             target: x86_64
+            args-extra: -i python3.11
           # Linux aarch64 (Docker/QEMU — need explicit -i)
           - os: ubuntu-latest
             target: aarch64
