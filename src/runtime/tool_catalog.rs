@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 
-use crate::config::tool::ToolConfig;
+use crate::config::tool::{ImplementationConfig, ToolConfig};
 use crate::config::validate::ToolNameResolver;
 use crate::esaa::Intention;
 use crate::types::ToolDefinition;
@@ -265,12 +265,34 @@ impl ToolCatalog {
     }
 
     /// Map a tool call to an [`Intention`] for ESAA evaluation.
+    ///
+    /// Declarative `kind: shell` tools map to
+    /// [`Intention::ExecuteShellCommand`] (same gate as the built-in) with
+    /// the resolved command template. All other declarative tools map to
+    /// [`Intention::CallCustomTool`].
     pub fn intention(&self, name: &str, arguments_json: &str) -> Intention {
         if let Some(entry) = self.builtin.get(name) {
             return (entry.to_intention)(arguments_json);
         }
 
-        // Declarative and unknown tools both map to CallCustomTool.
+        if let Some(entry) = self.declarative.get(name) {
+            if let ImplementationConfig::Shell {
+                command_template,
+                timeout_secs,
+            } = &entry.config.implementation
+            {
+                let args = crate::runtime::action_executor::parse_args_for_interpolation(
+                    arguments_json,
+                );
+                let resolved =
+                    crate::runtime::action_executor::resolve_args(command_template, &args);
+                return Intention::ExecuteShellCommand {
+                    command: resolved,
+                    timeout_secs: *timeout_secs,
+                };
+            }
+        }
+
         Intention::CallCustomTool {
             tool_name: name.to_string(),
             arguments: arguments_json.to_string(),
@@ -472,5 +494,76 @@ mod tests {
 
         let err = ToolCatalog::with_declarative(&tools).unwrap_err();
         assert!(err.contains("collides with built-in"));
+    }
+
+    fn make_shell_tool(name: &str, command_template: &str) -> ToolConfig {
+        ToolConfig {
+            name: name.to_string(),
+            description: format!("Shell tool {name}"),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "dir": {"type": "string"}
+                },
+                "required": ["dir"]
+            }),
+            requires_approval: None,
+            implementation: ImplementationConfig::Shell {
+                command_template: command_template.to_string(),
+                timeout_secs: Some(60),
+            },
+        }
+    }
+
+    #[test]
+    fn shell_tool_registered_and_known() {
+        let mut tools = HashMap::new();
+        tools.insert(
+            "run_tests".into(),
+            make_shell_tool("run_tests", "cd ${args.dir} && cargo test"),
+        );
+        let catalog = ToolCatalog::with_declarative(&tools).unwrap();
+        assert!(catalog.knows("run_tests"));
+        assert!(catalog.is_declarative("run_tests"));
+        assert_eq!(catalog.all_tool_names().len(), 8);
+    }
+
+    #[test]
+    fn shell_tool_requires_approval_by_default() {
+        let mut tools = HashMap::new();
+        tools.insert("sh".into(), make_shell_tool("sh", "echo hi"));
+        let catalog = ToolCatalog::with_declarative(&tools).unwrap();
+        assert!(catalog.requires_approval("sh"));
+    }
+
+    #[test]
+    fn shell_tool_intention_maps_to_execute_shell_command() {
+        let mut tools = HashMap::new();
+        tools.insert(
+            "run_tests".into(),
+            make_shell_tool("run_tests", "cd ${args.dir} && cargo test"),
+        );
+        let catalog = ToolCatalog::with_declarative(&tools).unwrap();
+
+        let intention = catalog.intention("run_tests", r#"{"dir":"src"}"#);
+        assert_eq!(intention.tag(), "execute_shell_command");
+
+        // Verify the command was resolved.
+        if let Intention::ExecuteShellCommand { command, timeout_secs } = &intention {
+            assert_eq!(command, "cd src && cargo test");
+            assert_eq!(*timeout_secs, Some(60));
+        } else {
+            panic!("expected ExecuteShellCommand");
+        }
+    }
+
+    #[test]
+    fn http_tool_intention_stays_call_custom() {
+        let mut tools = HashMap::new();
+        tools.insert("api".into(), make_http_tool("api"));
+        let catalog = ToolCatalog::with_declarative(&tools).unwrap();
+
+        let intention = catalog.intention("api", r#"{"key":"val"}"#);
+        assert_eq!(intention.tag(), "call_custom_tool");
     }
 }

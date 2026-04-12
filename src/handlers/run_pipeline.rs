@@ -220,6 +220,11 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
     )
     .await;
 
+    // Close the persistent shell session for this stream (ADR-0015 §3).
+    rt.shell_pool()
+        .close_session(&stream_id, "workflow_end")
+        .await;
+
     Ok(PipelineResult {
         pipeline_name: pipeline.name.clone(),
         step_results: all_results,
@@ -411,6 +416,7 @@ async fn run_agent_step(
                             let ctx = ActionContext {
                                 project_root,
                                 memory,
+                                stream_id,
                             };
                             match action_executor.execute(&tc.name, &tc.arguments, &ctx).await {
                                 Ok(output) => output,

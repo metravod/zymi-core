@@ -153,6 +153,21 @@ pub enum EventKind {
         success: bool,
     },
 
+    // -- Shell session lifecycle (ADR-0015) --
+    /// A persistent shell session was created for a stream.
+    /// History-only: replay does not recreate the shell.
+    ShellSessionStarted {
+        stream_id: String,
+        pid: u32,
+        shell_path: String,
+    },
+    /// A persistent shell session was closed.
+    ShellSessionClosed {
+        stream_id: String,
+        /// `"idle"` | `"workflow_end"` | `"killed"` | `"exit"`
+        reason: String,
+    },
+
     // -- Pipeline service contract (cross-process trigger/result) --
     /// External request to run a named pipeline. Published by clients
     /// (e.g. Django) and consumed by `zymi serve <pipeline>`.
@@ -192,6 +207,8 @@ impl EventKind {
             EventKind::WorkflowNodeStarted { .. } => "workflow_node_started",
             EventKind::WorkflowNodeCompleted { .. } => "workflow_node_completed",
             EventKind::WorkflowCompleted { .. } => "workflow_completed",
+            EventKind::ShellSessionStarted { .. } => "shell_session_started",
+            EventKind::ShellSessionClosed { .. } => "shell_session_closed",
             EventKind::PipelineRequested { .. } => "pipeline_requested",
             EventKind::PipelineCompleted { .. } => "pipeline_completed",
         }
@@ -270,6 +287,26 @@ mod tests {
         let json = serde_json::to_string(&kind).unwrap();
         let back: EventKind = serde_json::from_str(&json).unwrap();
         assert_eq!(back.tag(), "pipeline_completed");
+    }
+
+    #[test]
+    fn shell_session_events_serialization_roundtrip() {
+        let started = EventKind::ShellSessionStarted {
+            stream_id: "s-1".into(),
+            pid: 12345,
+            shell_path: "bash".into(),
+        };
+        let json = serde_json::to_string(&started).unwrap();
+        let back: EventKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.tag(), "shell_session_started");
+
+        let closed = EventKind::ShellSessionClosed {
+            stream_id: "s-1".into(),
+            reason: "workflow_end".into(),
+        };
+        let json = serde_json::to_string(&closed).unwrap();
+        let back: EventKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.tag(), "shell_session_closed");
     }
 
     #[test]

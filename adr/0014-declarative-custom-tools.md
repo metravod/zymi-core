@@ -178,3 +178,34 @@ To avoid landing this as one ~900-LoC PR, the work splits cleanly into four slic
 4. **Slice 4 — `kind: python` + `ProgrammaticTool` bridge for `ToolRegistry`.** Connects ADR-0007's existing registry to the catalog and adds the `python` implementation kind. Only this slice touches the `python` feature build.
 
 Each slice updates this ADR with a "Slice N — what landed" section the same way ADR-0013 does.
+
+## Slice 1 — what landed (v0.1.5, 2026-04-11)
+
+Introduced `src/runtime/tool_catalog.rs` with `ToolCatalog` as the single registry of all tools. The catalog owns `BuiltinEntry` (seven built-in tools) and `DeclarativeEntry` (from `tools/*.yml`), and answers `knows()`, `definition()`, `definitions_for_agent()`, `intention()`, and `requires_approval()` for any tool name regardless of source.
+
+Key changes:
+- `src/config/validate.rs` — extracted `ToolNameResolver` trait; `validate_agent_tools` now accepts `&dyn ToolNameResolver` instead of checking `KNOWN_TOOLS` directly. `BuiltinToolNameResolver` is the static fallback for config-only validation (before a `Runtime` exists).
+- `src/handlers/run_pipeline.rs` — removed `tool_call_to_intention()` function (66 lines); tool-call-to-intention mapping moved into `ToolCatalog::intention()`. `run_agent_step` now takes `&ToolCatalog` and uses `catalog.definitions_for_agent()` / `catalog.intention()`.
+- `src/runtime/action_executor.rs` — `BuiltinActionExecutor` kept for backwards compat; added `CatalogActionExecutor` as the new default (dispatches via catalog).
+- `src/runtime/mod.rs` — `Runtime` gained `tool_catalog: Arc<ToolCatalog>` field and accessor. Builder constructs catalog from `workspace.tools` and defaults to `CatalogActionExecutor`.
+- `src/lib.rs` — re-exports `ToolCatalog` and `CatalogActionExecutor`.
+
+`KNOWN_TOOLS` in `agent.rs` remains as the canonical built-in list but is no longer the load-bearing constant — it is only used by `BuiltinToolNameResolver` for pre-runtime validation.
+
+## Slice 2 — what landed (v0.1.5, 2026-04-11)
+
+Added `src/config/tool.rs` with `ToolConfig`, `ImplementationConfig` (`kind: http`), and `HttpMethod` types. `tools/*.yml` files are loaded by `load_project_dir` (step 5, between pipelines and cross-validation) with duplicate-name detection.
+
+Key changes:
+- `src/config/tool.rs` — `ToolConfig` with `name`, `description`, `parameters` (JSON Schema), `requires_approval` (optional, kind-aware default via `effective_requires_approval()`), and `implementation` (tagged enum). `load_tool()` parses YAML with template resolution.
+- `src/config/template.rs` — `${args.*}` added to the unresolved-at-parse-time list alongside `${inputs.*}`, so tool body templates survive parse-time resolution and are filled at call time.
+- `src/config/mod.rs` — `WorkspaceConfig` gained `tools: HashMap<String, ToolConfig>`; `load_project_dir` scans `tools/` directory.
+- `src/runtime/tool_catalog.rs` — `ToolCatalog::with_declarative()` builds from builtins + declarative tools; name collisions with builtins are a hard error.
+- `src/runtime/action_executor.rs` — `CatalogActionExecutor::execute()` dispatches declarative tools to `execute_declarative_http()`, which resolves `${args.X}` in URL/headers/body_template and fires a reqwest call. Added `parse_args_for_interpolation()` (flattens JSON to string map) and `resolve_args()` (placeholder substitution).
+
+What was deferred from the ADR design:
+- `kind: shell` (was slice 3 in the ADR) — deferred; not needed for the Habr launch.
+- `kind: python` (was slice 4) — reprioritised as slice 3 (Python auto-discovery from `tools/*.py`).
+- `ProgrammaticTool` trait — not yet needed; will land with Python auto-discovery.
+- Unsafe-shell miette warning — deferred with `kind: shell`.
+- `intention` field on `ToolConfig` — deferred; all declarative tools map to `CallCustomTool` for now.

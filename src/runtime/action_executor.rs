@@ -13,12 +13,16 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 
 use crate::config::tool::{HttpMethod, ImplementationConfig};
 use crate::engine::tools::{execute_builtin_tool, MemoryStore};
+use super::shell_session::{ShellSessionPool};
 use super::tool_catalog::ToolCatalog;
+
+use log::warn;
 
 /// Per-call context for an [`ActionExecutor`].
 ///
@@ -31,6 +35,8 @@ use super::tool_catalog::ToolCatalog;
 pub struct ActionContext<'a> {
     pub project_root: &'a Path,
     pub memory: &'a MemoryStore,
+    /// Stream identifier — used to look up the persistent shell session.
+    pub stream_id: &'a str,
 }
 
 /// Executes an approved tool call. Implementors are expected to be
@@ -79,15 +85,17 @@ impl ActionExecutor for BuiltinActionExecutor {
 
 /// Catalog-aware executor: dispatches approved tool calls through the
 /// [`ToolCatalog`]. Built-in tools delegate to [`execute_builtin_tool`];
+/// `execute_shell_command` is routed to the persistent [`ShellSessionPool`];
 /// declarative `kind: http` tools are dispatched via reqwest.
 #[derive(Clone)]
 pub struct CatalogActionExecutor {
     catalog: Arc<ToolCatalog>,
+    shell_pool: Arc<ShellSessionPool>,
 }
 
 impl CatalogActionExecutor {
-    pub fn new(catalog: Arc<ToolCatalog>) -> Self {
-        Self { catalog }
+    pub fn new(catalog: Arc<ToolCatalog>, shell_pool: Arc<ShellSessionPool>) -> Self {
+        Self { catalog, shell_pool }
     }
 }
 
@@ -99,12 +107,142 @@ impl ActionExecutor for CatalogActionExecutor {
         arguments_json: &str,
         ctx: &ActionContext<'_>,
     ) -> Result<String, String> {
+        if tool_name == "execute_shell_command" {
+            return self.execute_shell(arguments_json, ctx).await;
+        }
         if self.catalog.is_declarative(tool_name) {
             let config = self.catalog.declarative_config(tool_name)
                 .ok_or_else(|| format!("declarative tool '{tool_name}' config missing"))?;
-            execute_declarative_http(config, arguments_json).await
+            match &config.implementation {
+                ImplementationConfig::Http { .. } => {
+                    execute_declarative_http(config, arguments_json).await
+                }
+                ImplementationConfig::Shell { .. } => {
+                    self.execute_declarative_shell(config, arguments_json, ctx)
+                        .await
+                }
+            }
         } else {
             execute_builtin_tool(tool_name, arguments_json, ctx.project_root, ctx.memory).await
+        }
+    }
+}
+
+impl CatalogActionExecutor {
+    /// Route a declarative `kind: shell` tool through the persistent pool.
+    ///
+    /// Resolves `${args.X}` placeholders in the command template, then
+    /// dispatches into the same [`ShellSessionPool`] as the built-in
+    /// `execute_shell_command`.
+    async fn execute_declarative_shell(
+        &self,
+        config: &crate::config::tool::ToolConfig,
+        arguments_json: &str,
+        ctx: &ActionContext<'_>,
+    ) -> Result<String, String> {
+        let (command_template, timeout_secs) = match &config.implementation {
+            ImplementationConfig::Shell {
+                command_template,
+                timeout_secs,
+            } => (command_template.as_str(), timeout_secs.unwrap_or(30)),
+            _ => return Err(format!("tool '{}' is not kind: shell", config.name)),
+        };
+
+        // Log a warning if requires_approval was explicitly set to false on a
+        // shell tool (ADR-0014 §4 unsafe-shell warning).
+        if config.requires_approval == Some(false) {
+            warn!(
+                "tool '{}' is kind=shell with requires_approval=false — \
+                 bypasses the execute_shell_command policy gate; \
+                 verify this is intentional",
+                config.name
+            );
+        }
+
+        let args = parse_args_for_interpolation(arguments_json);
+        let resolved_command = resolve_args(command_template, &args);
+
+        let output = self
+            .shell_pool
+            .run_command(
+                ctx.stream_id,
+                &resolved_command,
+                Duration::from_secs(timeout_secs),
+                ctx.project_root,
+            )
+            .await
+            .map_err(|e| format!("shell session error: {e}"))?;
+
+        if output.timed_out {
+            Err(format!(
+                "command timed out after {timeout_secs}s\nstdout: {}\nstderr: {}",
+                truncate_output(&output.stdout, 2000),
+                truncate_output(&output.stderr, 2000),
+            ))
+        } else if output.exit_code == 0 {
+            Ok(if output.stdout.is_empty() {
+                "(no output)".to_string()
+            } else {
+                truncate_output(&output.stdout, 4000)
+            })
+        } else {
+            Err(format!(
+                "exit code {}\nstdout: {}\nstderr: {}",
+                output.exit_code,
+                truncate_output(&output.stdout, 2000),
+                truncate_output(&output.stderr, 2000),
+            ))
+        }
+    }
+
+    /// Route `execute_shell_command` through the persistent shell pool.
+    async fn execute_shell(
+        &self,
+        arguments_json: &str,
+        ctx: &ActionContext<'_>,
+    ) -> Result<String, String> {
+        let args: serde_json::Value = serde_json::from_str(arguments_json)
+            .map_err(|e| format!("invalid tool arguments JSON: {e}"))?;
+
+        let command = args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .ok_or("missing 'command' argument")?;
+        let timeout_secs = args
+            .get("timeout_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(30);
+
+        let output = self
+            .shell_pool
+            .run_command(
+                ctx.stream_id,
+                command,
+                Duration::from_secs(timeout_secs),
+                ctx.project_root,
+            )
+            .await
+            .map_err(|e| format!("shell session error: {e}"))?;
+
+        if output.timed_out {
+            Err(format!(
+                "command timed out after {timeout_secs}s\nstdout: {}\nstderr: {}",
+                truncate_output(&output.stdout, 2000),
+                truncate_output(&output.stderr, 2000),
+            ))
+        } else if output.exit_code == 0 {
+            Ok(if output.stdout.is_empty() {
+                "(no output)".to_string()
+            } else {
+                truncate_output(&output.stdout, 4000)
+            })
+        } else {
+            Err(format!(
+                "exit code {}\nstdout: {}\nstderr: {}",
+                output.exit_code,
+                truncate_output(&output.stdout, 2000),
+                truncate_output(&output.stderr, 2000),
+            ))
         }
     }
 }
@@ -160,12 +298,17 @@ async fn execute_declarative_http(
                 Err(format!("HTTP {status}: {}", truncate_output(&body, 2000)))
             }
         }
+        // Shell tools are dispatched by CatalogActionExecutor before reaching
+        // this function; if we get here it's a bug.
+        ImplementationConfig::Shell { .. } => {
+            Err("kind: shell tools should be dispatched via execute_declarative_shell".into())
+        }
     }
 }
 
 /// Parse LLM arguments JSON into a flat string map for `${args.X}` substitution.
 /// Nested objects/arrays are serialized as JSON strings.
-fn parse_args_for_interpolation(arguments_json: &str) -> HashMap<String, String> {
+pub(crate) fn parse_args_for_interpolation(arguments_json: &str) -> HashMap<String, String> {
     let mut map = HashMap::new();
     if let Ok(serde_json::Value::Object(obj)) = serde_json::from_str(arguments_json) {
         for (key, value) in obj {
@@ -180,7 +323,7 @@ fn parse_args_for_interpolation(arguments_json: &str) -> HashMap<String, String>
 }
 
 /// Resolve `${args.X}` placeholders in a template string.
-fn resolve_args(template: &str, args: &HashMap<String, String>) -> String {
+pub(crate) fn resolve_args(template: &str, args: &HashMap<String, String>) -> String {
     let mut result = template.to_string();
     for (key, value) in args {
         result = result.replace(&format!("${{args.{key}}}"), value);
@@ -210,6 +353,7 @@ mod tests {
         let ctx = ActionContext {
             project_root: &root,
             memory: &memory,
+            stream_id: "test",
         };
         let executor = BuiltinActionExecutor::new();
         let result = executor
@@ -227,6 +371,7 @@ mod tests {
         let ctx = ActionContext {
             project_root: &root,
             memory: &memory,
+            stream_id: "test",
         };
         let executor = BuiltinActionExecutor::new();
         let err = executor
@@ -239,13 +384,15 @@ mod tests {
     #[tokio::test]
     async fn catalog_executor_dispatches_builtin() {
         let catalog = Arc::new(ToolCatalog::builtin_only());
+        let pool = Arc::new(ShellSessionPool::new(Duration::from_secs(60)));
         let memory = new_memory_store();
         let root = PathBuf::from(".");
         let ctx = ActionContext {
             project_root: &root,
             memory: &memory,
+            stream_id: "test",
         };
-        let executor = CatalogActionExecutor::new(catalog);
+        let executor = CatalogActionExecutor::new(catalog, pool);
         let result = executor
             .execute("write_memory", r#"{"key":"k2","content":"v2"}"#, &ctx)
             .await

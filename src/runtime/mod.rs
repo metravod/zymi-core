@@ -32,6 +32,7 @@
 
 pub mod action_executor;
 pub mod event_router;
+pub mod shell_session;
 pub mod tool_catalog;
 
 use std::path::{Path, PathBuf};
@@ -48,6 +49,7 @@ use crate::policy::PolicyEngine;
 
 pub use action_executor::{ActionContext, ActionExecutor, BuiltinActionExecutor, CatalogActionExecutor};
 pub use event_router::EventCommandRouter;
+pub use shell_session::ShellSessionPool;
 pub use tool_catalog::ToolCatalog;
 
 /// Per-project bundle of infrastructure shared by command handlers.
@@ -66,6 +68,7 @@ pub struct Runtime {
     approval: Option<Arc<dyn ApprovalHandler>>,
     action_executor: Arc<dyn ActionExecutor>,
     tool_catalog: Arc<ToolCatalog>,
+    shell_pool: Arc<ShellSessionPool>,
     tail_policy: TailWatcherPolicy,
 }
 
@@ -122,6 +125,10 @@ impl Runtime {
 
     pub fn tool_catalog(&self) -> &Arc<ToolCatalog> {
         &self.tool_catalog
+    }
+
+    pub fn shell_pool(&self) -> &Arc<ShellSessionPool> {
+        &self.shell_pool
     }
 
     /// The cross-process [`crate::events::store::StoreTailWatcher`] policy
@@ -257,9 +264,30 @@ impl RuntimeBuilder {
                 .map_err(|e| format!("tool catalog error: {e}"))?,
         );
 
-        // 5. Action executor — defaults to the catalog-aware dispatcher.
+        // 5. Persistent shell session pool (ADR-0015).
+        //    Reads runtime.shell config from project.yml; falls back to
+        //    ShellConfig::default() when the block is absent.
+        let shell_config = workspace
+            .project
+            .runtime
+            .as_ref()
+            .map(|r| &r.shell)
+            .cloned()
+            .unwrap_or_default();
+        let shell_pool = Arc::new(
+            ShellSessionPool::from_config(&shell_config)
+                .with_bus(Arc::clone(&bus)),
+        );
+        shell_pool.start_reaper();
+
+        // 6. Action executor — defaults to the catalog-aware dispatcher.
         let action_executor: Arc<dyn ActionExecutor> = action_executor
-            .unwrap_or_else(|| Arc::new(CatalogActionExecutor::new(Arc::clone(&tool_catalog))) as Arc<dyn ActionExecutor>);
+            .unwrap_or_else(|| {
+                Arc::new(CatalogActionExecutor::new(
+                    Arc::clone(&tool_catalog),
+                    Arc::clone(&shell_pool),
+                )) as Arc<dyn ActionExecutor>
+            });
 
         Ok(Runtime {
             workspace: Arc::new(workspace),
@@ -272,6 +300,7 @@ impl RuntimeBuilder {
             approval,
             action_executor,
             tool_catalog,
+            shell_pool,
             tail_policy: tail_policy.unwrap_or_default(),
         })
     }

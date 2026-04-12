@@ -131,11 +131,13 @@ fn indent(kind: &EventKind) -> &'static str {
         | EventKind::WorkflowStarted { .. }
         | EventKind::WorkflowCompleted { .. } => "",
 
-        // Level 1 — node / agent boundaries
+        // Level 1 — node / agent / shell session boundaries
         EventKind::WorkflowNodeStarted { .. }
         | EventKind::WorkflowNodeCompleted { .. }
         | EventKind::AgentProcessingStarted { .. }
-        | EventKind::AgentProcessingCompleted { .. } => "  ",
+        | EventKind::AgentProcessingCompleted { .. }
+        | EventKind::ShellSessionStarted { .. }
+        | EventKind::ShellSessionClosed { .. } => "  ",
 
         // Level 2 — LLM / tool / intention detail
         EventKind::LlmCallStarted { .. }
@@ -174,6 +176,9 @@ fn kind_color(kind: &EventKind) -> &'static str {
         | EventKind::IntentionEvaluated { .. } => YELLOW,
 
         EventKind::ToolCallRequested { .. } => MAGENTA,
+
+        EventKind::ShellSessionStarted { .. } => CYAN,
+        EventKind::ShellSessionClosed { .. } => DIM,
 
         _ => "",
     }
@@ -341,6 +346,19 @@ fn print_rich(event: &Event, verbose: bool) {
         EventKind::WorkflowCompleted { success } => {
             let label = status_label(*success);
             println!("{pad}  {label}");
+        }
+
+        EventKind::ShellSessionStarted {
+            stream_id,
+            pid,
+            shell_path,
+        } => {
+            println!("{pad}  {CYAN}{shell_path}{RESET} pid={pid} {DIM}stream={stream_id}{RESET}");
+        }
+        EventKind::ShellSessionClosed {
+            stream_id, reason, ..
+        } => {
+            println!("{pad}  reason={reason} {DIM}stream={stream_id}{RESET}");
         }
 
         EventKind::PipelineRequested {

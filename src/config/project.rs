@@ -27,6 +27,8 @@ pub struct ProjectConfig {
     #[serde(default)]
     pub contracts: ContractsConfig,
     #[serde(default)]
+    pub runtime: Option<RuntimeConfig>,
+    #[serde(default)]
     pub services: Option<ServicesConfig>,
 }
 
@@ -73,6 +75,65 @@ pub struct ContractsConfig {
     pub file_write: FileWriteContract,
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
+}
+
+/// Runtime configuration block (`runtime:` in `project.yml`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct RuntimeConfig {
+    /// Persistent shell session settings (ADR-0015).
+    #[serde(default)]
+    pub shell: ShellConfig,
+}
+
+/// Configuration for persistent shell sessions (ADR-0015 §6).
+///
+/// Controls the `ShellSessionPool` that backs `execute_shell_command`
+/// and declarative `kind: shell` tools.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ShellConfig {
+    /// Seconds a session can be idle before the reaper kills it.
+    #[serde(default = "default_shell_idle_timeout")]
+    pub idle_timeout_seconds: u64,
+
+    /// Maximum number of concurrent shell sessions. When exceeded the
+    /// least-recently-used session is evicted.
+    #[serde(default = "default_shell_max_sessions")]
+    pub max_sessions: usize,
+
+    /// Path to the shell binary. Falls back to `sh` if the configured
+    /// path is not executable.
+    #[serde(default = "default_shell_path")]
+    pub shell_path: String,
+
+    /// Pass `-i` (interactive) to the shell on spawn. When `true`,
+    /// the user's shell init (PS1, aliases) runs — useful for coding
+    /// agents that need a realistic shell, but slower to start.
+    #[serde(default = "default_shell_interactive")]
+    pub interactive: bool,
+}
+
+impl Default for ShellConfig {
+    fn default() -> Self {
+        Self {
+            idle_timeout_seconds: default_shell_idle_timeout(),
+            max_sessions: default_shell_max_sessions(),
+            shell_path: default_shell_path(),
+            interactive: default_shell_interactive(),
+        }
+    }
+}
+
+fn default_shell_idle_timeout() -> u64 {
+    600
+}
+fn default_shell_max_sessions() -> usize {
+    32
+}
+fn default_shell_path() -> String {
+    "/bin/bash".to_string()
+}
+fn default_shell_interactive() -> bool {
+    false
 }
 
 /// Services configuration — external integrations that subscribe to the event bus.
@@ -247,5 +308,60 @@ services:
         let config = load_project(&path).unwrap();
         assert_eq!(config.llm.unwrap().api_key.as_deref(), Some("sk-test"));
         unsafe { std::env::remove_var("ZYMI_TEST_KEY") };
+    }
+
+    #[test]
+    fn project_without_runtime_uses_defaults() {
+        let dir = TempDir::new().unwrap();
+        let path = write_file(&dir, "project.yml", "name: test\n");
+        let config = load_project(&path).unwrap();
+        assert!(config.runtime.is_none());
+
+        // ShellConfig::default() should match ADR-0015 §6 values.
+        let shell = ShellConfig::default();
+        assert_eq!(shell.idle_timeout_seconds, 600);
+        assert_eq!(shell.max_sessions, 32);
+        assert_eq!(shell.shell_path, "/bin/bash");
+        assert!(!shell.interactive);
+    }
+
+    #[test]
+    fn project_with_runtime_shell_config() {
+        let dir = TempDir::new().unwrap();
+        let yaml = r#"
+name: test
+runtime:
+  shell:
+    idle_timeout_seconds: 120
+    max_sessions: 8
+    shell_path: /bin/sh
+    interactive: true
+"#;
+        let path = write_file(&dir, "project.yml", yaml);
+        let config = load_project(&path).unwrap();
+        let rt = config.runtime.unwrap();
+        assert_eq!(rt.shell.idle_timeout_seconds, 120);
+        assert_eq!(rt.shell.max_sessions, 8);
+        assert_eq!(rt.shell.shell_path, "/bin/sh");
+        assert!(rt.shell.interactive);
+    }
+
+    #[test]
+    fn project_with_partial_runtime_shell_config() {
+        let dir = TempDir::new().unwrap();
+        let yaml = r#"
+name: test
+runtime:
+  shell:
+    idle_timeout_seconds: 300
+"#;
+        let path = write_file(&dir, "project.yml", yaml);
+        let config = load_project(&path).unwrap();
+        let rt = config.runtime.unwrap();
+        assert_eq!(rt.shell.idle_timeout_seconds, 300);
+        // Rest should be defaults.
+        assert_eq!(rt.shell.max_sessions, 32);
+        assert_eq!(rt.shell.shell_path, "/bin/bash");
+        assert!(!rt.shell.interactive);
     }
 }

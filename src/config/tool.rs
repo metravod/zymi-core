@@ -37,6 +37,21 @@ pub enum ImplementationConfig {
         #[serde(default)]
         body_template: Option<String>,
     },
+
+    /// Shell command. `${args.X}` placeholders in `command_template` are
+    /// resolved at call time. Runs through the persistent
+    /// [`ShellSessionPool`](crate::runtime::ShellSessionPool) (same pool
+    /// as the built-in `execute_shell_command`).
+    ///
+    /// **Default `requires_approval: true`** — see ADR-0014 §4.
+    #[serde(rename = "shell")]
+    Shell {
+        /// Command template with `${args.X}` placeholders.
+        command_template: String,
+        /// Per-command timeout in seconds (default: 30).
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -51,11 +66,19 @@ pub enum HttpMethod {
 
 impl ToolConfig {
     /// Effective `requires_approval` value, considering the implementation kind default.
+    ///
+    /// `kind: shell` defaults to `true` (same surface as the built-in
+    /// `execute_shell_command`); `kind: http` defaults to `false`.
     pub fn effective_requires_approval(&self) -> bool {
         self.requires_approval.unwrap_or(match &self.implementation {
             ImplementationConfig::Http { .. } => false,
-            // Future: kind: shell defaults to true
+            ImplementationConfig::Shell { .. } => true,
         })
+    }
+
+    /// `true` when this is a `kind: shell` tool.
+    pub fn is_shell(&self) -> bool {
+        matches!(&self.implementation, ImplementationConfig::Shell { .. })
     }
 }
 
@@ -126,6 +149,7 @@ implementation:
                 assert_eq!(headers.get("Content-Type").unwrap(), "application/json");
                 assert!(body_template.as_ref().unwrap().contains("${args.channel}"));
             }
+            _ => panic!("expected Http variant"),
         }
     }
 
@@ -153,6 +177,7 @@ implementation:
                 assert!(matches!(method, HttpMethod::Get));
                 assert!(body_template.is_none());
             }
+            _ => panic!("expected Http variant"),
         }
     }
 
@@ -199,7 +224,90 @@ implementation:
             ImplementationConfig::Http { headers, .. } => {
                 assert_eq!(headers.get("Authorization").unwrap(), "Bearer secret123");
             }
+            _ => panic!("expected Http variant"),
         }
         unsafe { std::env::remove_var("ZYMI_TEST_TOKEN") };
+    }
+
+    #[test]
+    fn parse_shell_tool() {
+        let dir = TempDir::new().unwrap();
+        let yaml = r#"
+name: run_tests
+description: "Run tests in a directory"
+parameters:
+  type: object
+  properties:
+    dir:
+      type: string
+  required: [dir]
+implementation:
+  kind: shell
+  command_template: "cd ${args.dir} && cargo test"
+  timeout_secs: 120
+"#;
+        let path = write_file(&dir, "run_tests.yml", yaml);
+        let config = load_tool(&path, &HashMap::new()).unwrap();
+        assert_eq!(config.name, "run_tests");
+        assert!(config.is_shell());
+        // Shell defaults to requires_approval = true.
+        assert!(config.effective_requires_approval());
+        match &config.implementation {
+            ImplementationConfig::Shell {
+                command_template,
+                timeout_secs,
+            } => {
+                assert!(command_template.contains("${args.dir}"));
+                assert_eq!(*timeout_secs, Some(120));
+            }
+            _ => panic!("expected Shell variant"),
+        }
+    }
+
+    #[test]
+    fn parse_shell_tool_minimal() {
+        let dir = TempDir::new().unwrap();
+        let yaml = r#"
+name: lint
+description: "Run linter"
+parameters:
+  type: object
+  properties: {}
+implementation:
+  kind: shell
+  command_template: "cargo clippy"
+"#;
+        let path = write_file(&dir, "lint.yml", yaml);
+        let config = load_tool(&path, &HashMap::new()).unwrap();
+        match &config.implementation {
+            ImplementationConfig::Shell {
+                command_template,
+                timeout_secs,
+            } => {
+                assert_eq!(command_template, "cargo clippy");
+                assert!(timeout_secs.is_none());
+            }
+            _ => panic!("expected Shell variant"),
+        }
+    }
+
+    #[test]
+    fn shell_tool_approval_override_false() {
+        let dir = TempDir::new().unwrap();
+        let yaml = r#"
+name: safe_ls
+description: "List files"
+parameters:
+  type: object
+  properties: {}
+requires_approval: false
+implementation:
+  kind: shell
+  command_template: "ls -la"
+"#;
+        let path = write_file(&dir, "safe_ls.yml", yaml);
+        let config = load_tool(&path, &HashMap::new()).unwrap();
+        // Explicit override to false.
+        assert!(!config.effective_requires_approval());
     }
 }
