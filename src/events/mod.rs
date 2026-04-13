@@ -94,6 +94,10 @@ pub enum EventKind {
         approx_context_chars: usize,
     },
     LlmCallCompleted {
+        /// Full assistant message including content and tool_calls.
+        /// `None` for pre-enrichment events (ADR-0016 §1a).
+        #[serde(default)]
+        response_message: Option<Message>,
         has_tool_calls: bool,
         usage: Option<TokenUsage>,
         content_preview: Option<String>,
@@ -115,6 +119,10 @@ pub enum EventKind {
     },
     ToolCallCompleted {
         call_id: String,
+        /// Full tool output, untruncated (ADR-0016 §1a).
+        /// Empty string for pre-enrichment events — fall back to `result_preview`.
+        #[serde(default)]
+        result: String,
         result_preview: String,
         is_error: bool,
         duration_ms: u64,
@@ -151,6 +159,21 @@ pub enum EventKind {
     },
     WorkflowCompleted {
         success: bool,
+    },
+
+    // -- Memory lifecycle (ADR-0016 §1/§2) --
+    /// Agent wrote a key-value pair to workflow memory.
+    /// State event: replay rebuilds MemoryProjection from these.
+    MemoryWritten {
+        key: String,
+        value: String,
+        /// Set when overwriting a previous value; None on first write.
+        previous_value_seq: Option<u64>,
+    },
+    /// Agent deleted a key from workflow memory.
+    MemoryDeleted {
+        key: String,
+        previous_value_seq: u64,
     },
 
     // -- Shell session lifecycle (ADR-0015) --
@@ -207,6 +230,8 @@ impl EventKind {
             EventKind::WorkflowNodeStarted { .. } => "workflow_node_started",
             EventKind::WorkflowNodeCompleted { .. } => "workflow_node_completed",
             EventKind::WorkflowCompleted { .. } => "workflow_completed",
+            EventKind::MemoryWritten { .. } => "memory_written",
+            EventKind::MemoryDeleted { .. } => "memory_deleted",
             EventKind::ShellSessionStarted { .. } => "shell_session_started",
             EventKind::ShellSessionClosed { .. } => "shell_session_closed",
             EventKind::PipelineRequested { .. } => "pipeline_requested",
@@ -226,11 +251,13 @@ pub enum EventStoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ToolCallInfo;
 
     #[test]
     fn event_kind_serialization_roundtrip() {
         let kind = EventKind::ToolCallCompleted {
             call_id: "tc-1".into(),
+            result: "ok".into(),
             result_preview: "ok".into(),
             is_error: false,
             duration_ms: 42,
@@ -290,6 +317,58 @@ mod tests {
     }
 
     #[test]
+    fn memory_written_serialization_roundtrip() {
+        let kind = EventKind::MemoryWritten {
+            key: "findings".into(),
+            value: "rust is fast".into(),
+            previous_value_seq: None,
+        };
+        let json = serde_json::to_string(&kind).unwrap();
+        let back: EventKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.tag(), "memory_written");
+        if let EventKind::MemoryWritten { key, value, previous_value_seq } = back {
+            assert_eq!(key, "findings");
+            assert_eq!(value, "rust is fast");
+            assert!(previous_value_seq.is_none());
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn memory_written_overwrite_roundtrip() {
+        let kind = EventKind::MemoryWritten {
+            key: "findings".into(),
+            value: "updated".into(),
+            previous_value_seq: Some(42),
+        };
+        let json = serde_json::to_string(&kind).unwrap();
+        let back: EventKind = serde_json::from_str(&json).unwrap();
+        if let EventKind::MemoryWritten { previous_value_seq, .. } = back {
+            assert_eq!(previous_value_seq, Some(42));
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn memory_deleted_serialization_roundtrip() {
+        let kind = EventKind::MemoryDeleted {
+            key: "old_key".into(),
+            previous_value_seq: 7,
+        };
+        let json = serde_json::to_string(&kind).unwrap();
+        let back: EventKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.tag(), "memory_deleted");
+        if let EventKind::MemoryDeleted { key, previous_value_seq } = back {
+            assert_eq!(key, "old_key");
+            assert_eq!(previous_value_seq, 7);
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
     fn shell_session_events_serialization_roundtrip() {
         let started = EventKind::ShellSessionStarted {
             stream_id: "s-1".into(),
@@ -307,6 +386,86 @@ mod tests {
         let json = serde_json::to_string(&closed).unwrap();
         let back: EventKind = serde_json::from_str(&json).unwrap();
         assert_eq!(back.tag(), "shell_session_closed");
+    }
+
+    #[test]
+    fn enriched_tool_call_completed_roundtrip() {
+        let kind = EventKind::ToolCallCompleted {
+            call_id: "tc-1".into(),
+            result: "full output here".into(),
+            result_preview: "full output h…".into(),
+            is_error: false,
+            duration_ms: 42,
+        };
+        let json = serde_json::to_string(&kind).unwrap();
+        let back: EventKind = serde_json::from_str(&json).unwrap();
+        if let EventKind::ToolCallCompleted { result, result_preview, .. } = back {
+            assert_eq!(result, "full output here");
+            assert_eq!(result_preview, "full output h…");
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn enriched_llm_call_completed_roundtrip() {
+        let msg = Message::Assistant {
+            content: Some("I'll help.".into()),
+            tool_calls: vec![ToolCallInfo {
+                id: "tc-1".into(),
+                name: "read_file".into(),
+                arguments: r#"{"path":"a.rs"}"#.into(),
+            }],
+        };
+        let kind = EventKind::LlmCallCompleted {
+            response_message: Some(msg),
+            has_tool_calls: true,
+            usage: None,
+            content_preview: Some("I'll help.".into()),
+        };
+        let json = serde_json::to_string(&kind).unwrap();
+        let back: EventKind = serde_json::from_str(&json).unwrap();
+        if let EventKind::LlmCallCompleted { response_message, has_tool_calls, .. } = back {
+            assert!(has_tool_calls);
+            let rm = response_message.unwrap();
+            match rm {
+                Message::Assistant { content, tool_calls } => {
+                    assert_eq!(content.as_deref(), Some("I'll help."));
+                    assert_eq!(tool_calls.len(), 1);
+                    assert_eq!(tool_calls[0].name, "read_file");
+                }
+                _ => panic!("expected Assistant"),
+            }
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    /// Pre-enrichment events (stored before ADR-0016 §1a) deserialize
+    /// with default values for the new fields.
+    #[test]
+    fn pre_enrichment_backward_compat() {
+        // Simulate a pre-enrichment ToolCallCompleted (no `result` field).
+        // EventKind uses adjacently-tagged serde: {"type":"..","data":{..}}
+        let json = r#"{"type":"ToolCallCompleted","data":{"call_id":"tc-old","result_preview":"ok","is_error":false,"duration_ms":10}}"#;
+        let kind: EventKind = serde_json::from_str(json).unwrap();
+        if let EventKind::ToolCallCompleted { call_id, result, result_preview, .. } = kind {
+            assert_eq!(call_id, "tc-old");
+            assert!(result.is_empty(), "result should default to empty string");
+            assert_eq!(result_preview, "ok");
+        } else {
+            panic!("wrong variant");
+        }
+
+        // Simulate a pre-enrichment LlmCallCompleted (no `response_message` field).
+        let json = r#"{"type":"LlmCallCompleted","data":{"has_tool_calls":true,"usage":null,"content_preview":"hi"}}"#;
+        let kind: EventKind = serde_json::from_str(json).unwrap();
+        if let EventKind::LlmCallCompleted { response_message, has_tool_calls, .. } = kind {
+            assert!(response_message.is_none(), "response_message should default to None");
+            assert!(has_tool_calls);
+        } else {
+            panic!("wrong variant");
+        }
     }
 
     #[test]

@@ -130,6 +130,7 @@ impl LangfuseService {
                 has_tool_calls,
                 usage,
                 content_preview,
+                ..
             } => {
                 let gen_id = event
                     .correlation_id
@@ -197,6 +198,7 @@ impl LangfuseService {
                 result_preview,
                 is_error,
                 duration_ms,
+                ..
             } => {
                 let span_id = state.span_map.remove(call_id)?;
 
@@ -418,6 +420,7 @@ mod tests {
         // Complete
         let event = make_event(
             EventKind::LlmCallCompleted {
+                response_message: None,
                 has_tool_calls: true,
                 usage: Some(TokenUsage {
                     input_tokens: 100,
@@ -469,6 +472,7 @@ mod tests {
         let completed = make_event(
             EventKind::ToolCallCompleted {
                 call_id: "tc-1".into(),
+                result: "search results".into(),
                 result_preview: "search results".into(),
                 is_error: false,
                 duration_ms: 250,
@@ -581,6 +585,7 @@ mod tests {
         // 3. LLM call completes with tool calls
         let e3 = make_event(
             EventKind::LlmCallCompleted {
+                response_message: None,
                 has_tool_calls: true,
                 usage: Some(TokenUsage {
                     input_tokens: 200,
@@ -617,6 +622,7 @@ mod tests {
         let e5 = make_event(
             EventKind::ToolCallCompleted {
                 call_id: "tc-42".into(),
+                result: "ok".into(),
                 result_preview: "ok".into(),
                 is_error: false,
                 duration_ms: 120,
@@ -648,6 +654,7 @@ mod tests {
 
         let e7 = make_event(
             EventKind::LlmCallCompleted {
+                response_message: None,
                 has_tool_calls: false,
                 usage: Some(TokenUsage {
                     input_tokens: 300,

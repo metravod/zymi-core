@@ -31,6 +31,8 @@
 //! aggregates, and recovery.
 
 pub mod action_executor;
+pub mod context_builder;
+pub mod context_window;
 pub mod event_router;
 pub mod shell_session;
 pub mod tool_catalog;

@@ -676,6 +676,7 @@ mod tests {
             "s1",
             EventKind::ToolCallCompleted {
                 call_id: "tc-1".into(),
+                result: "ok".into(),
                 result_preview: "ok".into(),
                 is_error: false,
                 duration_ms: 10,

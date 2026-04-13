@@ -29,7 +29,7 @@ pub use approval::{ApprovalHandler, SharedApprovalHandler};
 pub use esaa::{
     contracts::{ContractEngine, FileWriteContract, RateLimitConfig},
     orchestrator::{Orchestrator, OrchestratorResult},
-    projections::{ConversationProjection, MetricsProjection, Projection},
+    projections::{ConversationProjection, MemoryProjection, MetricsProjection, Projection},
     Intention, IntentionVerdict,
 };
 pub use events::{

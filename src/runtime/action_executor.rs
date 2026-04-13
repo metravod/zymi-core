@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use uuid::Uuid;
 
 use crate::config::tool::{HttpMethod, ImplementationConfig};
 use crate::engine::tools::{execute_builtin_tool, MemoryStore};
@@ -28,15 +29,19 @@ use log::warn;
 ///
 /// Lifetimes are tied to a single tool invocation: `project_root` is the
 /// pipeline's working directory and `memory` is the per-run [`MemoryStore`]
-/// created by the [`super::Runtime`] command handler. Keeping memory in the
-/// context (rather than inside the executor) preserves today's behaviour
-/// where each pipeline run starts with a fresh memory store, even when many
-/// runs share the same `Runtime` (as in `zymi serve`).
+/// (event-sourced via [`crate::engine::tools::MemoryBridge`], ADR-0016 §2).
+/// Keeping memory in the context (rather than inside the executor) preserves
+/// today's behaviour where each pipeline run starts with a fresh memory store,
+/// even when many runs share the same `Runtime` (as in `zymi serve`).
 pub struct ActionContext<'a> {
     pub project_root: &'a Path,
     pub memory: &'a MemoryStore,
-    /// Stream identifier — used to look up the persistent shell session.
+    /// Stream identifier — used to look up the persistent shell session
+    /// and to scope memory events.
     pub stream_id: &'a str,
+    /// Correlation ID for the current pipeline run — used to link memory
+    /// events back to the originating request.
+    pub correlation_id: Uuid,
 }
 
 /// Executes an approved tool call. Implementors are expected to be
@@ -79,7 +84,15 @@ impl ActionExecutor for BuiltinActionExecutor {
         arguments_json: &str,
         ctx: &ActionContext<'_>,
     ) -> Result<String, String> {
-        execute_builtin_tool(tool_name, arguments_json, ctx.project_root, ctx.memory).await
+        execute_builtin_tool(
+            tool_name,
+            arguments_json,
+            ctx.project_root,
+            ctx.memory,
+            ctx.stream_id,
+            ctx.correlation_id,
+        )
+        .await
     }
 }
 
@@ -123,7 +136,15 @@ impl ActionExecutor for CatalogActionExecutor {
                 }
             }
         } else {
-            execute_builtin_tool(tool_name, arguments_json, ctx.project_root, ctx.memory).await
+            execute_builtin_tool(
+                tool_name,
+                arguments_json,
+                ctx.project_root,
+                ctx.memory,
+                ctx.stream_id,
+                ctx.correlation_id,
+            )
+            .await
         }
     }
 }
@@ -344,16 +365,28 @@ fn truncate_output(s: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use crate::engine::tools::new_memory_store;
+    use crate::events::bus::EventBus;
+    use crate::events::store::{open_store, StoreBackend};
     use std::path::PathBuf;
+
+    fn test_memory_store() -> crate::engine::tools::MemoryStore {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test_events.db");
+        let store = open_store(StoreBackend::Sqlite { path: db_path }).unwrap();
+        let bus = Arc::new(EventBus::new(store));
+        std::mem::forget(dir);
+        new_memory_store(bus)
+    }
 
     #[tokio::test]
     async fn builtin_executor_runs_write_memory() {
-        let memory = new_memory_store();
+        let memory = test_memory_store();
         let root = PathBuf::from(".");
         let ctx = ActionContext {
             project_root: &root,
             memory: &memory,
             stream_id: "test",
+            correlation_id: Uuid::new_v4(),
         };
         let executor = BuiltinActionExecutor::new();
         let result = executor
@@ -361,17 +394,23 @@ mod tests {
             .await
             .unwrap();
         assert!(result.contains("k"));
-        assert_eq!(memory.lock().await.get("k").unwrap(), "v");
+        // Verify via read_memory tool instead of direct HashMap access
+        let read_result = executor
+            .execute("read_memory", r#"{"key":"k"}"#, &ctx)
+            .await
+            .unwrap();
+        assert_eq!(read_result, "v");
     }
 
     #[tokio::test]
     async fn builtin_executor_unknown_tool_errors() {
-        let memory = new_memory_store();
+        let memory = test_memory_store();
         let root = PathBuf::from(".");
         let ctx = ActionContext {
             project_root: &root,
             memory: &memory,
             stream_id: "test",
+            correlation_id: Uuid::new_v4(),
         };
         let executor = BuiltinActionExecutor::new();
         let err = executor
@@ -385,12 +424,13 @@ mod tests {
     async fn catalog_executor_dispatches_builtin() {
         let catalog = Arc::new(ToolCatalog::builtin_only());
         let pool = Arc::new(ShellSessionPool::new(Duration::from_secs(60)));
-        let memory = new_memory_store();
+        let memory = test_memory_store();
         let root = PathBuf::from(".");
         let ctx = ActionContext {
             project_root: &root,
             memory: &memory,
             stream_id: "test",
+            correlation_id: Uuid::new_v4(),
         };
         let executor = CatalogActionExecutor::new(catalog, pool);
         let result = executor

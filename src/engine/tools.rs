@@ -1,17 +1,132 @@
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
+use uuid::Uuid;
 
+use crate::esaa::projections::{MemoryProjection, Projection};
+use crate::events::bus::EventBus;
+use crate::events::{Event, EventKind};
 use crate::types::ToolDefinition;
 
-/// Shared memory store for write_memory/read_memory tools within a pipeline run.
-pub type MemoryStore = Arc<Mutex<HashMap<String, String>>>;
+/// Event-sourced workflow memory (ADR-0016 §2).
+///
+/// Replaces the legacy `Arc<Mutex<HashMap<String, String>>>`. Writes go through
+/// the [`EventBus`] as `MemoryWritten` events; reads come from the
+/// [`MemoryProjection`]. The projection is updated **synchronously** after each
+/// publish so that a `write_memory` followed by `read_memory` in the same
+/// iteration always sees the write.
+pub struct MemoryBridge {
+    projection: RwLock<MemoryProjection>,
+    bus: Arc<EventBus>,
+}
 
-pub fn new_memory_store() -> MemoryStore {
-    Arc::new(Mutex::new(HashMap::new()))
+impl MemoryBridge {
+    pub fn new(bus: Arc<EventBus>) -> Self {
+        Self {
+            projection: RwLock::new(MemoryProjection::new()),
+            bus,
+        }
+    }
+
+    /// Write a key-value pair. Emits `MemoryWritten` on the bus and applies
+    /// to the local projection before returning — the next `get()` call in
+    /// the same iteration will see the value.
+    pub async fn write(
+        &self,
+        key: &str,
+        value: &str,
+        stream_id: &str,
+        correlation_id: Uuid,
+    ) -> Result<(), String> {
+        let previous_value_seq = self.projection.read().await.seq_for(key);
+
+        let mut event = Event::new(
+            stream_id.to_string(),
+            EventKind::MemoryWritten {
+                key: key.to_string(),
+                value: value.to_string(),
+                previous_value_seq,
+            },
+            "agent".to_string(),
+        )
+        .with_correlation(correlation_id);
+
+        self.bus
+            .publish(event.clone())
+            .await
+            .map_err(|e| format!("failed to publish MemoryWritten: {e}"))?;
+
+        // Synchronous local update — the bus.publish() call above assigned
+        // event.sequence via the store, but we cloned before publish mutated
+        // the sequence. Re-read isn't needed: apply() only uses sequence for
+        // written_at_seq tracking, and the projection will get the real event
+        // via its bus subscription for future replays. For the local
+        // synchronous guarantee, we assign a synthetic high sequence so that
+        // seq_for() returns a value > 0 (the exact number doesn't matter for
+        // correctness within a single run — it only matters for
+        // previous_value_seq which we already captured above).
+        event.sequence = u64::MAX; // placeholder — overwritten by next real apply from bus
+        self.projection.write().await.apply(&event);
+
+        Ok(())
+    }
+
+    /// Delete a key. Emits `MemoryDeleted` on the bus.
+    pub async fn delete(
+        &self,
+        key: &str,
+        stream_id: &str,
+        correlation_id: Uuid,
+    ) -> Result<(), String> {
+        let previous_value_seq = self.projection.read().await.seq_for(key);
+        let Some(prev_seq) = previous_value_seq else {
+            return Err(format!("memory key '{key}' not found"));
+        };
+
+        let mut event = Event::new(
+            stream_id.to_string(),
+            EventKind::MemoryDeleted {
+                key: key.to_string(),
+                previous_value_seq: prev_seq,
+            },
+            "agent".to_string(),
+        )
+        .with_correlation(correlation_id);
+
+        self.bus
+            .publish(event.clone())
+            .await
+            .map_err(|e| format!("failed to publish MemoryDeleted: {e}"))?;
+
+        event.sequence = u64::MAX;
+        self.projection.write().await.apply(&event);
+
+        Ok(())
+    }
+
+    /// Read a key from the projection. Returns `None` if never written or deleted.
+    pub async fn get(&self, key: &str) -> Option<String> {
+        self.projection.read().await.get(key).map(|s| s.to_string())
+    }
+
+    /// Snapshot the full memory state.
+    pub async fn snapshot(&self) -> std::collections::HashMap<String, String> {
+        self.projection.read().await.snapshot()
+    }
+
+    /// Check whether memory is empty.
+    pub async fn is_empty(&self) -> bool {
+        self.projection.read().await.is_empty()
+    }
+}
+
+/// Shared handle to the event-sourced memory bridge.
+pub type MemoryStore = Arc<MemoryBridge>;
+
+pub fn new_memory_store(bus: Arc<EventBus>) -> MemoryStore {
+    Arc::new(MemoryBridge::new(bus))
 }
 
 /// Execute a built-in tool by name. Returns the tool output as a string.
@@ -20,6 +135,8 @@ pub async fn execute_builtin_tool(
     arguments_json: &str,
     project_root: &Path,
     memory: &MemoryStore,
+    stream_id: &str,
+    correlation_id: Uuid,
 ) -> Result<String, String> {
     let args: serde_json::Value = serde_json::from_str(arguments_json)
         .map_err(|e| format!("invalid tool arguments JSON: {e}"))?;
@@ -80,10 +197,19 @@ pub async fn execute_builtin_tool(
                 .and_then(|v| v.as_str())
                 .ok_or("missing 'content' argument")?;
             memory
-                .lock()
-                .await
-                .insert(key.to_string(), content.to_string());
+                .write(key, content, stream_id, correlation_id)
+                .await?;
             Ok(format!("Stored memory key '{key}'"))
+        }
+        "read_memory" => {
+            let key = args
+                .get("key")
+                .and_then(|v| v.as_str())
+                .ok_or("missing 'key' argument")?;
+            match memory.get(key).await {
+                Some(value) => Ok(value),
+                None => Ok(format!("[memory key '{key}' not found]")),
+            }
         }
         other => Err(format!("unknown built-in tool: {other}")),
     }
@@ -244,6 +370,16 @@ fn builtin_tool_def(name: &str) -> Option<ToolDefinition> {
                 "required": ["key", "content"]
             }),
         ),
+        "read_memory" => (
+            "Read a value from the agent's memory by key",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string", "description": "Memory key to read"}
+                },
+                "required": ["key"]
+            }),
+        ),
         _ => return None,
     };
 
@@ -257,6 +393,21 @@ fn builtin_tool_def(name: &str) -> Option<ToolDefinition> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::store::{open_store, StoreBackend};
+
+    fn test_memory_store() -> MemoryStore {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test_events.db");
+        let store = open_store(StoreBackend::Sqlite { path: db_path }).unwrap();
+        let bus = Arc::new(EventBus::new(store));
+        // Leak the tempdir so it lives long enough for the test.
+        std::mem::forget(dir);
+        new_memory_store(bus)
+    }
+
+    fn test_correlation_id() -> Uuid {
+        Uuid::new_v4()
+    }
 
     #[test]
     fn tool_definitions_known_tools() {
@@ -267,9 +418,10 @@ mod tests {
             "web_search".into(),
             "web_scrape".into(),
             "write_memory".into(),
+            "read_memory".into(),
         ];
         let defs = tool_definitions_for_agent(&tools);
-        assert_eq!(defs.len(), 6);
+        assert_eq!(defs.len(), 7);
         assert_eq!(defs[0].name, "execute_shell_command");
     }
 
@@ -295,24 +447,186 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_store_roundtrip() {
-        let mem = new_memory_store();
-        let result =
-            execute_builtin_tool("write_memory", r#"{"key":"k","content":"v"}"#, Path::new("."), &mem)
-                .await
-                .unwrap();
+    async fn memory_write_read_roundtrip() {
+        let mem = test_memory_store();
+        let corr = test_correlation_id();
+        let result = execute_builtin_tool(
+            "write_memory",
+            r#"{"key":"k","content":"v"}"#,
+            Path::new("."),
+            &mem,
+            "test-stream",
+            corr,
+        )
+        .await
+        .unwrap();
         assert!(result.contains("k"));
-        assert_eq!(mem.lock().await.get("k").unwrap(), "v");
+
+        // Read back via read_memory tool
+        let read_result = execute_builtin_tool(
+            "read_memory",
+            r#"{"key":"k"}"#,
+            Path::new("."),
+            &mem,
+            "test-stream",
+            corr,
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_result, "v");
+    }
+
+    #[tokio::test]
+    async fn memory_read_nonexistent_key() {
+        let mem = test_memory_store();
+        let corr = test_correlation_id();
+        let result = execute_builtin_tool(
+            "read_memory",
+            r#"{"key":"nope"}"#,
+            Path::new("."),
+            &mem,
+            "test-stream",
+            corr,
+        )
+        .await
+        .unwrap();
+        assert!(result.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn memory_overwrite_preserves_latest() {
+        let mem = test_memory_store();
+        let corr = test_correlation_id();
+        execute_builtin_tool(
+            "write_memory",
+            r#"{"key":"k","content":"v1"}"#,
+            Path::new("."),
+            &mem,
+            "test-stream",
+            corr,
+        )
+        .await
+        .unwrap();
+
+        execute_builtin_tool(
+            "write_memory",
+            r#"{"key":"k","content":"v2"}"#,
+            Path::new("."),
+            &mem,
+            "test-stream",
+            corr,
+        )
+        .await
+        .unwrap();
+
+        let read_result = execute_builtin_tool(
+            "read_memory",
+            r#"{"key":"k"}"#,
+            Path::new("."),
+            &mem,
+            "test-stream",
+            corr,
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_result, "v2");
+    }
+
+    #[tokio::test]
+    async fn memory_write_emits_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test_events.db");
+        let store = open_store(StoreBackend::Sqlite { path: db_path }).unwrap();
+        let bus = Arc::new(EventBus::new(Arc::clone(&store)));
+        let mem = new_memory_store(Arc::clone(&bus));
+        let corr = test_correlation_id();
+
+        execute_builtin_tool(
+            "write_memory",
+            r#"{"key":"k","content":"v"}"#,
+            Path::new("."),
+            &mem,
+            "test-stream",
+            corr,
+        )
+        .await
+        .unwrap();
+
+        // Verify event was persisted in the store
+        let events = store.read_stream("test-stream", 0).await.unwrap();
+        let memory_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.kind.tag() == "memory_written")
+            .collect();
+        assert_eq!(memory_events.len(), 1);
+        if let EventKind::MemoryWritten { key, value, previous_value_seq } = &memory_events[0].kind {
+            assert_eq!(key, "k");
+            assert_eq!(value, "v");
+            assert!(previous_value_seq.is_none());
+        } else {
+            panic!("expected MemoryWritten");
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_overwrite_records_previous_seq() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test_events.db");
+        let store = open_store(StoreBackend::Sqlite { path: db_path }).unwrap();
+        let bus = Arc::new(EventBus::new(Arc::clone(&store)));
+        let mem = new_memory_store(Arc::clone(&bus));
+        let corr = test_correlation_id();
+
+        // First write
+        execute_builtin_tool(
+            "write_memory",
+            r#"{"key":"k","content":"v1"}"#,
+            Path::new("."),
+            &mem,
+            "test-stream",
+            corr,
+        )
+        .await
+        .unwrap();
+
+        // Overwrite
+        execute_builtin_tool(
+            "write_memory",
+            r#"{"key":"k","content":"v2"}"#,
+            Path::new("."),
+            &mem,
+            "test-stream",
+            corr,
+        )
+        .await
+        .unwrap();
+
+        let events = store.read_stream("test-stream", 0).await.unwrap();
+        let memory_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.kind.tag() == "memory_written")
+            .collect();
+        assert_eq!(memory_events.len(), 2);
+
+        // Second write should have previous_value_seq set
+        if let EventKind::MemoryWritten { previous_value_seq, .. } = &memory_events[1].kind {
+            assert!(previous_value_seq.is_some(), "overwrite should record previous seq");
+        } else {
+            panic!("expected MemoryWritten");
+        }
     }
 
     #[tokio::test]
     async fn shell_echo() {
-        let mem = new_memory_store();
+        let mem = test_memory_store();
+        let corr = test_correlation_id();
         let result = execute_builtin_tool(
             "execute_shell_command",
             r#"{"command":"echo hello"}"#,
             Path::new("."),
             &mem,
+            "test-stream",
+            corr,
         )
         .await
         .unwrap();
@@ -321,12 +635,15 @@ mod tests {
 
     #[tokio::test]
     async fn read_nonexistent_file() {
-        let mem = new_memory_store();
+        let mem = test_memory_store();
+        let corr = test_correlation_id();
         let result = execute_builtin_tool(
             "read_file",
             r#"{"path":"definitely_does_not_exist_xyz.txt"}"#,
             Path::new("."),
             &mem,
+            "test-stream",
+            corr,
         )
         .await;
         assert!(result.is_err());

@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::types::Message;
 use crate::events::{Event, EventKind};
 
@@ -96,6 +98,83 @@ impl Projection for MetricsProjection {
     }
 }
 
+/// A single entry in the agent's workflow memory.
+#[derive(Debug, Clone)]
+pub struct MemoryEntry {
+    pub value: String,
+    pub written_at_seq: u64,
+}
+
+/// Rebuilds workflow memory state from `MemoryWritten` / `MemoryDeleted` events.
+///
+/// This is the **only** readable surface for workflow memory (ADR-0016 §2).
+/// The legacy `Arc<Mutex<HashMap<String, String>>>` is replaced by this projection.
+pub struct MemoryProjection {
+    state: HashMap<String, MemoryEntry>,
+}
+
+impl MemoryProjection {
+    pub fn new() -> Self {
+        Self {
+            state: HashMap::new(),
+        }
+    }
+
+    /// Read a single memory key. Returns `None` if the key was never written
+    /// or has been deleted.
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.state.get(key).map(|e| e.value.as_str())
+    }
+
+    /// Snapshot the full memory state as a simple key-value map.
+    /// Used by the future ContextBuilder (ADR-0016 §4, Layer B) to render
+    /// the memory snapshot into the agent's context.
+    pub fn snapshot(&self) -> HashMap<String, String> {
+        self.state
+            .iter()
+            .map(|(k, e)| (k.clone(), e.value.clone()))
+            .collect()
+    }
+
+    /// Returns the sequence number at which a key was last written,
+    /// or `None` if the key doesn't exist. Used to populate
+    /// `MemoryWritten.previous_value_seq` on overwrites.
+    pub fn seq_for(&self, key: &str) -> Option<u64> {
+        self.state.get(key).map(|e| e.written_at_seq)
+    }
+
+    /// Returns `true` if the projection contains no entries.
+    pub fn is_empty(&self) -> bool {
+        self.state.is_empty()
+    }
+}
+
+impl Default for MemoryProjection {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Projection for MemoryProjection {
+    fn apply(&mut self, event: &Event) {
+        match &event.kind {
+            EventKind::MemoryWritten { key, value, .. } => {
+                self.state.insert(
+                    key.clone(),
+                    MemoryEntry {
+                        value: value.clone(),
+                        written_at_seq: event.sequence,
+                    },
+                );
+            }
+            EventKind::MemoryDeleted { key, .. } => {
+                self.state.remove(key);
+            }
+            _ => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,6 +199,7 @@ mod tests {
         proj.apply(&make_event(
             "conv-1",
             EventKind::LlmCallCompleted {
+                response_message: None,
                 has_tool_calls: false,
                 usage: None,
                 content_preview: None,
@@ -163,6 +243,7 @@ mod tests {
         proj.apply(&make_event(
             "s1",
             EventKind::LlmCallCompleted {
+                response_message: None,
                 has_tool_calls: true,
                 usage: Some(TokenUsage {
                     input_tokens: 100,
@@ -176,6 +257,7 @@ mod tests {
             "s1",
             EventKind::ToolCallCompleted {
                 call_id: "tc-1".into(),
+                result: "ok".into(),
                 result_preview: "ok".into(),
                 is_error: false,
                 duration_ms: 42,
@@ -186,6 +268,7 @@ mod tests {
             "s1",
             EventKind::ToolCallCompleted {
                 call_id: "tc-2".into(),
+                result: "Tool error: fail".into(),
                 result_preview: "Tool error: fail".into(),
                 is_error: true,
                 duration_ms: 10,
@@ -195,6 +278,7 @@ mod tests {
         proj.apply(&make_event(
             "s1",
             EventKind::LlmCallCompleted {
+                response_message: None,
                 has_tool_calls: false,
                 usage: Some(TokenUsage {
                     input_tokens: 200,
@@ -209,6 +293,126 @@ mod tests {
         assert_eq!(proj.total_input_tokens, 300);
         assert_eq!(proj.total_output_tokens, 150);
         assert_eq!(proj.errors, 1);
+    }
+
+    #[test]
+    fn memory_projection_write_and_read() {
+        let mut proj = MemoryProjection::new();
+        assert!(proj.is_empty());
+
+        let mut event = make_event(
+            "s1",
+            EventKind::MemoryWritten {
+                key: "findings".into(),
+                value: "rust is fast".into(),
+                previous_value_seq: None,
+            },
+        );
+        event.sequence = 1;
+        proj.apply(&event);
+
+        assert!(!proj.is_empty());
+        assert_eq!(proj.get("findings"), Some("rust is fast"));
+        assert_eq!(proj.seq_for("findings"), Some(1));
+        assert_eq!(proj.get("nonexistent"), None);
+    }
+
+    #[test]
+    fn memory_projection_overwrite() {
+        let mut proj = MemoryProjection::new();
+
+        let mut e1 = make_event(
+            "s1",
+            EventKind::MemoryWritten {
+                key: "k".into(),
+                value: "v1".into(),
+                previous_value_seq: None,
+            },
+        );
+        e1.sequence = 1;
+        proj.apply(&e1);
+
+        let mut e2 = make_event(
+            "s1",
+            EventKind::MemoryWritten {
+                key: "k".into(),
+                value: "v2".into(),
+                previous_value_seq: Some(1),
+            },
+        );
+        e2.sequence = 5;
+        proj.apply(&e2);
+
+        assert_eq!(proj.get("k"), Some("v2"));
+        assert_eq!(proj.seq_for("k"), Some(5));
+    }
+
+    #[test]
+    fn memory_projection_delete() {
+        let mut proj = MemoryProjection::new();
+
+        let mut e1 = make_event(
+            "s1",
+            EventKind::MemoryWritten {
+                key: "k".into(),
+                value: "v".into(),
+                previous_value_seq: None,
+            },
+        );
+        e1.sequence = 1;
+        proj.apply(&e1);
+
+        let mut e2 = make_event(
+            "s1",
+            EventKind::MemoryDeleted {
+                key: "k".into(),
+                previous_value_seq: 1,
+            },
+        );
+        e2.sequence = 2;
+        proj.apply(&e2);
+
+        assert_eq!(proj.get("k"), None);
+        assert!(proj.is_empty());
+    }
+
+    #[test]
+    fn memory_projection_snapshot() {
+        let mut proj = MemoryProjection::new();
+
+        for (i, (k, v)) in [("a", "1"), ("b", "2"), ("c", "3")].iter().enumerate() {
+            let mut e = make_event(
+                "s1",
+                EventKind::MemoryWritten {
+                    key: k.to_string(),
+                    value: v.to_string(),
+                    previous_value_seq: None,
+                },
+            );
+            e.sequence = i as u64 + 1;
+            proj.apply(&e);
+        }
+
+        let snap = proj.snapshot();
+        assert_eq!(snap.len(), 3);
+        assert_eq!(snap.get("a").unwrap(), "1");
+        assert_eq!(snap.get("b").unwrap(), "2");
+        assert_eq!(snap.get("c").unwrap(), "3");
+    }
+
+    #[test]
+    fn memory_projection_ignores_unrelated_events() {
+        let mut proj = MemoryProjection::new();
+        proj.apply(&make_event(
+            "s1",
+            EventKind::LlmCallCompleted {
+                response_message: None,
+                has_tool_calls: false,
+                usage: None,
+                content_preview: None,
+            },
+        ));
+        assert!(proj.is_empty());
     }
 
     #[test]
@@ -230,6 +434,7 @@ mod tests {
             make_event(
                 "conv-1",
                 EventKind::LlmCallCompleted {
+                    response_message: None,
                     has_tool_calls: false,
                     usage: Some(TokenUsage {
                         input_tokens: 50,

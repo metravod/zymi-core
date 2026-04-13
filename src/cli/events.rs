@@ -137,7 +137,9 @@ fn indent(kind: &EventKind) -> &'static str {
         | EventKind::AgentProcessingStarted { .. }
         | EventKind::AgentProcessingCompleted { .. }
         | EventKind::ShellSessionStarted { .. }
-        | EventKind::ShellSessionClosed { .. } => "  ",
+        | EventKind::ShellSessionClosed { .. }
+        | EventKind::MemoryWritten { .. }
+        | EventKind::MemoryDeleted { .. } => "  ",
 
         // Level 2 — LLM / tool / intention detail
         EventKind::LlmCallStarted { .. }
@@ -179,6 +181,9 @@ fn kind_color(kind: &EventKind) -> &'static str {
 
         EventKind::ShellSessionStarted { .. } => CYAN,
         EventKind::ShellSessionClosed { .. } => DIM,
+
+        EventKind::MemoryWritten { .. } => CYAN,
+        EventKind::MemoryDeleted { .. } => YELLOW,
 
         _ => "",
     }
@@ -237,6 +242,7 @@ fn print_rich(event: &Event, verbose: bool) {
             has_tool_calls,
             usage,
             content_preview,
+            ..
         } => {
             let tokens = usage
                 .as_ref()
@@ -268,6 +274,7 @@ fn print_rich(event: &Event, verbose: bool) {
             result_preview,
             is_error,
             duration_ms,
+            ..
         } => {
             let label = status_label(!is_error);
             print!("{pad}  {label} {DIM}{duration_ms}ms{RESET}");
@@ -359,6 +366,28 @@ fn print_rich(event: &Event, verbose: bool) {
             stream_id, reason, ..
         } => {
             println!("{pad}  reason={reason} {DIM}stream={stream_id}{RESET}");
+        }
+
+        EventKind::MemoryWritten {
+            key,
+            value,
+            previous_value_seq,
+        } => {
+            let overwrite = if previous_value_seq.is_some() {
+                " (overwrite)"
+            } else {
+                ""
+            };
+            println!(
+                "{pad}  {CYAN}{key}{RESET}{overwrite} = {}",
+                truncate(value, 80)
+            );
+        }
+        EventKind::MemoryDeleted {
+            key,
+            ..
+        } => {
+            println!("{pad}  {YELLOW}delete{RESET} {key}");
         }
 
         EventKind::PipelineRequested {

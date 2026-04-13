@@ -31,8 +31,11 @@ use crate::commands::RunPipeline;
 use crate::config::AgentConfig;
 use crate::engine::tools::{new_memory_store, MemoryStore};
 use crate::runtime::ToolCatalog;
+use crate::runtime::context_builder::{ContextBuilder, ContextConfig};
+use crate::runtime::context_window::approx_chars;
 use crate::esaa::orchestrator::{Orchestrator, OrchestratorResult};
 use crate::events::bus::EventBus;
+use crate::events::store::EventStore;
 use crate::events::{Event, EventKind};
 use crate::llm::{ChatRequest, ChatResponse, LlmProvider};
 use crate::runtime::{ActionContext, ActionExecutor, Runtime};
@@ -82,7 +85,7 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
     let plan = crate::config::build_execution_plan(&pipeline)
         .map_err(|e| format!("failed to build execution plan: {e}"))?;
 
-    let memory = new_memory_store();
+    let memory = new_memory_store(Arc::clone(rt.bus()));
     let stream_id = cmd
         .stream_id
         .clone()
@@ -146,6 +149,7 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
             let provider = Arc::clone(rt.provider());
             let orchestrator = Arc::clone(rt.orchestrator());
             let bus = Arc::clone(rt.bus());
+            let store = Arc::clone(rt.store());
             let action_executor = Arc::clone(rt.action_executor());
             let tool_catalog = Arc::clone(rt.tool_catalog());
             let memory = memory.clone();
@@ -163,6 +167,7 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
                     provider.as_ref(),
                     &orchestrator,
                     &bus,
+                    &store,
                     action_executor.as_ref(),
                     &tool_catalog,
                     &memory,
@@ -234,6 +239,10 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
 }
 
 /// Run a single agent step: LLM loop with tool calls.
+///
+/// Context is built from the event store on each iteration via
+/// [`ContextBuilder`] (ADR-0016 §4/§6). There is no in-memory
+/// `Vec<Message>` — the event log is the source of truth.
 #[allow(clippy::too_many_arguments)]
 async fn run_agent_step(
     step_id: &str,
@@ -243,6 +252,7 @@ async fn run_agent_step(
     provider: &dyn LlmProvider,
     orchestrator: &Orchestrator,
     bus: &EventBus,
+    store: &Arc<dyn EventStore>,
     action_executor: &dyn ActionExecutor,
     tool_catalog: &ToolCatalog,
     memory: &MemoryStore,
@@ -255,21 +265,33 @@ async fn run_agent_step(
     let max_iterations = agent.max_iterations.unwrap_or(default_max_iterations);
     let tool_defs = tool_catalog.definitions_for_agent(&agent.tools);
 
-    let mut messages: Vec<Message> = Vec::new();
+    // Per-step sub-stream isolates this step's LLM/tool events from other
+    // parallel steps on the same pipeline stream (ADR-0016 §6).
+    let step_stream_id = format!("{stream_id}:step:{step_id}");
 
     let system_prompt = agent
         .system_prompt
         .clone()
         .unwrap_or_else(|| format!("You are the '{}' agent.", agent.name));
-    messages.push(Message::System(system_prompt));
 
     let user_msg = if context.is_empty() {
         task.to_string()
     } else {
         format!("{task}\n\n---\nContext from previous steps:\n{context}")
     };
-    messages.push(Message::User(user_msg));
 
+    // The ContextBuilder reads from the event store and reconstructs the
+    // conversation on every iteration — no mutable Vec<Message>.
+    let context_builder = ContextBuilder::new(
+        Arc::clone(store),
+        memory.clone(),
+        step_stream_id.clone(),
+        system_prompt,
+        user_msg,
+        ContextConfig::default(),
+    );
+
+    // Workflow-level event on the pipeline stream.
     emit_event(
         bus,
         stream_id,
@@ -302,36 +324,28 @@ async fn run_agent_step(
             });
         }
 
+        // Build context from the event store (ADR-0016 §4).
+        // Includes prefix (Layer A), memory snapshot (Layer B), and
+        // observation-masked tail (Layer C).
+        let messages = context_builder
+            .build()
+            .await
+            .map_err(|e| format!("[{step_id}] context build failed: {e}"))?;
+
         emit_event(
             bus,
-            stream_id,
+            &step_stream_id,
             correlation_id,
             EventKind::LlmCallStarted {
                 iteration,
                 message_count: messages.len(),
-                approx_context_chars: messages
-                    .iter()
-                    .map(|m| match m {
-                        Message::System(s) | Message::User(s) => s.len(),
-                        Message::Assistant { content, .. } => {
-                            content.as_ref().map_or(0, |c| c.len())
-                        }
-                        Message::ToolResult { content, .. } => content.len(),
-                        Message::UserMultimodal { parts } => parts
-                            .iter()
-                            .map(|p| match p {
-                                crate::types::ContentPart::Text(t) => t.len(),
-                                _ => 0,
-                            })
-                            .sum(),
-                    })
-                    .sum(),
+                approx_context_chars: approx_chars(&messages),
             },
         )
         .await;
 
         let request = ChatRequest {
-            messages: messages.clone(),
+            messages,
             tools: tool_defs.clone(),
             temperature: Some(0.7),
             max_tokens: Some(4096),
@@ -349,11 +363,14 @@ async fn run_agent_step(
             } => {
                 let has_tool_calls = !tool_calls.is_empty();
 
+                // Enriched event: stores the full response_message (ADR-0016 §1a).
+                // The next iteration's context_builder.build() reads it back.
                 emit_event(
                     bus,
-                    stream_id,
+                    &step_stream_id,
                     correlation_id,
                     EventKind::LlmCallCompleted {
+                        response_message: Some(response.message.clone()),
                         has_tool_calls,
                         usage: Some(response.usage.clone()),
                         content_preview: content.as_ref().map(|c| truncate(c, 100).to_string()),
@@ -384,14 +401,15 @@ async fn run_agent_step(
                     });
                 }
 
-                messages.push(response.message.clone());
+                // No messages.push(response.message) — the LlmCallCompleted
+                // event IS the record. The next build() reads it back.
 
                 for tc in tool_calls {
                     let start = Instant::now();
 
                     emit_event(
                         bus,
-                        stream_id,
+                        &step_stream_id,
                         correlation_id,
                         EventKind::ToolCallRequested {
                             tool_name: tc.name.clone(),
@@ -417,6 +435,7 @@ async fn run_agent_step(
                                 project_root,
                                 memory,
                                 stream_id,
+                                correlation_id,
                             };
                             match action_executor.execute(&tc.name, &tc.arguments, &ctx).await {
                                 Ok(output) => output,
@@ -438,12 +457,15 @@ async fn run_agent_step(
                         || tool_result.starts_with("[rejected")
                         || tool_result.starts_with("[requires approval");
 
+                    // Enriched event: stores full tool result (ADR-0016 §1a).
+                    // The next build() reads it back as a ToolResult message.
                     emit_event(
                         bus,
-                        stream_id,
+                        &step_stream_id,
                         correlation_id,
                         EventKind::ToolCallCompleted {
                             call_id: tc.id.clone(),
+                            result: tool_result.clone(),
                             result_preview: truncate(&tool_result, 200).to_string(),
                             is_error,
                             duration_ms,
@@ -451,10 +473,7 @@ async fn run_agent_step(
                     )
                     .await;
 
-                    messages.push(Message::ToolResult {
-                        tool_call_id: tc.id.clone(),
-                        content: tool_result,
-                    });
+                    // No messages.push(ToolResult) — the event IS the record.
                 }
             }
             _ => {
