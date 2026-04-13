@@ -100,7 +100,15 @@ impl ShellSession {
         if interactive {
             cmd.arg("-i");
         } else {
-            cmd.args(["--norc", "--noprofile"]);
+            // --norc / --noprofile are bash/zsh-specific; passing them to
+            // dash or other POSIX shells causes an immediate exit.
+            let shell_name = Path::new(shell_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            if matches!(shell_name, "bash" | "zsh") {
+                cmd.args(["--norc", "--noprofile"]);
+            }
         }
         let mut child = cmd
             .current_dir(project_root)
