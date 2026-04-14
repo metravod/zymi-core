@@ -95,14 +95,20 @@ fn is_prefix_message(m: &Message) -> bool {
 }
 
 /// A contiguous segment of the message body.
-enum Segment {
+pub(crate) enum Segment {
     /// An `Assistant` message followed by zero or more `ToolResult` messages.
     Turn { start: usize, end: usize },
     /// A non-turn message (e.g. `User` in a multi-turn conversation).
     PassThrough(usize),
 }
 
-fn identify_segments(body: &[Message]) -> Vec<Segment> {
+impl Segment {
+    pub(crate) fn is_turn(&self) -> bool {
+        matches!(self, Segment::Turn { .. })
+    }
+}
+
+pub(crate) fn identify_segments(body: &[Message]) -> Vec<Segment> {
     let mut segments = Vec::new();
     let mut i = 0;
 

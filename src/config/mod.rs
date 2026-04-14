@@ -14,7 +14,7 @@ pub use agent::AgentConfig;
 pub use error::ConfigError;
 pub use dag::{build_execution_plan, ExecutionPlan};
 pub use pipeline::{PipelineConfig, PipelineInput, PipelineOutput, PipelineStep};
-pub use project::{ContractsConfig, DefaultsConfig, LangfuseConfig, LlmConfig, ProjectConfig, RuntimeConfig, ServicesConfig, ShellConfig};
+pub use project::{ContractsConfig, ContextWindowConfig, DefaultsConfig, LangfuseConfig, LlmConfig, ProjectConfig, RuntimeConfig, ServicesConfig, ShellConfig};
 pub use tool::{ToolConfig, ImplementationConfig, HttpMethod};
 
 /// A fully loaded and validated workspace.
@@ -139,12 +139,12 @@ pub fn load_project_dir(root: &Path) -> Result<WorkspaceConfig, ConfigError> {
         }
     }
 
-    // 6. Cross-validate (uses the static builtin tool list; the Runtime
-    //    re-validates against the full ToolCatalog at build time if needed).
+    // 6. Cross-validate (builtin + declarative tool names from tools/*.yml).
+    let declarative_names: Vec<String> = tools.keys().cloned().collect();
     validate::validate_workspace(
         &agents,
         &pipelines,
-        &validate::BuiltinToolNameResolver,
+        &validate::ConfigToolNameResolver::new(declarative_names),
     )?;
 
     Ok(WorkspaceConfig {
@@ -165,6 +165,7 @@ mod tests {
         let root = dir.path();
         fs::create_dir_all(root.join("agents")).unwrap();
         fs::create_dir_all(root.join("pipelines")).unwrap();
+        fs::create_dir_all(root.join("tools")).unwrap();
 
         fs::write(
             root.join("project.yml"),
@@ -173,6 +174,25 @@ name: test-project
 version: "0.1"
 variables:
   default_model: gpt-4o
+"#,
+        )
+        .unwrap();
+
+        // Declarative web_search tool (no longer a builtin).
+        fs::write(
+            root.join("tools/web_search.yml"),
+            r#"
+name: web_search
+description: "Search the web"
+parameters:
+  type: object
+  properties:
+    query:
+      type: string
+  required: [query]
+implementation:
+  kind: shell
+  command_template: "echo 'not configured'"
 "#,
         )
         .unwrap();

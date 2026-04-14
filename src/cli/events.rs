@@ -139,7 +139,8 @@ fn indent(kind: &EventKind) -> &'static str {
         | EventKind::ShellSessionStarted { .. }
         | EventKind::ShellSessionClosed { .. }
         | EventKind::MemoryWritten { .. }
-        | EventKind::MemoryDeleted { .. } => "  ",
+        | EventKind::MemoryDeleted { .. }
+        | EventKind::ContextCompacted { .. } => "  ",
 
         // Level 2 — LLM / tool / intention detail
         EventKind::LlmCallStarted { .. }
@@ -184,6 +185,9 @@ fn kind_color(kind: &EventKind) -> &'static str {
 
         EventKind::MemoryWritten { .. } => CYAN,
         EventKind::MemoryDeleted { .. } => YELLOW,
+
+        EventKind::ContextCompacted { bytes_saved, .. } if *bytes_saved < 0 => YELLOW,
+        EventKind::ContextCompacted { .. } => CYAN,
 
         _ => "",
     }
@@ -388,6 +392,21 @@ fn print_rich(event: &Event, verbose: bool) {
             ..
         } => {
             println!("{pad}  {YELLOW}delete{RESET} {key}");
+        }
+
+        EventKind::ContextCompacted {
+            replaces_seq_range,
+            summary,
+            bytes_saved,
+        } => {
+            let (lo, hi) = replaces_seq_range;
+            let sign = if *bytes_saved >= 0 { "+" } else { "" };
+            print!("{pad}  seq={lo}..={hi} {sign}{bytes_saved} bytes");
+            if verbose {
+                println!(" summary={}", truncate(summary, 200));
+            } else {
+                println!();
+            }
         }
 
         EventKind::PipelineRequested {

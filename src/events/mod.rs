@@ -176,6 +176,19 @@ pub enum EventKind {
         previous_value_seq: u64,
     },
 
+    // -- Context compaction (ADR-0016 §5) --
+    /// The context builder compacted a range of events into a summary.
+    /// State event: replay honours this to reconstruct the correct working
+    /// context (events in the replaced range are suppressed).
+    ContextCompacted {
+        /// Inclusive event sequence range this summary replaces.
+        replaces_seq_range: (u64, u64),
+        /// LLM-generated summary of the compacted span.
+        summary: String,
+        /// Bytes saved (original − replacement). Negative means bad compaction.
+        bytes_saved: i64,
+    },
+
     // -- Shell session lifecycle (ADR-0015) --
     /// A persistent shell session was created for a stream.
     /// History-only: replay does not recreate the shell.
@@ -232,6 +245,7 @@ impl EventKind {
             EventKind::WorkflowCompleted { .. } => "workflow_completed",
             EventKind::MemoryWritten { .. } => "memory_written",
             EventKind::MemoryDeleted { .. } => "memory_deleted",
+            EventKind::ContextCompacted { .. } => "context_compacted",
             EventKind::ShellSessionStarted { .. } => "shell_session_started",
             EventKind::ShellSessionClosed { .. } => "shell_session_closed",
             EventKind::PipelineRequested { .. } => "pipeline_requested",
@@ -363,6 +377,41 @@ mod tests {
         if let EventKind::MemoryDeleted { key, previous_value_seq } = back {
             assert_eq!(key, "old_key");
             assert_eq!(previous_value_seq, 7);
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn context_compacted_serialization_roundtrip() {
+        let kind = EventKind::ContextCompacted {
+            replaces_seq_range: (5, 20),
+            summary: "Agent read 3 files and fixed a bug.".into(),
+            bytes_saved: 12345,
+        };
+        let json = serde_json::to_string(&kind).unwrap();
+        let back: EventKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.tag(), "context_compacted");
+        if let EventKind::ContextCompacted { replaces_seq_range, summary, bytes_saved } = back {
+            assert_eq!(replaces_seq_range, (5, 20));
+            assert_eq!(summary, "Agent read 3 files and fixed a bug.");
+            assert_eq!(bytes_saved, 12345);
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn context_compacted_negative_bytes_saved() {
+        let kind = EventKind::ContextCompacted {
+            replaces_seq_range: (1, 3),
+            summary: "A very verbose summary that is longer than the original.".into(),
+            bytes_saved: -500,
+        };
+        let json = serde_json::to_string(&kind).unwrap();
+        let back: EventKind = serde_json::from_str(&json).unwrap();
+        if let EventKind::ContextCompacted { bytes_saved, .. } = back {
+            assert_eq!(bytes_saved, -500);
         } else {
             panic!("wrong variant");
         }

@@ -12,6 +12,7 @@ Event-sourced agent engine for auditable AI workflows in Rust, YAML, and Python.
 - **Declarative custom tools**: add HTTP (and soon shell/Python) tools in `tools/*.yml` — no Rust code required.
 - **Flexible integration points**: use the Rust crate, Python bindings, or both — Python can drive pipelines directly via `Runtime.for_project(...).run_pipeline(...)`, no subprocess.
 - **LLM-provider ready**: OpenAI-compatible providers, Anthropic support, Python tools, and LangFuse event services.
+- **Automatic context management**: observation masking compresses older tool results in-place (~2x cost reduction, no extra LLM calls), with LLM summarization as a graduated fallback when the context grows further.
 - **JSON Schemas for configs**: `zymi schema project|agent|pipeline|tool` outputs draft-07 JSON Schema for IDE autocomplete and LLM-assisted config generation.
 
 ## Installation
@@ -117,6 +118,14 @@ policy:
   enabled: true
   allow: ["ls *", "cat *", "echo *"]
   deny: ["rm -rf *"]
+
+# optional — tune context window budget
+runtime:
+  context:
+    observation_window: 10
+    soft_cap_chars: 400000
+    hard_cap_chars: 600000
+    min_tail_turns: 4
 ```
 
 ```yaml
@@ -365,8 +374,9 @@ watcher.stop().await;
 1. **Every meaningful state change becomes an event.** The SQLite event store is the source of truth.
 2. **Agents express intentions, not side effects.** Intentions are evaluated against boundary contracts before execution.
 3. **Pipelines are DAGs.** Independent steps can run in parallel, while dependencies remain explicit.
-4. **Runs stay replayable.** You can inspect events with `zymi events --stream <id>` and verify hash-chain integrity with `zymi verify`.
-5. **Custom tools are declarative.** HTTP tools live in `tools/*.yml` and are dispatched at runtime — no Rust code, no rebuild.
+4. **Context is event-sourced too.** The agent's working context is reassembled from the event log each iteration — older observations are masked automatically, and hybrid compaction kicks in when the budget is exceeded.
+5. **Runs stay replayable.** You can inspect events with `zymi events --stream <id>` and verify hash-chain integrity with `zymi verify`.
+6. **Custom tools are declarative.** HTTP tools live in `tools/*.yml` and are dispatched at runtime — no Rust code, no rebuild.
 
 Core intention types include `ExecuteShellCommand`, `WriteFile`, `ReadFile`, `WebSearch`, `WebScrape`, `WriteMemory`, `SpawnSubAgent`, and `CallCustomTool`.
 

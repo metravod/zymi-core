@@ -2,7 +2,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::approval::{ApprovalHandler, TerminalApprovalHandler};
 use crate::config::load_project_dir;
 use crate::events::store::{StoreTailWatcher, TailWatcherPolicy};
 use crate::runtime::{EventCommandRouter, Runtime};
@@ -26,6 +25,8 @@ use super::store_path;
 pub fn exec(
     pipeline_name: &str,
     poll_interval_ms: u64,
+    approval_mode: &str,
+    callback_url: Option<&str>,
     root: impl AsRef<Path>,
 ) -> Result<(), String> {
     let root = root.as_ref().to_path_buf();
@@ -63,6 +64,8 @@ pub fn exec(
         pipeline_name.to_string(),
         root,
         poll_interval_ms,
+        approval_mode.to_string(),
+        callback_url.map(|s| s.to_string()),
     ))
 }
 
@@ -71,10 +74,14 @@ async fn serve_loop(
     pipeline_name: String,
     root: PathBuf,
     poll_interval_ms: u64,
+    approval_mode: String,
+    callback_url: Option<String>,
 ) -> Result<(), String> {
-    // Single shared handler so prompts from concurrent pipeline runs are
-    // serialised on the operator's terminal.
-    let approval_handler: Arc<dyn ApprovalHandler> = Arc::new(TerminalApprovalHandler::new());
+    let approval_handler = super::build_approval_handler(
+        &approval_mode,
+        callback_url.as_deref(),
+    )
+    .await?;
 
     // Operator can override poll interval from the CLI; the rest of the
     // tail policy (batch size, catch-up cap, lag warn threshold) takes the

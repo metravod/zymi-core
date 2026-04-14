@@ -157,6 +157,12 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
             let project_root = rt.project_root().to_path_buf();
             let defaults = workspace.project.defaults.clone();
             let approval_handler = rt.approval_handler().cloned();
+            let context_config: ContextConfig = workspace
+                .project
+                .runtime
+                .as_ref()
+                .map(|r| r.context.clone().into())
+                .unwrap_or_default();
 
             handles.push(tokio::spawn(async move {
                 run_agent_step(
@@ -164,9 +170,9 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
                     &agent,
                     &task,
                     &context,
-                    provider.as_ref(),
+                    Arc::clone(&provider),
                     &orchestrator,
-                    &bus,
+                    Arc::clone(&bus),
                     &store,
                     action_executor.as_ref(),
                     &tool_catalog,
@@ -176,6 +182,7 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
                     &project_root,
                     defaults.max_iterations,
                     approval_handler,
+                    context_config,
                 )
                 .await
             }));
@@ -249,9 +256,9 @@ async fn run_agent_step(
     agent: &AgentConfig,
     task: &str,
     context: &str,
-    provider: &dyn LlmProvider,
+    provider: Arc<dyn LlmProvider>,
     orchestrator: &Orchestrator,
-    bus: &EventBus,
+    bus: Arc<EventBus>,
     store: &Arc<dyn EventStore>,
     action_executor: &dyn ActionExecutor,
     tool_catalog: &ToolCatalog,
@@ -261,6 +268,7 @@ async fn run_agent_step(
     project_root: &std::path::Path,
     default_max_iterations: usize,
     approval_handler: Option<Arc<dyn ApprovalHandler>>,
+    context_config: ContextConfig,
 ) -> Result<StepResult, String> {
     let max_iterations = agent.max_iterations.unwrap_or(default_max_iterations);
     let tool_defs = tool_catalog.definitions_for_agent(&agent.tools);
@@ -288,8 +296,12 @@ async fn run_agent_step(
         step_stream_id.clone(),
         system_prompt,
         user_msg,
-        ContextConfig::default(),
-    );
+        context_config,
+    )
+    .with_compaction(Arc::clone(&provider), Arc::clone(&bus));
+
+    // Reborrow for the rest of the function (emit_event expects &EventBus).
+    let bus: &EventBus = &bus;
 
     // Workflow-level event on the pipeline stream.
     emit_event(

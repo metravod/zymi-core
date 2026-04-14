@@ -7,6 +7,7 @@ mod verify;
 
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 
@@ -39,6 +40,14 @@ enum Command {
         /// Pipeline input in KEY=VALUE format (repeatable)
         #[arg(short = 'i', long = "input", value_name = "KEY=VALUE")]
         inputs: Vec<String>,
+
+        /// Approval mode: "terminal" (interactive, default) or "webhook"
+        #[arg(long, default_value = "terminal")]
+        approval: String,
+
+        /// Webhook callback URL for approval notifications (requires --approval=webhook)
+        #[arg(long)]
+        callback_url: Option<String>,
 
         /// Project root directory (defaults to cwd)
         #[arg(short = 'd', long)]
@@ -92,6 +101,14 @@ enum Command {
         #[arg(long, default_value = "100")]
         poll_interval_ms: u64,
 
+        /// Approval mode: "terminal" (interactive, default) or "webhook"
+        #[arg(long, default_value = "terminal")]
+        approval: String,
+
+        /// Webhook callback URL for approval notifications (requires --approval=webhook)
+        #[arg(long)]
+        callback_url: Option<String>,
+
         /// Project root directory (defaults to cwd)
         #[arg(short = 'd', long)]
         dir: Option<PathBuf>,
@@ -125,8 +142,10 @@ fn dispatch(cli: Cli) {
         Command::Run {
             pipeline,
             inputs,
+            approval,
+            callback_url,
             dir,
-        } => run::exec(&pipeline, &inputs, resolve_root(dir.as_deref())),
+        } => run::exec(&pipeline, &inputs, &approval, callback_url.as_deref(), resolve_root(dir.as_deref())),
         Command::Events {
             stream,
             kind,
@@ -148,8 +167,10 @@ fn dispatch(cli: Cli) {
         Command::Serve {
             pipeline,
             poll_interval_ms,
+            approval,
+            callback_url,
             dir,
-        } => serve::exec(&pipeline, poll_interval_ms, resolve_root(dir.as_deref())),
+        } => serve::exec(&pipeline, poll_interval_ms, &approval, callback_url.as_deref(), resolve_root(dir.as_deref())),
         Command::Schema { kind, all } => schema::exec(kind.as_deref(), all),
     };
 
@@ -168,6 +189,44 @@ fn resolve_root(dir: Option<&Path>) -> PathBuf {
 /// Path to the event store database within a project.
 pub(crate) fn store_path(root: &Path) -> PathBuf {
     root.join(".zymi").join("events.db")
+}
+
+/// Build an approval handler from CLI flags.
+///
+/// `--approval=terminal` (default): interactive stdin prompt.
+/// `--approval=webhook`: HTTP webhook server (requires `webhook` feature).
+pub(crate) async fn build_approval_handler(
+    mode: &str,
+    callback_url: Option<&str>,
+) -> Result<Arc<dyn crate::approval::ApprovalHandler>, String> {
+    match mode {
+        "terminal" => Ok(Arc::new(
+            crate::approval::TerminalApprovalHandler::new(),
+        )),
+        #[cfg(feature = "webhook")]
+        "webhook" => {
+            let addr: std::net::SocketAddr = "127.0.0.1:0"
+                .parse()
+                .map_err(|e| format!("invalid webhook addr: {e}"))?;
+            let handler = crate::webhook::WebhookApprovalHandler::start(
+                addr,
+                std::time::Duration::from_secs(300),
+                callback_url.map(|s| s.to_string()),
+            )
+            .await
+            .map_err(|e| format!("failed to start webhook server: {e}"))?;
+            Ok(handler)
+        }
+        #[cfg(not(feature = "webhook"))]
+        "webhook" => Err(
+            "webhook approval requires the 'webhook' feature. \
+             Rebuild with --features webhook"
+                .into(),
+        ),
+        other => Err(format!(
+            "unknown approval mode '{other}'. Expected 'terminal' or 'webhook'"
+        )),
+    }
 }
 
 /// Create a tokio runtime for async operations.

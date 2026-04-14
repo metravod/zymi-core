@@ -171,15 +171,6 @@ pub async fn execute_builtin_tool(
                 .ok_or("missing 'content' argument")?;
             write_file(path, content, project_root).await
         }
-        "web_search" => {
-            let query = args
-                .get("query")
-                .and_then(|v| v.as_str())
-                .ok_or("missing 'query' argument")?;
-            Ok(format!(
-                "[web_search not connected to a search provider] Query: {query}"
-            ))
-        }
         "web_scrape" => {
             let url = args
                 .get("url")
@@ -339,16 +330,6 @@ fn builtin_tool_def(name: &str) -> Option<ToolDefinition> {
                 "required": ["path", "content"]
             }),
         ),
-        "web_search" => (
-            "Search the web for information",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Search query"}
-                },
-                "required": ["query"]
-            }),
-        ),
         "web_scrape" => (
             "Fetch the contents of a URL",
             serde_json::json!({
@@ -415,13 +396,12 @@ mod tests {
             "execute_shell_command".into(),
             "read_file".into(),
             "write_file".into(),
-            "web_search".into(),
             "web_scrape".into(),
             "write_memory".into(),
             "read_memory".into(),
         ];
         let defs = tool_definitions_for_agent(&tools);
-        assert_eq!(defs.len(), 7);
+        assert_eq!(defs.len(), 6);
         assert_eq!(defs[0].name, "execute_shell_command");
     }
 

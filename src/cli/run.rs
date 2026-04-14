@@ -1,14 +1,18 @@
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
 
-use crate::approval::{ApprovalHandler, TerminalApprovalHandler};
 use crate::commands::RunPipeline;
 use crate::config::load_project_dir;
 use crate::handlers::run_pipeline;
 use crate::runtime::Runtime;
 
-pub fn exec(pipeline: &str, raw_inputs: &[String], root: impl AsRef<Path>) -> Result<(), String> {
+pub fn exec(
+    pipeline: &str,
+    raw_inputs: &[String],
+    approval_mode: &str,
+    callback_url: Option<&str>,
+    root: impl AsRef<Path>,
+) -> Result<(), String> {
     let root = root.as_ref();
 
     if !root.join("project.yml").exists() {
@@ -47,7 +51,8 @@ pub fn exec(pipeline: &str, raw_inputs: &[String], root: impl AsRef<Path>) -> Re
         inputs.insert(key.to_string(), value.to_string());
     }
 
-    let approval_handler: Arc<dyn ApprovalHandler> = Arc::new(TerminalApprovalHandler::new());
+    let rt = super::runtime();
+    let approval_handler = rt.block_on(super::build_approval_handler(approval_mode, callback_url))?;
 
     let runtime = Runtime::builder(workspace, root.to_path_buf())
         .with_approval_handler(approval_handler)
@@ -55,7 +60,6 @@ pub fn exec(pipeline: &str, raw_inputs: &[String], root: impl AsRef<Path>) -> Re
 
     let cmd = RunPipeline::new(pipeline.to_string(), inputs);
 
-    let rt = super::runtime();
     let result = rt.block_on(run_pipeline::handle(&runtime, cmd))?;
 
     println!("---");

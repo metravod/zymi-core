@@ -83,6 +83,59 @@ pub struct RuntimeConfig {
     /// Persistent shell session settings (ADR-0015).
     #[serde(default)]
     pub shell: ShellConfig,
+    /// Context window management settings (ADR-0016).
+    #[serde(default)]
+    pub context: ContextWindowConfig,
+}
+
+/// Context window management configuration (ADR-0016 §5).
+///
+/// Controls observation masking, soft/hard caps, and compaction
+/// behaviour. Values here map 1:1 to [`crate::runtime::context_builder::ContextConfig`].
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ContextWindowConfig {
+    /// Number of recent turns whose tool results are kept verbatim.
+    /// Older observations are replaced with a compact placeholder.
+    #[serde(default = "default_observation_window")]
+    pub observation_window: usize,
+
+    /// Character count that triggers hybrid compaction (LLM summarization
+    /// of the oldest masked batch). Only fires when a provider is wired.
+    #[serde(default = "default_soft_cap_chars")]
+    pub soft_cap_chars: usize,
+
+    /// Absolute character limit. Exceeding this after compaction is a
+    /// fatal `HardCapExceeded` error that stops the agent step.
+    #[serde(default = "default_hard_cap_chars")]
+    pub hard_cap_chars: usize,
+
+    /// Minimum recent turns preserved even under compaction pressure.
+    #[serde(default = "default_min_tail_turns")]
+    pub min_tail_turns: usize,
+}
+
+impl Default for ContextWindowConfig {
+    fn default() -> Self {
+        Self {
+            observation_window: default_observation_window(),
+            soft_cap_chars: default_soft_cap_chars(),
+            hard_cap_chars: default_hard_cap_chars(),
+            min_tail_turns: default_min_tail_turns(),
+        }
+    }
+}
+
+fn default_observation_window() -> usize {
+    10
+}
+fn default_soft_cap_chars() -> usize {
+    400_000
+}
+fn default_hard_cap_chars() -> usize {
+    600_000
+}
+fn default_min_tail_turns() -> usize {
+    4
 }
 
 /// Configuration for persistent shell sessions (ADR-0015 §6).
@@ -363,5 +416,59 @@ runtime:
         assert_eq!(rt.shell.max_sessions, 32);
         assert_eq!(rt.shell.shell_path, "/bin/bash");
         assert!(!rt.shell.interactive);
+    }
+
+    #[test]
+    fn project_with_runtime_context_config() {
+        let dir = TempDir::new().unwrap();
+        let yaml = r#"
+name: test
+runtime:
+  context:
+    observation_window: 5
+    soft_cap_chars: 200000
+    hard_cap_chars: 500000
+    min_tail_turns: 2
+"#;
+        let path = write_file(&dir, "project.yml", yaml);
+        let config = load_project(&path).unwrap();
+        let rt = config.runtime.unwrap();
+        assert_eq!(rt.context.observation_window, 5);
+        assert_eq!(rt.context.soft_cap_chars, 200_000);
+        assert_eq!(rt.context.hard_cap_chars, 500_000);
+        assert_eq!(rt.context.min_tail_turns, 2);
+    }
+
+    #[test]
+    fn project_with_partial_runtime_context_config() {
+        let dir = TempDir::new().unwrap();
+        let yaml = r#"
+name: test
+runtime:
+  context:
+    observation_window: 20
+"#;
+        let path = write_file(&dir, "project.yml", yaml);
+        let config = load_project(&path).unwrap();
+        let rt = config.runtime.unwrap();
+        assert_eq!(rt.context.observation_window, 20);
+        // Rest should be defaults.
+        assert_eq!(rt.context.soft_cap_chars, 400_000);
+        assert_eq!(rt.context.hard_cap_chars, 600_000);
+        assert_eq!(rt.context.min_tail_turns, 4);
+    }
+
+    #[test]
+    fn project_without_runtime_context_uses_defaults() {
+        let dir = TempDir::new().unwrap();
+        let yaml = "name: test\nruntime:\n  shell:\n    max_sessions: 16\n";
+        let path = write_file(&dir, "project.yml", yaml);
+        let config = load_project(&path).unwrap();
+        let rt = config.runtime.unwrap();
+        let ctx = rt.context;
+        assert_eq!(ctx.observation_window, 10);
+        assert_eq!(ctx.soft_cap_chars, 400_000);
+        assert_eq!(ctx.hard_cap_chars, 600_000);
+        assert_eq!(ctx.min_tail_turns, 4);
     }
 }

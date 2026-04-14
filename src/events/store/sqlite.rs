@@ -170,22 +170,24 @@ impl EventStore for SqliteEventStore {
             let conn = conn.blocking_lock();
             let mut stmt = conn
                 .prepare(
-                    "SELECT data FROM events WHERE stream_id = ?1 AND sequence >= ?2 ORDER BY sequence ASC",
+                    "SELECT data, sequence FROM events WHERE stream_id = ?1 AND sequence >= ?2 ORDER BY sequence ASC",
                 )
                 .map_err(|e| EventStoreError::Connection(e.to_string()))?;
 
             let rows = stmt
                 .query_map(rusqlite::params![stream_id, from_seq], |row| {
                     let data: String = row.get(0)?;
-                    Ok(data)
+                    let seq: u64 = row.get(1)?;
+                    Ok((data, seq))
                 })
                 .map_err(|e| EventStoreError::Connection(e.to_string()))?;
 
             let mut events = Vec::new();
             for row in rows {
-                let data = row.map_err(|e| EventStoreError::Connection(e.to_string()))?;
-                let event: Event = serde_json::from_str(&data)
+                let (data, seq) = row.map_err(|e| EventStoreError::Connection(e.to_string()))?;
+                let mut event: Event = serde_json::from_str(&data)
                     .map_err(|e| EventStoreError::Serialization(e.to_string()))?;
+                event.sequence = seq;
                 events.push(event);
             }
             Ok(events)
@@ -214,7 +216,7 @@ impl EventStore for SqliteEventStore {
             let conn = conn.blocking_lock();
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, data FROM events WHERE id > ?1 ORDER BY id ASC LIMIT ?2",
+                    "SELECT id, data, sequence FROM events WHERE id > ?1 ORDER BY id ASC LIMIT ?2",
                 )
                 .map_err(|e| EventStoreError::Connection(e.to_string()))?;
 
@@ -222,16 +224,18 @@ impl EventStore for SqliteEventStore {
                 .query_map(rusqlite::params![after_global_seq, limit], |row| {
                     let id: u64 = row.get(0)?;
                     let data: String = row.get(1)?;
-                    Ok((id, data))
+                    let seq: u64 = row.get(2)?;
+                    Ok((id, data, seq))
                 })
                 .map_err(|e| EventStoreError::Connection(e.to_string()))?;
 
             let mut events = Vec::new();
             for row in rows {
-                let (global_seq, data) =
+                let (global_seq, data, seq) =
                     row.map_err(|e| EventStoreError::Connection(e.to_string()))?;
-                let event: Event = serde_json::from_str(&data)
+                let mut event: Event = serde_json::from_str(&data)
                     .map_err(|e| EventStoreError::Serialization(e.to_string()))?;
+                event.sequence = seq;
                 events.push(TailedEvent { global_seq, event });
             }
             Ok(events)
@@ -825,5 +829,56 @@ mod tests {
         let (_dir, store) = setup().await;
         let streams = store.list_streams().await.unwrap();
         assert!(streams.is_empty());
+    }
+
+    /// Concurrent appends to different streams must never leak events
+    /// across stream boundaries (session isolation, ADR-0016 drift goal).
+    #[tokio::test]
+    async fn concurrent_streams_are_isolated() {
+        let (_dir, store) = setup().await;
+        let store = Arc::new(store);
+        let n = 20; // events per stream
+
+        let mut handles = Vec::new();
+        for stream_idx in 0..3 {
+            let store = Arc::clone(&store);
+            handles.push(tokio::spawn(async move {
+                let stream = format!("concurrent-{stream_idx}");
+                for i in 0..n {
+                    let mut event = make_event(
+                        &stream,
+                        EventKind::ResponseReady {
+                            conversation_id: stream.clone(),
+                            content: format!("msg-{i}"),
+                        },
+                    );
+                    store.append(&mut event).await.unwrap();
+                }
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        // Each stream must contain exactly `n` events, all with the
+        // matching stream_id — no cross-contamination.
+        for stream_idx in 0..3 {
+            let stream = format!("concurrent-{stream_idx}");
+            let events = store.read_stream(&stream, 1).await.unwrap();
+            assert_eq!(
+                events.len(),
+                n,
+                "stream '{stream}' should have {n} events, got {}",
+                events.len()
+            );
+            for event in &events {
+                assert_eq!(
+                    event.stream_id, stream,
+                    "event on stream '{stream}' has wrong stream_id: {}",
+                    event.stream_id
+                );
+            }
+        }
     }
 }

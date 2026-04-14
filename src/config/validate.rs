@@ -59,18 +59,29 @@ fn validate_agent_tools(
     Ok(())
 }
 
-/// Default resolver that uses the static [`super::agent::KNOWN_TOOLS`] list.
-/// Used by [`super::load_project_dir`] which runs before a `Runtime` (and
-/// therefore a `ToolCatalog`) exists.
-pub struct BuiltinToolNameResolver;
+/// Resolver that combines the static [`super::agent::KNOWN_TOOLS`] list with
+/// declarative tool names loaded from `tools/*.yml`. Used by
+/// [`super::load_project_dir`] which runs before a `Runtime` (and therefore
+/// a `ToolCatalog`) exists.
+pub struct ConfigToolNameResolver {
+    declarative_names: Vec<String>,
+}
 
-impl ToolNameResolver for BuiltinToolNameResolver {
+impl ConfigToolNameResolver {
+    pub fn new(declarative_names: Vec<String>) -> Self {
+        Self { declarative_names }
+    }
+}
+
+impl ToolNameResolver for ConfigToolNameResolver {
     fn knows(&self, name: &str) -> bool {
-        super::agent::KNOWN_TOOLS.contains(&name)
+        super::agent::KNOWN_TOOLS.contains(&name) || self.declarative_names.iter().any(|n| n == name)
     }
 
     fn all_tool_names(&self) -> Vec<&str> {
-        super::agent::KNOWN_TOOLS.to_vec()
+        let mut names: Vec<&str> = super::agent::KNOWN_TOOLS.to_vec();
+        names.extend(self.declarative_names.iter().map(|s| s.as_str()));
+        names
     }
 }
 
@@ -245,7 +256,9 @@ mod tests {
             ),
         );
 
-        assert!(validate_workspace(&agents, &pipelines, &BuiltinToolNameResolver).is_ok());
+        // web_search is declarative (from tools/*.yml), not builtin.
+        let resolver = ConfigToolNameResolver::new(vec!["web_search".into()]);
+        assert!(validate_workspace(&agents, &pipelines, &resolver).is_ok());
     }
 
     #[test]
@@ -253,7 +266,7 @@ mod tests {
         let mut agents = HashMap::new();
         agents.insert("a".into(), agent("a", vec!["nonexistent_tool"]));
 
-        let err = validate_workspace(&agents, &HashMap::new(), &BuiltinToolNameResolver).unwrap_err();
+        let err = validate_workspace(&agents, &HashMap::new(), &ConfigToolNameResolver::new(vec![])).unwrap_err();
         assert!(matches!(err, ConfigError::Validation { .. }));
     }
 
@@ -267,7 +280,7 @@ mod tests {
             pipeline_from_steps("p", vec![("s1", "missing_agent", vec![])]),
         );
 
-        let err = validate_workspace(&agents, &pipelines, &BuiltinToolNameResolver).unwrap_err();
+        let err = validate_workspace(&agents, &pipelines, &ConfigToolNameResolver::new(vec![])).unwrap_err();
         assert!(matches!(err, ConfigError::Validation { message, .. } if message.contains("missing_agent")));
     }
 
@@ -282,7 +295,7 @@ mod tests {
             pipeline_from_steps("p", vec![("s1", "a", vec!["nonexistent"])]),
         );
 
-        let err = validate_workspace(&agents, &pipelines, &BuiltinToolNameResolver).unwrap_err();
+        let err = validate_workspace(&agents, &pipelines, &ConfigToolNameResolver::new(vec![])).unwrap_err();
         assert!(matches!(err, ConfigError::Validation { message, .. } if message.contains("nonexistent")));
     }
 
@@ -297,7 +310,7 @@ mod tests {
             pipeline_from_steps("p", vec![("s1", "a", vec!["s1"])]),
         );
 
-        let err = validate_workspace(&agents, &pipelines, &BuiltinToolNameResolver).unwrap_err();
+        let err = validate_workspace(&agents, &pipelines, &ConfigToolNameResolver::new(vec![])).unwrap_err();
         assert!(matches!(err, ConfigError::CyclicDependency { .. }));
     }
 
@@ -319,7 +332,7 @@ mod tests {
             ),
         );
 
-        let err = validate_workspace(&agents, &pipelines, &BuiltinToolNameResolver).unwrap_err();
+        let err = validate_workspace(&agents, &pipelines, &ConfigToolNameResolver::new(vec![])).unwrap_err();
         assert!(matches!(err, ConfigError::CyclicDependency { .. }));
     }
 
@@ -342,7 +355,7 @@ mod tests {
             ),
         );
 
-        assert!(validate_workspace(&agents, &pipelines, &BuiltinToolNameResolver).is_ok());
+        assert!(validate_workspace(&agents, &pipelines, &ConfigToolNameResolver::new(vec![])).is_ok());
     }
 
     #[test]
@@ -357,7 +370,7 @@ mod tests {
         });
         pipelines.insert("p".into(), p);
 
-        let err = validate_workspace(&agents, &pipelines, &BuiltinToolNameResolver).unwrap_err();
+        let err = validate_workspace(&agents, &pipelines, &ConfigToolNameResolver::new(vec![])).unwrap_err();
         assert!(matches!(err, ConfigError::Validation { message, .. } if message.contains("nonexistent")));
     }
 }

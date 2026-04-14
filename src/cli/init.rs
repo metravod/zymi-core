@@ -3,6 +3,67 @@ use std::path::Path;
 
 const KNOWN_EXAMPLES: &[&str] = &["research"];
 
+/// Declarative web_search tool template shipped with `zymi init`.
+///
+/// Ships as a working shell placeholder that returns a helpful message.
+/// Users uncomment the provider block they want and set the API key.
+const WEB_SEARCH_TOOL: &str = r#"# ============================================================================
+# web_search — declarative tool example
+#
+# This is a working example of a declarative tool. Out of the box it returns
+# a placeholder message. To connect it to a real search API:
+#
+#   1. Pick a provider below and uncomment its `implementation:` block.
+#   2. Delete or comment out the placeholder `implementation:` at the bottom.
+#   3. Set the API key in your environment.
+#
+# If you don't need web search, just delete this file — nothing will break.
+# ============================================================================
+
+name: web_search
+description: "Search the web for information on a given query"
+parameters:
+  type: object
+  properties:
+    query:
+      type: string
+      description: "Search query"
+  required: [query]
+
+# --- Provider: Brave Search (https://brave.com/search/api/) ---
+#     Free tier: 2000 queries/month
+#
+# implementation:
+#   kind: http
+#   method: GET
+#   url: "https://api.search.brave.com/res/v1/web/search?q=${args.query}&count=5"
+#   headers:
+#     Accept: "application/json"
+#     X-Subscription-Token: "${env.BRAVE_SEARCH_API_KEY}"
+
+# --- Provider: SerpAPI (https://serpapi.com/) ---
+#     Free tier: 100 queries/month
+#
+# implementation:
+#   kind: http
+#   method: GET
+#   url: "https://serpapi.com/search.json?q=${args.query}&num=5&api_key=${env.SERPAPI_KEY}"
+
+# --- Provider: Google Custom Search (https://developers.google.com/custom-search/) ---
+#     Free tier: 100 queries/day
+#
+# implementation:
+#   kind: http
+#   method: GET
+#   url: "https://www.googleapis.com/customsearch/v1?q=${args.query}&key=${env.GOOGLE_API_KEY}&cx=${env.GOOGLE_SEARCH_CX}&num=5"
+
+# Placeholder — returns a message instead of real results.
+# Replace with one of the provider blocks above.
+implementation:
+  kind: shell
+  command_template: "echo 'web_search is not configured. Edit tools/web_search.yml to connect a search provider.'"
+"#;
+
 pub fn exec(name: Option<String>, example: Option<&str>) -> Result<(), String> {
     if let Some(ex) = example {
         if !KNOWN_EXAMPLES.contains(&ex) {
@@ -28,6 +89,7 @@ pub fn exec(name: Option<String>, example: Option<&str>) -> Result<(), String> {
 
     create_dir(&cwd, "agents")?;
     create_dir(&cwd, "pipelines")?;
+    create_dir(&cwd, "tools")?;
     create_dir(&cwd, ".zymi")?;
 
     match example {
@@ -105,12 +167,15 @@ output:
 "#,
     )?;
 
+    write_file(&root.join("tools/web_search.yml"), WEB_SEARCH_TOOL)?;
+
     println!("Initialized zymi project '{project_name}'");
     println!();
-    println!("  project.yml          — project configuration");
-    println!("  agents/default.yml   — default agent");
-    println!("  pipelines/main.yml   — main pipeline");
-    println!("  .zymi/               — runtime data (events.db)");
+    println!("  project.yml              — project configuration");
+    println!("  agents/default.yml       — default agent");
+    println!("  pipelines/main.yml       — main pipeline");
+    println!("  tools/web_search.yml     — web search tool (configure your provider)");
+    println!("  .zymi/                   — runtime data (events.db)");
     println!();
     println!("Next: configure your LLM provider in project.yml, then run:");
     println!("  zymi run main");
@@ -252,12 +317,15 @@ output:
 "#,
     )?;
 
+    write_file(&root.join("tools/web_search.yml"), WEB_SEARCH_TOOL)?;
+
     println!("Initialized zymi project '{project_name}' with research example");
     println!();
     println!("  project.yml                — project configuration");
     println!("  agents/researcher.yml      — research agent (web_search, web_scrape, write_memory)");
     println!("  agents/writer.yml          — writer agent (read_file, write_file)");
     println!("  pipelines/research.yml     — 4-step research pipeline with parallel search");
+    println!("  tools/web_search.yml       — web search tool (configure your provider)");
     println!("  output/                    — report output directory");
     println!("  memory/                    — agent memory store");
     println!("  .zymi/                     — runtime data (events.db)");
