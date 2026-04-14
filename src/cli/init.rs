@@ -57,11 +57,81 @@ parameters:
 #   method: GET
 #   url: "https://www.googleapis.com/customsearch/v1?q=${args.query}&key=${env.GOOGLE_API_KEY}&cx=${env.GOOGLE_SEARCH_CX}&num=5"
 
+# --- Provider: Tavily (https://tavily.com/) ---
+#     AI-optimised search — returns clean, LLM-ready content.
+#     Free tier: 1000 queries/month
+#
+# implementation:
+#   kind: http
+#   method: POST
+#   url: "https://api.tavily.com/search"
+#   headers:
+#     Content-Type: "application/json"
+#     Authorization: "Bearer ${env.TAVILY_API_KEY}"
+#   body_template: '{"query": "${args.query}", "max_results": 5}'
+
 # Placeholder — returns a message instead of real results.
 # Replace with one of the provider blocks above.
 implementation:
   kind: shell
   command_template: "echo 'web_search is not configured. Edit tools/web_search.yml to connect a search provider.'"
+"#;
+
+/// Declarative web_scrape tool template shipped with `zymi init`.
+///
+/// Scrapes a URL and returns clean markdown/text content.
+/// Users uncomment the provider block they want and set the API key.
+const WEB_SCRAPE_TOOL: &str = r#"# ============================================================================
+# web_scrape — declarative tool example
+#
+# Fetches a URL and returns its content as clean text/markdown.
+# Out of the box it returns a placeholder message. To connect a provider:
+#
+#   1. Pick a provider below and uncomment its `implementation:` block.
+#   2. Delete or comment out the placeholder `implementation:` at the bottom.
+#   3. Set the API key in your environment.
+#
+# If you don't need web scraping, just delete this file — nothing will break.
+# ============================================================================
+
+name: web_scrape
+description: "Fetch a web page and return its content as clean text"
+parameters:
+  type: object
+  properties:
+    url:
+      type: string
+      description: "URL to scrape"
+  required: [url]
+
+# --- Provider: Firecrawl (https://firecrawl.dev/) ---
+#     Turns any URL into clean markdown. AI-optimised.
+#     Free tier: 500 pages/month
+#
+# implementation:
+#   kind: http
+#   method: POST
+#   url: "https://api.firecrawl.dev/v1/scrape"
+#   headers:
+#     Content-Type: "application/json"
+#     Authorization: "Bearer ${env.FIRECRAWL_API_KEY}"
+#   body_template: '{"url": "${args.url}", "formats": ["markdown"]}'
+
+# --- Provider: Jina Reader (https://jina.ai/reader/) ---
+#     Free, no API key needed. Prepend r.jina.ai/ to any URL.
+#
+# implementation:
+#   kind: http
+#   method: GET
+#   url: "https://r.jina.ai/${args.url}"
+#   headers:
+#     Accept: "text/plain"
+
+# Placeholder — returns a message instead of real results.
+# Replace with one of the provider blocks above.
+implementation:
+  kind: shell
+  command_template: "echo 'web_scrape is not configured. Edit tools/web_scrape.yml to connect a scraping provider.'"
 "#;
 
 pub fn exec(name: Option<String>, example: Option<&str>) -> Result<(), String> {
@@ -168,6 +238,7 @@ output:
     )?;
 
     write_file(&root.join("tools/web_search.yml"), WEB_SEARCH_TOOL)?;
+    write_file(&root.join("tools/web_scrape.yml"), WEB_SCRAPE_TOOL)?;
 
     println!("Initialized zymi project '{project_name}'");
     println!();
@@ -175,6 +246,7 @@ output:
     println!("  agents/default.yml       — default agent");
     println!("  pipelines/main.yml       — main pipeline");
     println!("  tools/web_search.yml     — web search tool (configure your provider)");
+    println!("  tools/web_scrape.yml     — web scrape tool (configure your provider)");
     println!("  .zymi/                   — runtime data (events.db)");
     println!();
     println!("Next: configure your LLM provider in project.yml, then run:");
@@ -318,6 +390,7 @@ output:
     )?;
 
     write_file(&root.join("tools/web_search.yml"), WEB_SEARCH_TOOL)?;
+    write_file(&root.join("tools/web_scrape.yml"), WEB_SCRAPE_TOOL)?;
 
     println!("Initialized zymi project '{project_name}' with research example");
     println!();
@@ -326,6 +399,7 @@ output:
     println!("  agents/writer.yml          — writer agent (read_file, write_file)");
     println!("  pipelines/research.yml     — 4-step research pipeline with parallel search");
     println!("  tools/web_search.yml       — web search tool (configure your provider)");
+    println!("  tools/web_scrape.yml       — web scrape tool (configure your provider)");
     println!("  output/                    — report output directory");
     println!("  memory/                    — agent memory store");
     println!("  .zymi/                     — runtime data (events.db)");

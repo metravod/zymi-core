@@ -27,6 +27,14 @@ pub fn resolve_templates(
     let captures: Vec<_> = re.captures_iter(raw).collect();
     for cap in captures.iter().rev() {
         let full_match = cap.get(0).unwrap();
+
+        // Skip placeholders inside YAML comment lines — the active implementation
+        // may be a harmless shell placeholder while commented-out provider blocks
+        // reference env vars the user hasn't set yet.
+        if is_in_yaml_comment(raw, full_match.start()) {
+            continue;
+        }
+
         let key = cap.get(1).unwrap().as_str().trim();
 
         let replacement = resolve_key(key, vars);
@@ -51,6 +59,15 @@ pub fn resolve_templates(
     }
 
     Ok(result)
+}
+
+/// Check whether the byte offset falls on a YAML comment line.
+///
+/// Walks backward to the start of the line and checks if the non-whitespace
+/// content begins with `#`.
+fn is_in_yaml_comment(raw: &str, offset: usize) -> bool {
+    let line_start = raw[..offset].rfind('\n').map_or(0, |p| p + 1);
+    raw[line_start..offset].trim_start().starts_with('#')
 }
 
 /// Resolve a single template key.
@@ -145,5 +162,40 @@ mod tests {
         let input = "${a} and ${b}";
         let result = resolve_templates(input, &vars, Path::new("test.yml")).unwrap();
         assert_eq!(result, "1 and 2");
+    }
+
+    #[test]
+    fn skips_placeholders_in_yaml_comments() {
+        let vars = HashMap::new();
+        let input = "# url: \"https://api.example.com?key=${env.MISSING_KEY}\"\nname: test";
+        let result = resolve_templates(input, &vars, Path::new("test.yml")).unwrap();
+        // Comment line is untouched; no error for the missing env var.
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn skips_placeholders_in_indented_yaml_comments() {
+        let vars = HashMap::new();
+        let input = "impl:\n  #   token: \"${env.MISSING}\"\n  kind: shell";
+        let result = resolve_templates(input, &vars, Path::new("test.yml")).unwrap();
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn resolves_active_line_but_skips_comment() {
+        let mut vars = HashMap::new();
+        vars.insert("model".into(), "gpt-4o".into());
+        let input = "# backup: ${env.NOT_SET}\nmodel: ${model}";
+        let result = resolve_templates(input, &vars, Path::new("test.yml")).unwrap();
+        assert_eq!(result, "# backup: ${env.NOT_SET}\nmodel: gpt-4o");
+    }
+
+    #[test]
+    fn is_in_yaml_comment_basic() {
+        assert!(is_in_yaml_comment("# ${env.KEY}", 2));
+        assert!(is_in_yaml_comment("  # ${env.KEY}", 4));
+        assert!(!is_in_yaml_comment("key: ${env.KEY}", 5));
+        assert!(!is_in_yaml_comment("first\nkey: ${env.KEY}", 11));
+        assert!(is_in_yaml_comment("first\n# ${env.KEY}", 8));
     }
 }
