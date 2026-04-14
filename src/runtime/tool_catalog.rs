@@ -117,24 +117,6 @@ impl ToolCatalog {
             false,
         );
 
-        register_builtin(&mut builtin, "web_scrape",
-            "Fetch the contents of a URL",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "url": {"type": "string", "description": "URL to fetch"}
-                },
-                "required": ["url"]
-            }),
-            |args_json| {
-                let args: serde_json::Value = serde_json::from_str(args_json).unwrap_or_default();
-                Intention::WebScrape {
-                    url: args.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                }
-            },
-            false,
-        );
-
         register_builtin(&mut builtin, "write_memory",
             "Store a key-value pair in the agent's memory",
             serde_json::json!({
@@ -354,13 +336,12 @@ mod tests {
     }
 
     #[test]
-    fn builtin_catalog_knows_all_six() {
+    fn builtin_catalog_knows_all_five() {
         let catalog = ToolCatalog::builtin_only();
         let expected = [
             "execute_shell_command",
             "write_file",
             "read_file",
-            "web_scrape",
             "write_memory",
             "spawn_sub_agent",
         ];
@@ -368,7 +349,7 @@ mod tests {
             assert!(catalog.knows(name), "catalog should know {name}");
             assert!(catalog.definition(name).is_some(), "catalog should have definition for {name}");
         }
-        assert_eq!(catalog.all_tool_names().len(), 6);
+        assert_eq!(catalog.all_tool_names().len(), 5);
     }
 
     #[test]
@@ -381,10 +362,10 @@ mod tests {
     #[test]
     fn definitions_for_agent_filters_correctly() {
         let catalog = ToolCatalog::builtin_only();
-        let tools = vec!["web_scrape".into(), "nonexistent".into(), "read_file".into()];
+        let tools = vec!["write_memory".into(), "nonexistent".into(), "read_file".into()];
         let defs = catalog.definitions_for_agent(&tools);
         assert_eq!(defs.len(), 2);
-        assert_eq!(defs[0].name, "web_scrape");
+        assert_eq!(defs[0].name, "write_memory");
         assert_eq!(defs[1].name, "read_file");
     }
 
@@ -421,7 +402,7 @@ mod tests {
         let catalog = ToolCatalog::with_declarative(&tools).unwrap();
         assert!(catalog.knows("slack_post"));
         assert!(catalog.is_declarative("slack_post"));
-        assert_eq!(catalog.all_tool_names().len(), 7); // 6 builtin + 1
+        assert_eq!(catalog.all_tool_names().len(), 6); // 5 builtin + 1
 
         let def = catalog.definition("slack_post").unwrap();
         assert_eq!(def.name, "slack_post");
@@ -484,6 +465,16 @@ mod tests {
         let catalog = ToolCatalog::with_declarative(&tools).unwrap();
         assert!(catalog.knows("web_search"));
         assert!(catalog.is_declarative("web_search"));
+    }
+
+    #[test]
+    fn web_scrape_declarative_no_collision() {
+        let mut tools = HashMap::new();
+        tools.insert("web_scrape".into(), make_http_tool("web_scrape"));
+
+        let catalog = ToolCatalog::with_declarative(&tools).unwrap();
+        assert!(catalog.knows("web_scrape"));
+        assert!(catalog.is_declarative("web_scrape"));
     }
 
     fn make_shell_tool(name: &str, command_template: &str) -> ToolConfig {

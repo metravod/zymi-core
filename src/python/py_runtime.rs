@@ -135,6 +135,7 @@ impl PyRuntime {
         let workspace = load_project_dir(&root)
             .map_err(|e| PyRuntimeError::new_err(format!("failed to load project: {e}")))?;
 
+        let _guard = shared_tokio().enter();
         let mut builder = Runtime::builder(workspace, root);
         match approval {
             "terminal" => {

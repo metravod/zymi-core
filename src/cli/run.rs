@@ -52,6 +52,7 @@ pub fn exec(
     }
 
     let rt = super::runtime();
+    let _guard = rt.enter();
     let approval_handler = rt.block_on(super::build_approval_handler(approval_mode, callback_url))?;
 
     let runtime = Runtime::builder(workspace, root.to_path_buf())

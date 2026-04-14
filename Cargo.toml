@@ -1,6 +1,6 @@
 [package]
 name = "zymi-core"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 description = "Event-sourced agent engine with boundary contracts, hash-chain audit, and declarative pipelines"
 repository = "https://github.com/metravod/zymi-core"

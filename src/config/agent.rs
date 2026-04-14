@@ -34,7 +34,6 @@ pub const KNOWN_TOOLS: &[&str] = &[
     "execute_shell_command",
     "write_file",
     "read_file",
-    "web_scrape",
     "write_memory",
     "spawn_sub_agent",
 ];

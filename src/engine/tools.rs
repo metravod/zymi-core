@@ -171,13 +171,6 @@ pub async fn execute_builtin_tool(
                 .ok_or("missing 'content' argument")?;
             write_file(path, content, project_root).await
         }
-        "web_scrape" => {
-            let url = args
-                .get("url")
-                .and_then(|v| v.as_str())
-                .ok_or("missing 'url' argument")?;
-            web_scrape(url).await
-        }
         "write_memory" => {
             let key = args
                 .get("key")
@@ -265,23 +258,6 @@ async fn write_file(path: &str, content: &str, project_root: &Path) -> Result<St
     Ok(format!("Written {} bytes to {path}", content.len()))
 }
 
-async fn web_scrape(url: &str) -> Result<String, String> {
-    let resp = reqwest::get(url)
-        .await
-        .map_err(|e| format!("failed to fetch {url}: {e}"))?;
-
-    if !resp.status().is_success() {
-        return Err(format!("HTTP {}", resp.status()));
-    }
-
-    let body = resp
-        .text()
-        .await
-        .map_err(|e| format!("failed to read response body: {e}"))?;
-
-    Ok(truncate_output(&body, 8000))
-}
-
 fn truncate_output(s: &str, max_chars: usize) -> String {
     if s.len() <= max_chars {
         s.to_string()
@@ -328,16 +304,6 @@ fn builtin_tool_def(name: &str) -> Option<ToolDefinition> {
                     "content": {"type": "string", "description": "File content to write"}
                 },
                 "required": ["path", "content"]
-            }),
-        ),
-        "web_scrape" => (
-            "Fetch the contents of a URL",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "url": {"type": "string", "description": "URL to fetch"}
-                },
-                "required": ["url"]
             }),
         ),
         "write_memory" => (
@@ -396,12 +362,11 @@ mod tests {
             "execute_shell_command".into(),
             "read_file".into(),
             "write_file".into(),
-            "web_scrape".into(),
             "write_memory".into(),
             "read_memory".into(),
         ];
         let defs = tool_definitions_for_agent(&tools);
-        assert_eq!(defs.len(), 6);
+        assert_eq!(defs.len(), 5);
         assert_eq!(defs[0].name, "execute_shell_command");
     }
 
