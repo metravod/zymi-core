@@ -515,7 +515,7 @@ mod tests {
         let catalog = ToolCatalog::with_declarative(&tools).unwrap();
         assert!(catalog.knows("run_tests"));
         assert!(catalog.is_declarative("run_tests"));
-        assert_eq!(catalog.all_tool_names().len(), 8);
+        assert_eq!(catalog.all_tool_names().len(), 7);
     }
 
     #[test]
