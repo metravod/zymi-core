@@ -9,7 +9,7 @@ Event-sourced agent engine for auditable AI workflows in Rust, YAML, and Python.
 - **Auditable by default**: every state change is persisted as an event with hash-chain verification.
 - **Safer side effects**: agents emit intentions first; contracts and approvals decide what is allowed to execute.
 - **Practical workflows**: define agents and DAG pipelines in YAML, then run them from a small CLI.
-- **Declarative custom tools**: add HTTP (and soon shell/Python) tools in `tools/*.yml` — no Rust code required.
+- **Declarative custom tools**: add HTTP and shell tools in `tools/*.yml` — no Rust code required. `zymi init` includes a working example.
 - **Flexible integration points**: use the Rust crate, Python bindings, or both — Python can drive pipelines directly via `Runtime.for_project(...).run_pipeline(...)`, no subprocess.
 - **LLM-provider ready**: OpenAI-compatible providers, Anthropic support, Python tools, and LangFuse event services.
 - **Automatic context management**: observation masking compresses older tool results in-place (~2x cost reduction, no extra LLM calls), with LLM summarization as a graduated fallback when the context grows further.
@@ -57,7 +57,7 @@ What this gives you:
 - `project.yml` for provider config, policies, contracts, and defaults
 - `agents/` for agent definitions
 - `pipelines/` for DAG workflows
-- `tools/` for declarative custom tools (optional)
+- `tools/web_search.yml` — a declarative tool example, ready to wire up to a search provider
 - `.zymi/events.db` for the append-only event log
 - `output/` and `memory/` directories in the research example
 
@@ -97,8 +97,8 @@ my-project/
     default.yml
   pipelines/
     main.yml
-  tools/          # optional — declarative custom tools
-    slack_post.yml
+  tools/          # declarative custom tools
+    web_search.yml
   .zymi/
     events.db
 ```
@@ -154,6 +154,8 @@ input:
 output:
   step: process
 ```
+
+The default scaffold also creates `tools/web_search.yml` — a declarative tool with a shell placeholder and commented-out configs for Brave Search, SerpAPI, and Google Custom Search. Uncomment one, set the API key, and the agent's `web_search` tool starts returning real results.
 
 ### Declarative Custom Tools
 
