@@ -76,10 +76,27 @@ zymi serve research
 zymi events
 zymi events --stream conversation-1
 zymi events --stream conversation-1 --verbose
-zymi events --kind tool_call_completed --json
+zymi events --kind tool_call_completed --raw
 
 zymi verify
 zymi verify --stream conversation-1
+
+# Discover what's in the project / what has run
+zymi pipelines
+zymi runs                          # all runs, newest first
+zymi runs --pipeline research --limit 20
+
+# Interactive 3-panel TUI: runs ▸ pipeline graph ▸ events
+# Inside: Tab cycles panels, Enter expands, f follows tail,
+#         Shift+R on a graph node forks-resumes from that step.
+zymi observe
+zymi observe --run pipeline-research-abc123
+
+# Fork-resume an earlier run from a chosen step (ADR-0018).
+# Steps upstream of the fork are frozen — their events are copied verbatim;
+# the fork step + DAG-descendants re-run against the current configs on disk.
+zymi resume pipeline-research-abc123 --from-step writer
+zymi resume pipeline-research-abc123 --from-step writer --dry-run   # preview only
 
 # JSON Schema for configs (useful for IDE autocomplete / LLM generation)
 zymi schema project

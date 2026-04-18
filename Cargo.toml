@@ -1,6 +1,6 @@
 [package]
 name = "zymi-core"
-version = "0.1.8"
+version = "0.2.0"
 edition = "2021"
 description = "Event-sourced agent engine with boundary contracts, hash-chain audit, and declarative pipelines"
 repository = "https://github.com/metravod/zymi-core"
@@ -27,11 +27,14 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-feature
 pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 axum = { version = "0.7", optional = true }
+ratatui = { version = "0.29", optional = true }
+crossterm = { version = "0.28", features = ["event-stream"], optional = true }
+futures = { version = "0.3", optional = true }
 
 [features]
 default = []
 python = ["pyo3"]
-cli = ["clap", "runtime"]
+cli = ["clap", "runtime", "ratatui", "crossterm", "futures"]
 runtime = ["reqwest"]
 webhook = ["axum", "runtime"]
 services = ["runtime"]

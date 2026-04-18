@@ -8,7 +8,7 @@
 //! `ProcessConversation`, `DecideApproval`, `ReplayStream`. Slice 1 only
 //! ships [`RunPipeline`]; the others are added when a real caller appears.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use uuid::Uuid;
 
@@ -19,12 +19,36 @@ use uuid::Uuid;
 /// be reattached to the same correlation/stream as their request, instead of
 /// minting fresh ones. The synchronous `zymi run` path generates them
 /// locally via [`RunPipeline::new`].
+///
+/// The optional [`resume`](Self::resume) field carries fork-resume context
+/// (ADR-0018). When present, the handler skips its own
+/// [`crate::events::EventKind::PipelineRequested`] emission (the resume
+/// orchestrator already wrote it), seeds `step_outputs` from
+/// [`ResumeContext::frozen_outputs`], does not execute any step whose id is
+/// in [`ResumeContext::frozen_step_ids`], and still emits a
+/// `PipelineCompleted` envelope at the end (so `zymi runs` and `zymi observe`
+/// see the new stream as a complete run).
 #[derive(Debug, Clone)]
 pub struct RunPipeline {
     pub pipeline_name: String,
     pub inputs: HashMap<String, String>,
     pub correlation_id: Uuid,
     pub stream_id: Option<String>,
+    pub resume: Option<ResumeContext>,
+}
+
+/// Frozen prefix carried over from a parent stream when forking a resume.
+///
+/// Built by [`crate::handlers::resume_pipeline`] from the parent stream and
+/// the current pipeline DAG. The handler treats every step in
+/// `frozen_step_ids` as an upstream dependency whose output is already known
+/// (`frozen_outputs[step_id]`) and must not be re-executed.
+#[derive(Debug, Clone)]
+pub struct ResumeContext {
+    pub parent_stream_id: String,
+    pub fork_at_step: String,
+    pub frozen_outputs: HashMap<String, String>,
+    pub frozen_step_ids: HashSet<String>,
 }
 
 impl RunPipeline {
@@ -37,6 +61,7 @@ impl RunPipeline {
             inputs,
             correlation_id: Uuid::new_v4(),
             stream_id: None,
+            resume: None,
         }
     }
 
@@ -53,6 +78,26 @@ impl RunPipeline {
             inputs,
             correlation_id,
             stream_id: Some(stream_id.into()),
+            resume: None,
+        }
+    }
+
+    /// Construct a resume command. The caller must already have appended
+    /// `PipelineRequested`, `ResumeForked`, `WorkflowStarted`, and the
+    /// frozen-step bootstrap events to `stream_id` before dispatching.
+    pub fn resume(
+        pipeline_name: impl Into<String>,
+        inputs: HashMap<String, String>,
+        correlation_id: Uuid,
+        stream_id: impl Into<String>,
+        resume: ResumeContext,
+    ) -> Self {
+        Self {
+            pipeline_name: pipeline_name.into(),
+            inputs,
+            correlation_id,
+            stream_id: Some(stream_id.into()),
+            resume: Some(resume),
         }
     }
 }

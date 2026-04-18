@@ -86,6 +86,7 @@ impl Runtime {
             approval: None,
             action_executor: None,
             tail_policy: None,
+            provider: None,
         }
     }
 
@@ -164,6 +165,7 @@ pub struct RuntimeBuilder {
     approval: Option<Arc<dyn ApprovalHandler>>,
     action_executor: Option<Arc<dyn ActionExecutor>>,
     tail_policy: Option<TailWatcherPolicy>,
+    provider: Option<Arc<dyn LlmProvider>>,
 }
 
 impl RuntimeBuilder {
@@ -208,6 +210,14 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Inject an LLM provider, bypassing the `project.llm` config. Primarily
+    /// for tests that drive the engine with a mock provider; production
+    /// callers should let the builder construct the provider from config.
+    pub fn with_llm_provider(mut self, provider: Arc<dyn LlmProvider>) -> Self {
+        self.provider = Some(provider);
+        self
+    }
+
     /// Finalise the runtime. Returns an error if the project's LLM section
     /// is missing or the SQLite store cannot be opened.
     pub fn build(self) -> Result<Runtime, String> {
@@ -219,6 +229,7 @@ impl RuntimeBuilder {
             approval,
             action_executor,
             tail_policy,
+            provider: provider_override,
         } = self;
 
         // 1. Store + bus — either injected together, or build the SQLite
@@ -247,16 +258,20 @@ impl RuntimeBuilder {
 
         // 3. LLM provider. Required: a Runtime that cannot run any pipeline
         //    is not a useful Runtime, so fail at build time rather than at
-        //    first command dispatch.
-        let llm_config = workspace
-            .project
-            .llm
-            .as_ref()
-            .ok_or("no 'llm' section in project.yml — configure a provider to run pipelines")?;
-        let provider: Arc<dyn LlmProvider> = Arc::from(
-            llm::create_provider(llm_config)
-                .map_err(|e| format!("failed to create LLM provider: {e}"))?,
-        );
+        //    first command dispatch. Tests may inject a mock via
+        //    `with_llm_provider`, in which case `project.llm` is not consulted.
+        let provider: Arc<dyn LlmProvider> = match provider_override {
+            Some(p) => p,
+            None => {
+                let llm_config = workspace.project.llm.as_ref().ok_or(
+                    "no 'llm' section in project.yml — configure a provider to run pipelines",
+                )?;
+                Arc::from(
+                    llm::create_provider(llm_config)
+                        .map_err(|e| format!("failed to create LLM provider: {e}"))?,
+                )
+            }
+        };
 
         // 4. Tool catalog — built-in tools + declarative tools from
         //    workspace.tools (tools/*.yml). Programmatic registrations

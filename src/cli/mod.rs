@@ -1,6 +1,12 @@
+mod event_fmt;
 mod events;
 mod init;
+mod observe;
+mod pipelines;
+mod resume;
 mod run;
+mod runs;
+mod runs_data;
 mod schema;
 mod serve;
 mod verify;
@@ -68,9 +74,9 @@ enum Command {
         #[arg(short, long, default_value = "50")]
         limit: usize,
 
-        /// Output as JSON (one event per line)
+        /// Emit raw output (one JSON event per line, pipe-friendly)
         #[arg(long)]
-        json: bool,
+        raw: bool,
 
         /// Show extended detail for each event
         #[arg(short, long)]
@@ -106,6 +112,75 @@ enum Command {
         approval: String,
 
         /// Webhook callback URL for approval notifications (requires --approval=webhook)
+        #[arg(long)]
+        callback_url: Option<String>,
+
+        /// Project root directory (defaults to cwd)
+        #[arg(short = 'd', long)]
+        dir: Option<PathBuf>,
+    },
+
+    /// List pipelines defined in the project
+    Pipelines {
+        /// Project root directory
+        #[arg(short = 'd', long)]
+        dir: Option<PathBuf>,
+    },
+
+    /// List pipeline runs recorded in the event store
+    Runs {
+        /// Filter by pipeline name
+        #[arg(short, long)]
+        pipeline: Option<String>,
+
+        /// Maximum number of runs to show
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+
+        /// Emit raw JSON output (one run per line)
+        #[arg(long)]
+        raw: bool,
+
+        /// Project root directory
+        #[arg(short = 'd', long)]
+        dir: Option<PathBuf>,
+    },
+
+    /// Interactive TUI for browsing runs, pipeline graph, and event timeline
+    Observe {
+        /// Pre-select a run by stream id
+        #[arg(short, long)]
+        run: Option<String>,
+
+        /// Project root directory
+        #[arg(short = 'd', long)]
+        dir: Option<PathBuf>,
+    },
+
+    /// Fork-resume a previous pipeline run from a chosen step (ADR-0018).
+    ///
+    /// Steps upstream of `--from-step` are frozen — their events from the
+    /// parent stream are copied to a new stream and they are not re-executed.
+    /// The fork step and its DAG-descendants run from scratch using the
+    /// current pipelines/agents config from disk.
+    Resume {
+        /// Parent stream id (see `zymi runs` / `zymi observe`)
+        stream: String,
+
+        /// Step id at which to fork — this step and everything downstream re-run
+        #[arg(long = "from-step")]
+        from_step: String,
+
+        /// Print the resume plan (frozen vs re-executed steps) and exit
+        /// without writing any new events.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Approval mode: "terminal" (interactive, default) or "webhook"
+        #[arg(long, default_value = "terminal")]
+        approval: String,
+
+        /// Webhook callback URL for approval notifications
         #[arg(long)]
         callback_url: Option<String>,
 
@@ -150,17 +225,32 @@ fn dispatch(cli: Cli) {
             stream,
             kind,
             limit,
-            json,
+            raw,
             verbose,
             dir,
         } => events::exec(
             stream.as_deref(),
             kind.as_deref(),
             limit,
-            json,
+            raw,
             verbose,
             resolve_root(dir.as_deref()),
         ),
+        Command::Pipelines { dir } => pipelines::exec(resolve_root(dir.as_deref())),
+        Command::Runs {
+            pipeline,
+            limit,
+            raw,
+            dir,
+        } => runs::exec(
+            pipeline.as_deref(),
+            limit,
+            raw,
+            resolve_root(dir.as_deref()),
+        ),
+        Command::Observe { run, dir } => {
+            observe::exec(run.as_deref(), resolve_root(dir.as_deref()))
+        }
         Command::Verify { stream, dir } => {
             verify::exec(stream.as_deref(), resolve_root(dir.as_deref()))
         }
@@ -171,6 +261,21 @@ fn dispatch(cli: Cli) {
             callback_url,
             dir,
         } => serve::exec(&pipeline, poll_interval_ms, &approval, callback_url.as_deref(), resolve_root(dir.as_deref())),
+        Command::Resume {
+            stream,
+            from_step,
+            dry_run,
+            approval,
+            callback_url,
+            dir,
+        } => resume::exec(
+            &stream,
+            &from_step,
+            dry_run,
+            &approval,
+            callback_url.as_deref(),
+            resolve_root(dir.as_deref()),
+        ),
         Command::Schema { kind, all } => schema::exec(kind.as_deref(), all),
     };
 
@@ -197,7 +302,7 @@ pub(crate) fn store_path(root: &Path) -> PathBuf {
 /// `--approval=webhook`: HTTP webhook server (requires `webhook` feature).
 pub(crate) async fn build_approval_handler(
     mode: &str,
-    callback_url: Option<&str>,
+    #[cfg_attr(not(feature = "webhook"), allow(unused_variables))] callback_url: Option<&str>,
 ) -> Result<Arc<dyn crate::approval::ApprovalHandler>, String> {
     match mode {
         "terminal" => Ok(Arc::new(

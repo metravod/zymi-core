@@ -92,6 +92,7 @@ pub async fn run_pipeline_for_request(
         inputs: inputs.clone(),
         correlation_id,
         stream_id: None,
+        resume: None,
     };
     handler::handle(&runtime, cmd).await
 }

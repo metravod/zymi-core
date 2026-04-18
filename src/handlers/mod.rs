@@ -6,4 +6,5 @@
 //!
 //! Slice 1 only ships [`run_pipeline`] — see ADR-0013 for the larger set.
 
+pub mod resume_pipeline;
 pub mod run_pipeline;

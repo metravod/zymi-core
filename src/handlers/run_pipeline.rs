@@ -86,22 +86,45 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
         .map_err(|e| format!("failed to build execution plan: {e}"))?;
 
     let memory = new_memory_store(Arc::clone(rt.bus()));
+    let is_local_cli_run = cmd.stream_id.is_none();
+    let resume = cmd.resume.clone();
+    let is_resume = resume.is_some();
     let stream_id = cmd
         .stream_id
         .clone()
         .unwrap_or_else(|| format!("pipeline-{}-{}", pipeline.name, Uuid::new_v4()));
     let correlation_id = cmd.correlation_id;
 
-    emit_event(
-        rt.bus(),
-        &stream_id,
-        correlation_id,
-        EventKind::WorkflowStarted {
-            user_message: format!("pipeline: {}", pipeline.name),
-            node_count: plan.step_count(),
-        },
-    )
-    .await;
+    // For local CLI runs, emit a `PipelineRequested` marker so `zymi runs`
+    // / `zymi observe` can identify the run the same way as cross-process
+    // runs (which already receive one from the event router). Resume runs
+    // have their PipelineRequested + WorkflowStarted + frozen-step bootstrap
+    // emitted by the resume orchestrator before dispatch (ADR-0018).
+    if is_local_cli_run {
+        emit_event(
+            rt.bus(),
+            &stream_id,
+            correlation_id,
+            EventKind::PipelineRequested {
+                pipeline: pipeline.name.clone(),
+                inputs: cmd.inputs.clone(),
+            },
+        )
+        .await;
+    }
+
+    if !is_resume {
+        emit_event(
+            rt.bus(),
+            &stream_id,
+            correlation_id,
+            EventKind::WorkflowStarted {
+                user_message: format!("pipeline: {}", pipeline.name),
+                node_count: plan.step_count(),
+            },
+        )
+        .await;
+    }
 
     println!(
         "  Execution plan: {} steps, {} levels\n",
@@ -112,6 +135,27 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
     let mut step_outputs: HashMap<String, String> = HashMap::new();
     let mut all_results: HashMap<String, StepResult> = HashMap::new();
     let mut overall_success = true;
+
+    if let Some(ctx) = &resume {
+        for (step_id, output) in &ctx.frozen_outputs {
+            step_outputs.insert(step_id.clone(), output.clone());
+            all_results.insert(
+                step_id.clone(),
+                StepResult {
+                    step_id: step_id.clone(),
+                    agent_name: pipeline
+                        .steps
+                        .iter()
+                        .find(|s| &s.id == step_id)
+                        .map(|s| s.agent.clone())
+                        .unwrap_or_default(),
+                    output: output.clone(),
+                    iterations: 0,
+                    success: true,
+                },
+            );
+        }
+    }
 
     for (level_idx, level) in plan.levels.iter().enumerate() {
         let level_names: Vec<&str> = level.iter().map(|s| s.as_str()).collect();
@@ -128,6 +172,13 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
         let mut handles = Vec::new();
 
         for step_id in level {
+            if let Some(ctx) = &resume {
+                if ctx.frozen_step_ids.contains(step_id) {
+                    println!("    [{step_id}] frozen (resumed from parent)");
+                    continue;
+                }
+            }
+
             let step = pipeline
                 .steps
                 .iter()
@@ -231,6 +282,26 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
         },
     )
     .await;
+
+    // Matching PipelineCompleted for the local CLI marker above. The serve
+    // path publishes its own PipelineCompleted at the event router level, so
+    // we skip it here to avoid duplicate completions on the same stream.
+    // Resume runs are launched directly from CLI (no router), so we emit the
+    // completion envelope here as well (ADR-0018).
+    if is_local_cli_run || is_resume {
+        emit_event(
+            rt.bus(),
+            &stream_id,
+            correlation_id,
+            EventKind::PipelineCompleted {
+                pipeline: pipeline.name.clone(),
+                success: overall_success,
+                final_output: final_output.clone(),
+                error: None,
+            },
+        )
+        .await;
+    }
 
     // Close the persistent shell session for this stream (ADR-0015 §3).
     rt.shell_pool()

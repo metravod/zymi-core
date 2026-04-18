@@ -220,6 +220,16 @@ pub enum EventKind {
         final_output: Option<String>,
         error: Option<String>,
     },
+
+    /// Marker emitted at the start of a forked resume run (ADR-0018).
+    /// History-only: projections ignore it. The new stream copies the parent's
+    /// frozen step events as if they happened on the new stream; this marker
+    /// preserves the audit trail back to the originating run.
+    ResumeForked {
+        parent_stream_id: String,
+        parent_correlation_id: Uuid,
+        fork_at_step: String,
+    },
 }
 
 impl EventKind {
@@ -250,6 +260,7 @@ impl EventKind {
             EventKind::ShellSessionClosed { .. } => "shell_session_closed",
             EventKind::PipelineRequested { .. } => "pipeline_requested",
             EventKind::PipelineCompleted { .. } => "pipeline_completed",
+            EventKind::ResumeForked { .. } => "resume_forked",
         }
     }
 }
