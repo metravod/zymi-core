@@ -137,7 +137,7 @@ pub async fn list_runs(
         });
     }
 
-    runs.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+    runs.sort_by_key(|r| std::cmp::Reverse(r.started_at));
     Ok(runs)
 }
 
