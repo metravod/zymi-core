@@ -121,7 +121,7 @@ pub fn format_event(event: &Event) -> FormattedEvent {
                 full.push_str(&format!("  {k}: {v}\n"));
             }
             FormattedEvent {
-                icon: "🚀",
+                icon: "●",
                 label: "Pipeline".into(),
                 short_detail: short,
                 full_detail: full,
@@ -161,7 +161,7 @@ pub fn format_event(event: &Event) -> FormattedEvent {
         EventKind::UserMessageReceived { content, connector } => {
             let text = content.user_text().unwrap_or("<multimodal>");
             FormattedEvent {
-                icon: "👤",
+                icon: "@",
                 label: "User".into(),
                 short_detail: format!("{connector}: {}", truncate(text, 80)),
                 full_detail: format!("connector: {connector}\n{text}"),
@@ -170,7 +170,7 @@ pub fn format_event(event: &Event) -> FormattedEvent {
             }
         }
         EventKind::ScheduledTaskTriggered { entry_id, task } => FormattedEvent {
-            icon: "⏰",
+            icon: "*",
             label: "Scheduled".into(),
             short_detail: format!("{entry_id}: {}", truncate(task, 60)),
             full_detail: format!("entry: {entry_id}\ntask: {task}"),
@@ -179,7 +179,7 @@ pub fn format_event(event: &Event) -> FormattedEvent {
         },
 
         EventKind::AgentProcessingStarted { conversation_id } => FormattedEvent {
-            icon: "▶",
+            icon: "▸",
             label: "Processing".into(),
             short_detail: format!("conversation={conversation_id}"),
             full_detail: format!("conversation: {conversation_id}"),
@@ -205,7 +205,7 @@ pub fn format_event(event: &Event) -> FormattedEvent {
         } => {
             let ctx_k = *approx_context_chars / 1024;
             FormattedEvent {
-                icon: "⚡",
+                icon: "·",
                 label: "LLM call".into(),
                 short_detail: format!("iter={iteration} msgs={message_count} ~{ctx_k}k"),
                 full_detail: format!(
@@ -247,7 +247,7 @@ pub fn format_event(event: &Event) -> FormattedEvent {
             arguments,
             call_id,
         } => FormattedEvent {
-            icon: "🔧",
+            icon: "⚙",
             label: format!("Tool: {tool_name}"),
             short_detail: truncate(arguments, 80).to_string(),
             full_detail: format!("call_id: {call_id}\ntool: {tool_name}\nargs: {arguments}"),
@@ -272,7 +272,7 @@ pub fn format_event(event: &Event) -> FormattedEvent {
         },
 
         EventKind::ApprovalRequested { description, approval_id } => FormattedEvent {
-            icon: "⏳",
+            icon: "?",
             label: "Approval".into(),
             short_detail: truncate(description, 80).to_string(),
             full_detail: format!("id: {approval_id}\n{description}"),
@@ -289,7 +289,7 @@ pub fn format_event(event: &Event) -> FormattedEvent {
         },
 
         EventKind::IntentionEmitted { intention_tag, intention_data } => FormattedEvent {
-            icon: "📋",
+            icon: "!",
             label: "Intention".into(),
             short_detail: intention_tag.clone(),
             full_detail: format!("tag: {intention_tag}\ndata: {intention_data}"),
@@ -297,7 +297,7 @@ pub fn format_event(event: &Event) -> FormattedEvent {
             indent,
         },
         EventKind::IntentionEvaluated { intention_tag, verdict } => FormattedEvent {
-            icon: "📝",
+            icon: "=",
             label: "Contract".into(),
             short_detail: format!("{intention_tag}: {verdict}"),
             full_detail: format!("tag: {intention_tag}\nverdict: {verdict}"),
@@ -306,7 +306,7 @@ pub fn format_event(event: &Event) -> FormattedEvent {
         },
 
         EventKind::ResponseReady { conversation_id, content } => FormattedEvent {
-            icon: "📨",
+            icon: "»",
             label: "Response".into(),
             short_detail: truncate(content, 80).to_string(),
             full_detail: format!("conversation: {conversation_id}\n{content}"),
@@ -315,7 +315,7 @@ pub fn format_event(event: &Event) -> FormattedEvent {
         },
 
         EventKind::WorkflowStarted { node_count, user_message } => FormattedEvent {
-            icon: "🔀",
+            icon: "◆",
             label: "Workflow".into(),
             short_detail: format!("{node_count} node(s) — {}", truncate(user_message, 60)),
             full_detail: format!("nodes: {node_count}\nmessage: {user_message}"),
@@ -323,7 +323,7 @@ pub fn format_event(event: &Event) -> FormattedEvent {
             indent,
         },
         EventKind::WorkflowNodeStarted { node_id, description } => FormattedEvent {
-            icon: "▶",
+            icon: "▸",
             label: format!("WF:{node_id}"),
             short_detail: truncate(description, 80).to_string(),
             full_detail: format!("node: {node_id}\n{description}"),
@@ -367,7 +367,7 @@ pub fn format_event(event: &Event) -> FormattedEvent {
         EventKind::MemoryWritten { key, value, previous_value_seq } => {
             let overwrite = if previous_value_seq.is_some() { " (overwrite)" } else { "" };
             FormattedEvent {
-                icon: "✎",
+                icon: "+",
                 label: "Memory".into(),
                 short_detail: format!("{key}{overwrite} = {}", truncate(value, 60)),
                 full_detail: format!("key: {key}{overwrite}\nvalue: {value}"),
@@ -392,7 +392,7 @@ pub fn format_event(event: &Event) -> FormattedEvent {
             let (lo, hi) = replaces_seq_range;
             let sign = if *bytes_saved >= 0 { "+" } else { "" };
             FormattedEvent {
-                icon: "↯",
+                icon: "~",
                 label: "Compact".into(),
                 short_detail: format!("seq={lo}..={hi} {sign}{bytes_saved} bytes"),
                 full_detail: format!(

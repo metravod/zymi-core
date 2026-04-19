@@ -2,21 +2,20 @@
 //!
 //! Algorithm:
 //! 1. Assign each node a rank = `max(rank(p) for p in depends_on) + 1`.
-//! 2. Render nodes of the same rank side-by-side, ranks stacked top-to-bottom.
-//! 3. Draw straight `│` between a node and a parent at the previous rank when
-//!    both occupy the same column, else draw a step connector.
+//! 2. Stack ranks top-to-bottom. Nodes sharing a rank are stacked vertically
+//!    inside a framed "Level N" box; parallelism is labelled in the header.
+//! 3. Boxes are connected by a thin `│` trunk between them.
 //!
-//! Pipeline DAGs are tiny (≤10 nodes typical), so we don't minimise crossings.
-//! When a rank has more than [`MAX_NODES_PER_RANK`] nodes, we fall back to a
-//! compact `rank N: [a, b, c, …]` line. That preserves information without
-//! wrapping to unreadable widths.
+//! Pipeline DAGs are tiny (≤10 nodes typical), so we don't minimise crossings
+//! or solve arbitrary DAG routing — this is a pretty-printer, not a graph lib.
 
 use std::collections::HashMap;
 
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+
 use crate::config::PipelineConfig;
 use crate::events::{Event, EventKind};
-
-const MAX_NODES_PER_RANK: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeStatus {
@@ -30,9 +29,18 @@ impl NodeStatus {
     pub fn glyph(self) -> char {
         match self {
             NodeStatus::Pending => '·',
-            NodeStatus::Running => '⏳',
+            NodeStatus::Running => '◷',
             NodeStatus::Ok => '✓',
             NodeStatus::Failed => '✗',
+        }
+    }
+
+    fn color(self) -> Color {
+        match self {
+            NodeStatus::Pending => Color::DarkGray,
+            NodeStatus::Running => Color::Yellow,
+            NodeStatus::Ok => Color::Green,
+            NodeStatus::Failed => Color::Red,
         }
     }
 }
@@ -49,9 +57,6 @@ pub struct GraphNode {
 pub struct Graph {
     pub nodes: Vec<GraphNode>,
     pub rank_counts: Vec<usize>,
-    /// `true` when at least one rank exceeded [`MAX_NODES_PER_RANK`] and we
-    /// rendered the compact fallback instead of the graph.
-    pub compact: bool,
 }
 
 impl Graph {
@@ -81,68 +86,88 @@ impl Graph {
             }
         }
 
-        let compact = rank_counts.iter().any(|&c| c > MAX_NODES_PER_RANK);
-        Graph {
-            nodes,
-            rank_counts,
-            compact,
-        }
+        Graph { nodes, rank_counts }
     }
 
-    /// Return the selected node id or `None` if the graph is empty.
+    /// Return the selected node or `None` if the graph is empty.
     pub fn node_at(&self, idx: usize) -> Option<&GraphNode> {
         self.nodes.get(idx)
     }
 
-    /// Render as a list of text lines for ratatui. `selected_idx` is the
-    /// index into [`Graph::nodes`] that should be highlighted.
-    pub fn render_lines(&self, selected_idx: Option<usize>) -> Vec<String> {
+    /// Render as styled lines for ratatui. `width` is the usable content width
+    /// inside the surrounding block (i.e. `area.width - 2`). `selected_idx` is
+    /// the index into [`Graph::nodes`] that should be highlighted.
+    pub fn render_lines(
+        &self,
+        selected_idx: Option<usize>,
+        width: usize,
+    ) -> Vec<Line<'static>> {
+        let dim = Style::default().fg(Color::DarkGray);
+
         if self.nodes.is_empty() {
-            return vec!["(empty pipeline)".into()];
+            return vec![Line::from(Span::styled("(empty pipeline)", dim))];
         }
 
-        if self.compact {
-            return self.render_compact(selected_idx);
-        }
+        // Clamp to sensible bounds. Narrow terminals get 24, wide get 60.
+        let box_w = width.clamp(24, 60);
+        let inner = box_w - 2;
 
-        let mut lines = Vec::new();
         let selected_id = selected_idx.and_then(|i| self.nodes.get(i).map(|n| n.id.as_str()));
 
-        // Group nodes by rank.
         let mut by_rank: Vec<Vec<&GraphNode>> = vec![Vec::new(); self.rank_counts.len()];
         for node in &self.nodes {
             by_rank[node.rank].push(node);
         }
 
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        let trunk_col = inner / 2 + 1; // column offset inside the box for the trunk
+
         for (r, row) in by_rank.iter().enumerate() {
+            // Connector trunk between boxes.
             if r > 0 {
-                lines.push(connector_row(row.len()));
+                let trunk = format!("{}│", " ".repeat(trunk_col));
+                lines.push(Line::from(Span::styled(trunk, dim)));
             }
-            lines.push(node_row(row, selected_id));
+
+            // Top border: ╭─ Level N [(parallel)] ─...─╮
+            let suffix = if row.len() > 1 { " (parallel)" } else { "" };
+            let label = format!(" Level {}{} ", r + 1, suffix);
+            let label_len = label.chars().count();
+            let dashes_after = inner.saturating_sub(label_len + 1);
+            let top = format!("╭─{label}{}╮", "─".repeat(dashes_after));
+            lines.push(Line::from(Span::styled(top, dim)));
+
+            // Node rows.
+            for node in row {
+                let is_sel = Some(node.id.as_str()) == selected_id;
+                let marker = if is_sel { '▸' } else { ' ' };
+                let body = format!(
+                    "{} {} {}",
+                    marker,
+                    node.status.glyph(),
+                    truncate_chars(&node.id, inner.saturating_sub(6))
+                );
+                let pad = (inner - 2).saturating_sub(body.chars().count());
+                let node_style = if is_sel {
+                    Style::default()
+                        .fg(node.status.color())
+                        .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+                } else {
+                    Style::default().fg(node.status.color())
+                };
+                let spans = vec![
+                    Span::styled("│ ", dim),
+                    Span::styled(body, node_style),
+                    Span::styled(format!("{} │", " ".repeat(pad)), dim),
+                ];
+                lines.push(Line::from(spans));
+            }
+
+            // Bottom border.
+            let bottom = format!("╰{}╯", "─".repeat(inner));
+            lines.push(Line::from(Span::styled(bottom, dim)));
         }
 
-        lines
-    }
-
-    fn render_compact(&self, selected_idx: Option<usize>) -> Vec<String> {
-        let mut lines = Vec::new();
-        let selected_id = selected_idx.and_then(|i| self.nodes.get(i).map(|n| n.id.as_str()));
-        let mut by_rank: Vec<Vec<&GraphNode>> = vec![Vec::new(); self.rank_counts.len()];
-        for node in &self.nodes {
-            by_rank[node.rank].push(node);
-        }
-
-        lines.push("(compact: ranks too wide to draw)".into());
-        for (r, row) in by_rank.iter().enumerate() {
-            let items: Vec<String> = row
-                .iter()
-                .map(|n| {
-                    let marker = if Some(n.id.as_str()) == selected_id { ">" } else { " " };
-                    format!("{marker}{} {}", n.status.glyph(), n.id)
-                })
-                .collect();
-            lines.push(format!("rank {r}: {}", items.join(", ")));
-        }
         lines
     }
 }
@@ -197,34 +222,15 @@ fn derive_statuses(events: &[Event]) -> HashMap<String, NodeStatus> {
     out
 }
 
-fn node_row(row: &[&GraphNode], selected_id: Option<&str>) -> String {
-    row.iter()
-        .map(|n| {
-            let marker = if Some(n.id.as_str()) == selected_id { ">" } else { " " };
-            format!("{marker}[{} {}]", n.status.glyph(), truncate(&n.id, 10))
-        })
-        .collect::<Vec<_>>()
-        .join("  ")
-}
-
-fn connector_row(n_nodes: usize) -> String {
-    // Simple downward arrow per node in the row; good enough for linear chains
-    // and narrow forks. Not trying to solve general DAG routing.
-    let mut s = String::new();
-    for i in 0..n_nodes {
-        if i > 0 {
-            s.push_str("      ");
-        }
-        s.push_str("   │    ");
+fn truncate_chars(s: &str, max: usize) -> String {
+    let count = s.chars().count();
+    if count <= max {
+        return s.to_string();
     }
-    s
-}
-
-fn truncate(s: &str, max: usize) -> &str {
-    if s.chars().count() <= max {
-        s
-    } else {
-        let end = s.floor_char_boundary(max);
-        &s[..end]
+    if max == 0 {
+        return String::new();
     }
+    let take = max.saturating_sub(1);
+    let head: String = s.chars().take(take).collect();
+    format!("{head}…")
 }

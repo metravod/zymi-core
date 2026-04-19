@@ -23,7 +23,7 @@ pub enum RunStatus {
 impl RunStatus {
     pub fn glyph(&self) -> &'static str {
         match self {
-            RunStatus::Running => "⏳",
+            RunStatus::Running => "◷",
             RunStatus::Ok => "✓",
             RunStatus::Failed => "✗",
         }

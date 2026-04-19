@@ -92,6 +92,7 @@ async fn run_loop(
 
     let mut reader = EventStream::new();
     let mut refresh_tick = tokio::time::interval(Duration::from_secs(2));
+    let mut fork_tail_tick = tokio::time::interval(Duration::from_millis(500));
     let (fork_tx, mut fork_rx) = mpsc::channel::<ForkResult>(4);
 
     let result = loop {
@@ -129,6 +130,16 @@ async fn run_loop(
             Some(fork_result) = fork_rx.recv() => {
                 if let Err(e) = apply_fork_result(&mut app, fork_result).await {
                     break Err(e);
+                }
+            }
+            _ = fork_tail_tick.tick() => {
+                if matches!(
+                    app.fork_prompt.as_ref().map(|p| &p.state),
+                    Some(ForkState::Running)
+                ) {
+                    if let Err(e) = app.poll_fork_tail().await {
+                        break Err(e);
+                    }
                 }
             }
         }
@@ -289,6 +300,7 @@ async fn apply_fork_result(app: &mut App, result: ForkResult) -> Result<(), Stri
             parent_stream_id,
             fork_at_step,
             state: ForkState::Running,
+            ..
         }) if *parent_stream_id == result.parent_stream_id
             && *fork_at_step == result.fork_at_step
     );

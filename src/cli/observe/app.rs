@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
+
 use crate::config::pipeline::load_pipeline;
 use crate::config::PipelineConfig;
 use crate::events::store::EventStore;
@@ -47,6 +49,13 @@ pub struct ForkPrompt {
     /// Step id at which to fork — the focused graph node.
     pub fork_at_step: String,
     pub state: ForkState,
+    /// When the popup was opened — used to disambiguate the new fork run
+    /// from earlier forks with the same `(parent, step)` key.
+    pub opened_at: DateTime<Utc>,
+    /// Stream id of the forked run, once we locate it in the store.
+    pub tail_stream_id: Option<String>,
+    /// Latest events of the forked run, for live-log rendering.
+    pub tail_events: Vec<Event>,
 }
 
 #[derive(Debug, Clone)]
@@ -121,8 +130,49 @@ impl App {
             parent_stream_id: run.stream_id.clone(),
             fork_at_step: node.id.clone(),
             state: ForkState::Confirm,
+            opened_at: Utc::now(),
+            tail_stream_id: None,
+            tail_events: Vec::new(),
         });
         true
+    }
+
+    /// While the fork-resume popup is in `Running` state, locate the newly
+    /// spawned stream and pull its latest events for the live log. Cheap
+    /// enough to run on a 500ms tick.
+    pub async fn poll_fork_tail(&mut self) -> Result<(), String> {
+        let Some(prompt) = &self.fork_prompt else { return Ok(()) };
+        if !matches!(prompt.state, ForkState::Running) {
+            return Ok(());
+        }
+
+        let stream_id = match &prompt.tail_stream_id {
+            Some(id) => id.clone(),
+            None => {
+                let runs = list_runs(self.store.clone(), None).await?;
+                let parent = prompt.parent_stream_id.clone();
+                let step = prompt.fork_at_step.clone();
+                let opened_at = prompt.opened_at;
+                let found = runs.into_iter().find(|r| {
+                    r.fork
+                        .as_ref()
+                        .is_some_and(|f| f.parent_stream_id == parent && f.fork_at_step == step)
+                        && r.started_at >= opened_at
+                });
+                let Some(run) = found else { return Ok(()) };
+                let id = run.stream_id.clone();
+                if let Some(p) = self.fork_prompt.as_mut() {
+                    p.tail_stream_id = Some(id.clone());
+                }
+                id
+            }
+        };
+
+        let events = load_run_events(self.store.clone(), &stream_id).await?;
+        if let Some(p) = self.fork_prompt.as_mut() {
+            p.tail_events = events;
+        }
+        Ok(())
     }
 
     pub fn clear_fork_prompt(&mut self) {

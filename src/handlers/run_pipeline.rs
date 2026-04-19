@@ -126,11 +126,13 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
         .await;
     }
 
-    println!(
-        "  Execution plan: {} steps, {} levels\n",
-        plan.step_count(),
-        plan.levels.len()
-    );
+    if is_local_cli_run {
+        println!(
+            "  Execution plan: {} steps, {} levels\n",
+            plan.step_count(),
+            plan.levels.len()
+        );
+    }
 
     let mut step_outputs: HashMap<String, String> = HashMap::new();
     let mut all_results: HashMap<String, StepResult> = HashMap::new();
@@ -159,14 +161,16 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
 
     for (level_idx, level) in plan.levels.iter().enumerate() {
         let level_names: Vec<&str> = level.iter().map(|s| s.as_str()).collect();
-        if level.len() == 1 {
-            println!("  Level {}: {}", level_idx + 1, level_names[0]);
-        } else {
-            println!(
-                "  Level {} (parallel): {}",
-                level_idx + 1,
-                level_names.join(", ")
-            );
+        if is_local_cli_run {
+            if level.len() == 1 {
+                println!("  Level {}: {}", level_idx + 1, level_names[0]);
+            } else {
+                println!(
+                    "  Level {} (parallel): {}",
+                    level_idx + 1,
+                    level_names.join(", ")
+                );
+            }
         }
 
         let mut handles = Vec::new();
@@ -174,7 +178,9 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
         for step_id in level {
             if let Some(ctx) = &resume {
                 if ctx.frozen_step_ids.contains(step_id) {
-                    println!("    [{step_id}] frozen (resumed from parent)");
+                    if is_local_cli_run {
+                        println!("    [{step_id}] frozen (resumed from parent)");
+                    }
                     continue;
                 }
             }
@@ -244,12 +250,14 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
                 .await
                 .map_err(|e| format!("step task panicked: {e}"))??;
 
-            println!(
-                "    [{}] {} ({} iterations)",
-                result.step_id,
-                if result.success { "done" } else { "FAILED" },
-                result.iterations
-            );
+            if is_local_cli_run {
+                println!(
+                    "    [{}] {} ({} iterations)",
+                    result.step_id,
+                    if result.success { "done" } else { "FAILED" },
+                    result.iterations
+                );
+            }
 
             if !result.success {
                 overall_success = false;
@@ -259,7 +267,9 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
             all_results.insert(result.step_id.clone(), result);
         }
 
-        println!();
+        if is_local_cli_run {
+            println!();
+        }
     }
 
     let final_output = pipeline

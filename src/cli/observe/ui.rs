@@ -10,6 +10,7 @@ use ratatui::Frame;
 use super::super::event_fmt::{format_event, EventColor};
 use super::super::runs_data::{format_duration, RunStatus, RunSummary};
 use super::app::{App, ForkPrompt, ForkState, Focus};
+use crate::events::Event;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let outer = Layout::default()
@@ -66,10 +67,10 @@ fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
         )
         .highlight_style(
             Style::default()
-                .bg(Color::DarkGray)
+                .bg(Color::Rgb(40, 55, 90))
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol("▶ ");
+        .highlight_symbol("» ");
 
     let mut state = ListState::default();
     if !app.runs.is_empty() {
@@ -154,8 +155,9 @@ fn draw_graph(frame: &mut Frame, app: &App, area: Rect) {
         } else {
             None
         };
-        for raw in graph.render_lines(selected) {
-            lines.push(Line::from(raw));
+        let content_width = area.width.saturating_sub(2) as usize;
+        for line in graph.render_lines(selected, content_width) {
+            lines.push(line);
         }
         lines.push(Line::from(""));
         if let Some(node) = graph.node_at(app.graph_cursor) {
@@ -253,10 +255,10 @@ fn draw_events(frame: &mut Frame, app: &mut App, area: Rect) {
         )
         .highlight_style(
             Style::default()
-                .bg(Color::DarkGray)
+                .bg(Color::Rgb(40, 55, 90))
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol("▶ ");
+        .highlight_symbol("» ");
 
     let mut state = ListState::default();
     if !app.events.is_empty() {
@@ -276,7 +278,12 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_fork_popup(frame: &mut Frame, prompt: &ForkPrompt, screen: Rect) {
-    let area = centered_rect(60, 30, screen);
+    // Running state gets a taller popup to fit the live log.
+    let (pct_x, pct_y) = match &prompt.state {
+        ForkState::Running => (80, 65),
+        _ => (70, 40),
+    };
+    let area = centered_rect(pct_x, pct_y, screen);
     frame.render_widget(Clear, area);
 
     let (title, body, hint, color) = match &prompt.state {
@@ -322,19 +329,47 @@ fn draw_fork_popup(frame: &mut Frame, prompt: &ForkPrompt, screen: Rect) {
             "[Enter] confirm   [Esc] cancel",
             Color::Cyan,
         ),
-        ForkState::Running => (
-            "Fork-resume — running",
-            vec![
+        ForkState::Running => {
+            let mut lines = vec![
                 Line::from(format!("Forking from {}", prompt.fork_at_step)),
-                Line::from(""),
                 Line::from(Span::styled(
                     "Re-executing downstream steps… this may take a while.",
                     Style::default().fg(Color::DarkGray),
                 )),
-            ],
-            "(working)",
-            Color::Yellow,
-        ),
+            ];
+            if prompt.tail_events.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "(waiting for new stream to appear…)",
+                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                )));
+            } else {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "— live log —",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                // Last ~14 events, oldest first.
+                let tail: Vec<&Event> = prompt
+                    .tail_events
+                    .iter()
+                    .rev()
+                    .take(14)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                for ev in tail {
+                    lines.push(fork_log_line(ev));
+                }
+            }
+            (
+                "Fork-resume — running",
+                lines,
+                "(working — Esc to dismiss popup; fork keeps running)",
+                Color::Yellow,
+            )
+        }
         ForkState::Done {
             new_stream_id,
             message,
@@ -379,6 +414,23 @@ fn draw_fork_popup(frame: &mut Frame, prompt: &ForkPrompt, screen: Rect) {
 
     let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
+}
+
+fn fork_log_line(event: &Event) -> Line<'static> {
+    let formatted = format_event(event);
+    let color = color_to_ratatui(formatted.color);
+    let ts = event.timestamp.with_timezone(&Local).format("%H:%M:%S");
+    let detail = truncate(&formatted.short_detail, 80).to_string();
+    Line::from(vec![
+        Span::styled(format!("{} ", formatted.icon), Style::default().fg(color)),
+        Span::styled(format!("{ts} "), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            formatted.label.clone(),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(detail, Style::default().fg(Color::DarkGray)),
+    ])
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
