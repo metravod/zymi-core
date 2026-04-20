@@ -70,7 +70,9 @@ pub fn indent_level(kind: &EventKind) -> u8 {
         | EventKind::ScheduledTaskTriggered { .. }
         | EventKind::ResponseReady { .. }
         | EventKind::WorkflowStarted { .. }
-        | EventKind::WorkflowCompleted { .. } => 0,
+        | EventKind::WorkflowCompleted { .. }
+        | EventKind::McpServerConnected { .. }
+        | EventKind::McpServerDisconnected { .. } => 0,
 
         EventKind::WorkflowNodeStarted { .. }
         | EventKind::WorkflowNodeCompleted { .. }
@@ -402,6 +404,27 @@ pub fn format_event(event: &Event) -> FormattedEvent {
                 indent,
             }
         }
+
+        EventKind::McpServerConnected { server, tool_count } => FormattedEvent {
+            icon: "◆",
+            label: "MCP up".into(),
+            short_detail: format!("{server} ({tool_count} tools)"),
+            full_detail: format!("server: {server}\ntools: {tool_count}"),
+            color: EventColor::Success,
+            indent,
+        },
+        EventKind::McpServerDisconnected { server, reason } => FormattedEvent {
+            icon: "◇",
+            label: "MCP down".into(),
+            short_detail: format!("{server} — {reason}"),
+            full_detail: format!("server: {server}\nreason: {reason}"),
+            color: if reason == "shutdown" {
+                EventColor::Info
+            } else {
+                EventColor::Warning
+            },
+            indent,
+        },
     }
 }
 

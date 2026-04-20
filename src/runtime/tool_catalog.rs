@@ -280,6 +280,14 @@ impl ToolCatalog {
         Some((entry.server.as_str(), entry.tool.as_str()))
     }
 
+    /// Number of MCP tools registered under a given server name.
+    pub fn mcp_tool_count(&self, server: &str) -> usize {
+        self.mcp
+            .values()
+            .filter(|entry| entry.server == server)
+            .count()
+    }
+
     /// Get the [`ToolConfig`] for a declarative tool.
     pub(crate) fn declarative_config(&self, name: &str) -> Option<&ToolConfig> {
         self.declarative.get(name).map(|e| &e.config)

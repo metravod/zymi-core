@@ -30,6 +30,38 @@ pub struct ProjectConfig {
     pub runtime: Option<RuntimeConfig>,
     #[serde(default)]
     pub services: Option<ServicesConfig>,
+    /// MCP servers to spawn at startup (ADR-0023). Each entry produces
+    /// one subprocess whose advertised tools are registered in the
+    /// `ToolCatalog` under `mcp__<name>__<tool>` ids.
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerConfig>,
+}
+
+/// One entry in the top-level `mcp_servers:` list (ADR-0023).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct McpServerConfig {
+    /// Logical server name. Becomes the `<server>` segment of every
+    /// catalog id produced for this server. Must not contain `__`.
+    pub name: String,
+    /// argv for the server subprocess. First element is the program.
+    pub command: Vec<String>,
+    /// Explicit environment variables. Parent env is **not** inherited
+    /// by default (ADR-0023 §security posture).
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// Allow-list of tool names to import. Mutually exclusive with
+    /// `deny`. Omitting both loads zero tools from the server with a
+    /// startup warning (opt-in UX).
+    #[serde(default)]
+    pub allow: Option<Vec<String>>,
+    /// Deny-list of tool names to skip. Mutually exclusive with `allow`.
+    #[serde(default)]
+    pub deny: Option<Vec<String>>,
+    /// If `true`, every tool imported from this server requires human
+    /// approval by default (per-tool overrides still go through the
+    /// policy engine). Defaults to `false`.
+    #[serde(default)]
+    pub requires_approval: Option<bool>,
 }
 
 /// LLM provider configuration.
@@ -456,6 +488,48 @@ runtime:
         assert_eq!(rt.context.soft_cap_chars, 400_000);
         assert_eq!(rt.context.hard_cap_chars, 600_000);
         assert_eq!(rt.context.min_tail_turns, 4);
+    }
+
+    #[test]
+    fn project_with_mcp_servers_parses_full_entry() {
+        let dir = TempDir::new().unwrap();
+        let yaml = r#"
+name: test
+mcp_servers:
+  - name: github
+    command: ["npx", "-y", "@modelcontextprotocol/server-github"]
+    env:
+      GITHUB_PERSONAL_ACCESS_TOKEN: xxx
+    allow: ["create_issue", "add_issue_comment"]
+  - name: postgres
+    command: ["npx", "-y", "@modelcontextprotocol/server-postgres", "postgres://localhost/db"]
+    deny: ["drop_table"]
+    requires_approval: true
+"#;
+        let path = write_file(&dir, "project.yml", yaml);
+        let config = load_project(&path).unwrap();
+        assert_eq!(config.mcp_servers.len(), 2);
+
+        let gh = &config.mcp_servers[0];
+        assert_eq!(gh.name, "github");
+        assert_eq!(gh.command[0], "npx");
+        assert_eq!(gh.env.get("GITHUB_PERSONAL_ACCESS_TOKEN").unwrap(), "xxx");
+        assert_eq!(gh.allow.as_deref().unwrap(), &["create_issue", "add_issue_comment"]);
+        assert!(gh.deny.is_none());
+        assert!(gh.requires_approval.is_none());
+
+        let pg = &config.mcp_servers[1];
+        assert_eq!(pg.name, "postgres");
+        assert_eq!(pg.deny.as_deref().unwrap(), &["drop_table"]);
+        assert_eq!(pg.requires_approval, Some(true));
+    }
+
+    #[test]
+    fn project_without_mcp_servers_is_empty_vec() {
+        let dir = TempDir::new().unwrap();
+        let path = write_file(&dir, "project.yml", "name: test\n");
+        let config = load_project(&path).unwrap();
+        assert!(config.mcp_servers.is_empty());
     }
 
     #[test]

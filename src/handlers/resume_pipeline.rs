@@ -667,6 +667,7 @@ mod tests {
                     shell: ShellConfig::default(),
                     context: Default::default(),
                 }),
+                mcp_servers: Vec::new(),
             },
             agents,
             pipelines,
