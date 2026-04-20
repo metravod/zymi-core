@@ -14,7 +14,7 @@ pub use agent::AgentConfig;
 pub use error::ConfigError;
 pub use dag::{build_execution_plan, ExecutionPlan};
 pub use pipeline::{PipelineConfig, PipelineInput, PipelineOutput, PipelineStep};
-pub use project::{ContractsConfig, ContextWindowConfig, DefaultsConfig, LangfuseConfig, LlmConfig, McpServerConfig, ProjectConfig, RuntimeConfig, ServicesConfig, ShellConfig};
+pub use project::{ContractsConfig, ContextWindowConfig, DefaultsConfig, LangfuseConfig, LlmConfig, McpRestartConfig, McpServerConfig, ProjectConfig, RuntimeConfig, ServicesConfig, ShellConfig};
 pub use tool::{ToolConfig, ImplementationConfig, HttpMethod};
 
 /// A fully loaded and validated workspace.

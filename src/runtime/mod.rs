@@ -281,9 +281,30 @@ impl RuntimeBuilder {
             return self.build_inner(McpStartState::default());
         }
 
-        let mcp_state = spawn_mcp_servers(&mcp_specs).await?;
-        // Build runtime with MCP tools registered.
-        let runtime = self.build_inner(mcp_state)?;
+        // We need the bus early so `spawn_mcp_servers` can wire it into the
+        // registry (restart/crash events must be publishable mid-call). If
+        // the caller didn't inject one, mirror `build_inner`'s default: reuse
+        // the injected store or open the SQLite default.
+        let bus_for_mcp = self.resolve_bus_for_startup()?;
+
+        let outcome = spawn_mcp_servers(&mcp_specs, Arc::clone(&bus_for_mcp)).await?;
+
+        // Publish per-server startup failures before proceeding. The runtime
+        // keeps building with whatever servers did connect — partial MCP
+        // failure is not a startup error (ADR-0023 §Lifecycle).
+        for failure in &outcome.failures {
+            publish_system_event(
+                &bus_for_mcp,
+                EventKind::McpServerDisconnected {
+                    server: failure.name.clone(),
+                    reason: failure.reason.clone(),
+                },
+            )
+            .await;
+        }
+
+        let self_with_bus = self.with_event_bus(Arc::clone(&bus_for_mcp));
+        let runtime = self_with_bus.build_inner(outcome.state)?;
 
         // Publish one McpServerConnected per live server so the TUI / `zymi
         // runs` surface observes the startup lifecycle (ADR-0023).
@@ -302,6 +323,36 @@ impl RuntimeBuilder {
         }
 
         Ok(runtime)
+    }
+
+    /// Resolve the event bus `build_inner` will end up using, so that
+    /// [`spawn_mcp_servers`] can share it. If the caller injected both a bus
+    /// and a store, reuse them. If the caller injected only a store, build
+    /// the bus over it. Otherwise open the default SQLite store and bus —
+    /// matching the untouched happy path in `build_inner`.
+    fn resolve_bus_for_startup(&self) -> Result<Arc<EventBus>, String> {
+        if let Some(bus) = self.bus.as_ref() {
+            return Ok(Arc::clone(bus));
+        }
+        let store: Arc<dyn EventStore> = match self.store.as_ref() {
+            Some(s) => Arc::clone(s),
+            None => {
+                let store_dir = self.project_root.join(".zymi");
+                std::fs::create_dir_all(&store_dir)
+                    .map_err(|e| format!("failed to create .zymi directory: {e}"))?;
+                let db_path = store_dir.join("events.db");
+                open_store(StoreBackend::Sqlite { path: db_path })
+                    .map_err(|e| format!("failed to open event store: {e}"))?
+            }
+        };
+        Ok(Arc::new(EventBus::new(store)))
+    }
+
+    fn with_event_bus(mut self, bus: Arc<EventBus>) -> Self {
+        // Keep any already-injected store; only pin the bus so `build_inner`
+        // doesn't open a second one.
+        self.bus = Some(bus);
+        self
     }
 
     fn build_inner(self, mcp_state: McpStartState) -> Result<Runtime, String> {
@@ -430,21 +481,44 @@ struct McpStartState {
     tools_by_server: HashMap<String, (Vec<McpTool>, bool)>,
 }
 
-/// MCP handshake timeouts. Kept local to the runtime for now — later slices
-/// may lift these into the `mcp_servers:` config.
-const MCP_INIT_TIMEOUT: Duration = Duration::from_secs(10);
-const MCP_CALL_TIMEOUT: Duration = Duration::from_secs(60);
+/// MCP shutdown grace. Kept local to the runtime: per-server handshake and
+/// call timeouts live in [`crate::config::McpServerConfig`] (Slice 5).
 const MCP_SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
+
+/// Outcome of `spawn_mcp_servers` — the live registry plus a list of
+/// per-server startup failures. Failures are surfaced as
+/// [`EventKind::McpServerDisconnected`] by the caller so the TUI /
+/// `zymi runs` can show them.
+#[derive(Debug, Default)]
+struct SpawnOutcome {
+    state: McpStartState,
+    failures: Vec<FailedServer>,
+}
+
+#[derive(Debug, Clone)]
+struct FailedServer {
+    name: String,
+    reason: String,
+}
 
 /// Spawn every MCP server in `specs`, perform the `initialize` handshake,
 /// enumerate tools, and apply the `allow:` / `deny:` filter. Returns the
 /// live registry plus the filtered tool lists for catalog registration.
 ///
-/// A server that fails to spawn is a hard error — the project declared it,
-/// so the runtime's startup contract is that every declared integration is
-/// either wired or the process refuses to start. Best-effort error
-/// surfaces (TUI events on partial connect) land in a later slice.
-async fn spawn_mcp_servers(specs: &[McpServerConfig]) -> Result<McpStartState, String> {
+/// **Best-effort (Slice 5):** a subprocess that fails to spawn or fails its
+/// handshake no longer aborts startup — the registry proceeds with the
+/// servers that did connect, and the caller publishes
+/// [`EventKind::McpServerDisconnected`] with a machine-readable `reason`
+/// prefix (`spawn_failed`, `init_timeout`, `init_failed`,
+/// `tools_list_failed`).
+///
+/// Config-shape errors (duplicate names, `allow` AND `deny`, `__` in names,
+/// empty command) remain hard errors — they're programmer errors, not
+/// runtime failures.
+async fn spawn_mcp_servers(
+    specs: &[McpServerConfig],
+    bus: Arc<EventBus>,
+) -> Result<SpawnOutcome, String> {
     // Pre-flight validation — all config-shape errors surface before we
     // spawn any subprocess, so a later duplicate-name doesn't get masked
     // by an earlier subprocess's unrelated spawn failure.
@@ -466,8 +540,9 @@ async fn spawn_mcp_servers(specs: &[McpServerConfig]) -> Result<McpStartState, S
         }
     }
 
-    let mut registry = McpRegistry::new();
+    let mut registry = McpRegistry::new().with_bus(bus);
     let mut tools_by_server: HashMap<String, (Vec<McpTool>, bool)> = HashMap::new();
+    let mut failures: Vec<FailedServer> = Vec::new();
 
     for cfg in specs {
         let spec = McpServerSpec {
@@ -475,15 +550,35 @@ async fn spawn_mcp_servers(specs: &[McpServerConfig]) -> Result<McpStartState, S
             command: cfg.command.clone(),
             env: cfg.env.clone(),
         };
+        let init_timeout = Duration::from_secs(cfg.effective_init_timeout_secs());
+        let call_timeout = Duration::from_secs(cfg.effective_call_timeout_secs());
 
-        let conn = McpServerConnection::connect(spec, MCP_INIT_TIMEOUT, MCP_CALL_TIMEOUT)
+        let conn = match McpServerConnection::connect(spec.clone(), init_timeout, call_timeout)
             .await
-            .map_err(|e| format!("mcp server '{}' init failed: {e}", cfg.name))?;
+        {
+            Ok(c) => c,
+            Err(err) => {
+                failures.push(FailedServer {
+                    name: cfg.name.clone(),
+                    reason: classify_startup_error(&err),
+                });
+                continue;
+            }
+        };
 
-        let advertised = conn
-            .list_tools()
-            .await
-            .map_err(|e| format!("mcp server '{}' tools/list failed: {e}", cfg.name))?;
+        let advertised = match conn.list_tools().await {
+            Ok(t) => t,
+            Err(err) => {
+                // The subprocess is alive but not usable; tear it down before
+                // moving on so we don't leak a zombie.
+                conn.shutdown(MCP_SHUTDOWN_GRACE).await;
+                failures.push(FailedServer {
+                    name: cfg.name.clone(),
+                    reason: format!("tools_list_failed: {err}"),
+                });
+                continue;
+            }
+        };
 
         // Per ADR-0023 §security posture: opt-in UX. When a server
         // advertises tools but neither `allow:` nor `deny:` was specified,
@@ -501,16 +596,52 @@ async fn spawn_mcp_servers(specs: &[McpServerConfig]) -> Result<McpStartState, S
         let filtered =
             filter_mcp_tools(&cfg.name, cfg.allow.as_deref(), cfg.deny.as_deref(), advertised);
 
-        registry.insert(cfg.name.clone(), Arc::new(conn));
+        let conn = Arc::new(conn);
+        match build_restart_policy(cfg, &spec, init_timeout, call_timeout) {
+            Some(policy) => registry.insert_with_restart(cfg.name.clone(), conn, policy),
+            None => registry.insert(cfg.name.clone(), conn),
+        }
+
         tools_by_server.insert(
             cfg.name.clone(),
             (filtered, cfg.requires_approval.unwrap_or(false)),
         );
     }
 
-    Ok(McpStartState {
+    let state = McpStartState {
         registry: Some(Arc::new(registry)),
         tools_by_server,
+    };
+    Ok(SpawnOutcome { state, failures })
+}
+
+fn classify_startup_error(err: &crate::mcp::McpError) -> String {
+    use crate::mcp::McpError;
+    match err {
+        McpError::Spawn(e) => format!("spawn_failed: {e}"),
+        McpError::Transport(crate::mcp::TransportError::Timeout) => "init_timeout".into(),
+        McpError::Config(msg) => format!("init_failed: {msg}"),
+        other => format!("init_failed: {other}"),
+    }
+}
+
+fn build_restart_policy(
+    cfg: &McpServerConfig,
+    spec: &McpServerSpec,
+    init_timeout: Duration,
+    call_timeout: Duration,
+) -> Option<crate::mcp::RestartPolicy> {
+    let restart_cfg = cfg.restart.as_ref()?;
+    let max = restart_cfg.effective_max_restarts();
+    if max == 0 {
+        return None;
+    }
+    Some(crate::mcp::RestartPolicy {
+        spec: spec.clone(),
+        init_timeout,
+        call_timeout,
+        max_restarts: max,
+        backoff_secs: restart_cfg.backoff_secs.clone().unwrap_or_else(|| vec![1]),
     })
 }
 
@@ -619,45 +750,178 @@ mod mcp_tests {
         assert_eq!(got[0].name, "present");
     }
 
+    fn make_cfg(name: &str, command: Vec<String>) -> McpServerConfig {
+        McpServerConfig {
+            name: name.into(),
+            command,
+            env: HashMap::new(),
+            allow: None,
+            deny: None,
+            requires_approval: None,
+            init_timeout_secs: Some(1),
+            call_timeout_secs: Some(1),
+            restart: None,
+        }
+    }
+
+    fn test_bus() -> Arc<EventBus> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mcp_test.db");
+        // Leak the tempdir — the file is only opened once per test and
+        // teardown on process exit is fine.
+        Box::leak(Box::new(dir));
+        let store = open_store(StoreBackend::Sqlite { path }).expect("open store");
+        Arc::new(EventBus::new(store))
+    }
+
     #[tokio::test]
     async fn spawn_rejects_allow_and_deny_together() {
-        let cfg = McpServerConfig {
-            name: "x".into(),
-            command: vec!["true".into()],
-            env: HashMap::new(),
-            allow: Some(vec!["a".into()]),
-            deny: Some(vec!["b".into()]),
-            requires_approval: None,
-        };
-        let err = spawn_mcp_servers(&[cfg]).await.unwrap_err();
+        let mut cfg = make_cfg("x", vec!["true".into()]);
+        cfg.allow = Some(vec!["a".into()]);
+        cfg.deny = Some(vec!["b".into()]);
+        let err = spawn_mcp_servers(&[cfg], test_bus()).await.unwrap_err();
         assert!(err.contains("mutually exclusive"), "got: {err}");
     }
 
     #[tokio::test]
     async fn spawn_rejects_duplicate_server_names() {
-        let make = |name: &str| McpServerConfig {
-            name: name.into(),
-            command: vec!["true".into()],
-            env: HashMap::new(),
-            allow: None,
-            deny: None,
-            requires_approval: None,
-        };
-        let err = spawn_mcp_servers(&[make("gh"), make("gh")]).await.unwrap_err();
+        let cfgs = vec![
+            make_cfg("gh", vec!["true".into()]),
+            make_cfg("gh", vec!["true".into()]),
+        ];
+        let err = spawn_mcp_servers(&cfgs, test_bus()).await.unwrap_err();
         assert!(err.contains("duplicate"), "got: {err}");
     }
 
     #[tokio::test]
     async fn spawn_rejects_double_underscore_in_server_name() {
-        let cfg = McpServerConfig {
-            name: "evil__name".into(),
+        let cfg = make_cfg("evil__name", vec!["true".into()]);
+        let err = spawn_mcp_servers(&[cfg], test_bus()).await.unwrap_err();
+        assert!(err.contains("__"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn spawn_collects_nonexistent_binary_as_failure_not_error() {
+        // Slice 5: per-server spawn failures no longer abort startup — they
+        // go into the `failures` list so the caller can publish
+        // McpServerDisconnected events and keep running.
+        let cfg = make_cfg(
+            "ghost",
+            vec!["/definitely/does/not/exist/zymi-mcp-test".into()],
+        );
+        let outcome = spawn_mcp_servers(&[cfg], test_bus()).await.unwrap();
+        assert_eq!(outcome.failures.len(), 1);
+        assert_eq!(outcome.failures[0].name, "ghost");
+        assert!(
+            outcome.failures[0].reason.starts_with("spawn_failed:"),
+            "reason should prefix 'spawn_failed:', got {}",
+            outcome.failures[0].reason
+        );
+        // The registry is still created — just with zero servers.
+        let registry = outcome.state.registry.expect("registry populated");
+        assert_eq!(registry.server_names().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn spawn_classifies_init_timeout() {
+        // `cat` is alive and speaks stdio, but never answers `initialize`,
+        // so the handshake times out. We classify that as `init_timeout`,
+        // not `init_failed` — observability distinguishes "server is up but
+        // broken" from "server returned a structured error".
+        if std::process::Command::new("cat")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return; // skip on platforms without cat
+        }
+        let cfg = make_cfg("silent", vec!["cat".into()]);
+        let outcome = spawn_mcp_servers(&[cfg], test_bus()).await.unwrap();
+        assert_eq!(outcome.failures.len(), 1);
+        assert_eq!(outcome.failures[0].reason, "init_timeout");
+    }
+
+    #[test]
+    fn classify_spawn_failed() {
+        use std::io;
+        let err = crate::mcp::McpError::Spawn(io::Error::new(io::ErrorKind::NotFound, "no such"));
+        let reason = classify_startup_error(&err);
+        assert!(reason.starts_with("spawn_failed:"), "got: {reason}");
+    }
+
+    #[test]
+    fn classify_transport_timeout() {
+        let err = crate::mcp::McpError::Transport(crate::mcp::TransportError::Timeout);
+        assert_eq!(classify_startup_error(&err), "init_timeout");
+    }
+
+    #[test]
+    fn classify_other_init_errors() {
+        let err = crate::mcp::McpError::Config("bad shape".into());
+        let reason = classify_startup_error(&err);
+        assert!(reason.starts_with("init_failed:"), "got: {reason}");
+    }
+
+    #[test]
+    fn build_restart_policy_none_when_no_restart_cfg() {
+        let cfg = make_cfg("x", vec!["true".into()]);
+        let spec = McpServerSpec {
+            name: "x".into(),
             command: vec!["true".into()],
             env: HashMap::new(),
-            allow: None,
-            deny: None,
-            requires_approval: None,
         };
-        let err = spawn_mcp_servers(&[cfg]).await.unwrap_err();
-        assert!(err.contains("__"), "got: {err}");
+        let policy = build_restart_policy(
+            &cfg,
+            &spec,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        assert!(policy.is_none());
+    }
+
+    #[test]
+    fn build_restart_policy_none_when_max_restarts_zero() {
+        let mut cfg = make_cfg("x", vec!["true".into()]);
+        cfg.restart = Some(crate::config::McpRestartConfig {
+            max_restarts: Some(0),
+            backoff_secs: Some(vec![1]),
+        });
+        let spec = McpServerSpec {
+            name: "x".into(),
+            command: vec!["true".into()],
+            env: HashMap::new(),
+        };
+        let policy = build_restart_policy(
+            &cfg,
+            &spec,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        assert!(policy.is_none(), "max_restarts=0 disables restart entirely");
+    }
+
+    #[test]
+    fn build_restart_policy_carries_fields() {
+        let mut cfg = make_cfg("x", vec!["true".into()]);
+        cfg.restart = Some(crate::config::McpRestartConfig {
+            max_restarts: Some(3),
+            backoff_secs: Some(vec![2, 4, 8]),
+        });
+        let spec = McpServerSpec {
+            name: "x".into(),
+            command: vec!["true".into()],
+            env: HashMap::new(),
+        };
+        let policy = build_restart_policy(
+            &cfg,
+            &spec,
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        )
+        .expect("policy built");
+        assert_eq!(policy.max_restarts, 3);
+        assert_eq!(policy.backoff_secs, vec![2, 4, 8]);
+        assert_eq!(policy.init_timeout, Duration::from_secs(5));
+        assert_eq!(policy.call_timeout, Duration::from_secs(30));
     }
 }

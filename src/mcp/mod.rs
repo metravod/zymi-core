@@ -9,5 +9,5 @@ pub mod registry;
 pub mod transport;
 
 pub use connection::{McpCallResult, McpError, McpServerConnection, McpServerSpec, McpTool};
-pub use registry::{make_id, parse_id, validate_segment, McpRegistry, MCP_PREFIX};
+pub use registry::{make_id, parse_id, validate_segment, McpRegistry, RestartPolicy, MCP_PREFIX};
 pub use transport::{Transport, TransportError};
