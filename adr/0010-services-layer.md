@@ -2,6 +2,8 @@
 
 Date: 2026-04-05
 
+Status: Revised by ADR 0020. The `EventService` trait and `ServiceRunner` shape described below are kept, but the hardcoded `if let Some(langfuse_config)` dispatch in `start_configured_services` is replaced by a typed plugin registry driven by `services:` YAML entries. Langfuse moves behind a `service-langfuse` feature flag; the services layer is wired into runtime startup (it was unreachable in the original design). Use this document for trait-shape rationale; consult ADR 0020 for the registry model and ADR 0022 for the interaction with approvals.
+
 ## Context
 
 zymi-core is an event-sourced agent engine. All state changes flow through the EventBus as events. External integrations (observability, notifications, analytics) need to react to these events without coupling to the core processing pipeline.

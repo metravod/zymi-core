@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use crate::config::tool::{ImplementationConfig, ToolConfig};
 use crate::config::validate::ToolNameResolver;
 use crate::esaa::Intention;
+use crate::mcp::{self, McpTool};
 use crate::types::ToolDefinition;
 
 /// Entry for a single built-in tool.
@@ -45,12 +46,22 @@ pub(crate) struct DeclarativeEntry {
     pub(crate) config: ToolConfig,
 }
 
+/// Entry for an MCP-backed tool. Keyed by the full `mcp__server__tool` id.
+#[derive(Debug, Clone)]
+pub(crate) struct McpEntry {
+    pub(crate) definition: ToolDefinition,
+    pub(crate) server: String,
+    pub(crate) tool: String,
+    pub(crate) requires_approval: bool,
+}
+
 /// The tool catalog. Constructed once per [`super::Runtime`] and shared by
 /// the config validator, the pipeline handler, and the action executor.
 #[derive(Debug)]
 pub struct ToolCatalog {
     builtin: HashMap<String, BuiltinEntry>,
     declarative: HashMap<String, DeclarativeEntry>,
+    mcp: HashMap<String, McpEntry>,
     // Future: programmatic: HashMap<String, Arc<dyn ProgrammaticTool>>,
 }
 
@@ -160,6 +171,7 @@ impl ToolCatalog {
         Self {
             builtin,
             declarative: HashMap::new(),
+            mcp: HashMap::new(),
         }
     }
 
@@ -196,14 +208,76 @@ impl ToolCatalog {
         Ok(catalog)
     }
 
+    /// Register a batch of MCP tools advertised by `server` (typically the
+    /// result of [`crate::mcp::McpServerConnection::list_tools`] after applying
+    /// allow/deny filters one layer up).
+    ///
+    /// Each tool is registered under the catalog id `mcp__<server>__<tool>`.
+    /// Returns an error if the server name or any tool name contains the
+    /// reserved `__` separator, or if a generated id collides with an
+    /// existing entry. `requires_approval` becomes the default for every
+    /// tool from this server (per-server policy lives one layer up).
+    pub fn add_mcp_server(
+        &mut self,
+        server: &str,
+        tools: &[McpTool],
+        requires_approval: bool,
+    ) -> Result<(), String> {
+        mcp::validate_segment(server).map_err(|e| format!("mcp server name: {e}"))?;
+        for tool in tools {
+            mcp::validate_segment(&tool.name)
+                .map_err(|e| format!("mcp tool '{}': {e}", tool.name))?;
+            let id = mcp::make_id(server, &tool.name);
+            if self.builtin.contains_key(&id)
+                || self.declarative.contains_key(&id)
+                || self.mcp.contains_key(&id)
+            {
+                return Err(format!("mcp tool id '{id}' collides with existing entry"));
+            }
+            let definition = ToolDefinition {
+                name: id.clone(),
+                description: tool.description.clone().unwrap_or_default(),
+                parameters: if tool.input_schema.is_null() {
+                    serde_json::json!({"type": "object", "properties": {}})
+                } else {
+                    tool.input_schema.clone()
+                },
+            };
+            self.mcp.insert(
+                id,
+                McpEntry {
+                    definition,
+                    server: server.to_string(),
+                    tool: tool.name.clone(),
+                    requires_approval,
+                },
+            );
+        }
+        Ok(())
+    }
+
     /// Is this tool name registered in the catalog?
     pub fn knows(&self, name: &str) -> bool {
-        self.builtin.contains_key(name) || self.declarative.contains_key(name)
+        self.builtin.contains_key(name)
+            || self.declarative.contains_key(name)
+            || self.mcp.contains_key(name)
     }
 
     /// Is this a declarative (YAML-defined) tool?
     pub fn is_declarative(&self, name: &str) -> bool {
         self.declarative.contains_key(name)
+    }
+
+    /// Is this an MCP-backed tool?
+    pub fn is_mcp(&self, name: &str) -> bool {
+        self.mcp.contains_key(name)
+    }
+
+    /// Resolve an MCP catalog id back to `(server, tool)` for executor
+    /// dispatch.
+    pub fn mcp_route(&self, name: &str) -> Option<(&str, &str)> {
+        let entry = self.mcp.get(name)?;
+        Some((entry.server.as_str(), entry.tool.as_str()))
     }
 
     /// Get the [`ToolConfig`] for a declarative tool.
@@ -217,6 +291,7 @@ impl ToolCatalog {
             .get(name)
             .map(|e| &e.definition)
             .or_else(|| self.declarative.get(name).map(|e| &e.definition))
+            .or_else(|| self.mcp.get(name).map(|e| &e.definition))
     }
 
     /// Build the tool definition list for an agent's declared tool names.
@@ -271,6 +346,9 @@ impl ToolCatalog {
         if let Some(entry) = self.declarative.get(name) {
             return entry.config.effective_requires_approval();
         }
+        if let Some(entry) = self.mcp.get(name) {
+            return entry.requires_approval;
+        }
         false
     }
 
@@ -278,6 +356,7 @@ impl ToolCatalog {
     pub fn all_tool_names(&self) -> Vec<&str> {
         let mut names: Vec<&str> = self.builtin.keys().map(|s| s.as_str()).collect();
         names.extend(self.declarative.keys().map(|s| s.as_str()));
+        names.extend(self.mcp.keys().map(|s| s.as_str()));
         names.sort_unstable();
         names
     }
@@ -546,5 +625,116 @@ mod tests {
 
         let intention = catalog.intention("api", r#"{"key":"val"}"#);
         assert_eq!(intention.tag(), "call_custom_tool");
+    }
+
+    fn mcp_tool(name: &str) -> McpTool {
+        McpTool {
+            name: name.into(),
+            description: Some(format!("desc for {name}")),
+            input_schema: serde_json::json!({"type": "object", "properties": {}}),
+        }
+    }
+
+    #[test]
+    fn mcp_server_tools_register_with_namespaced_id() {
+        let mut catalog = ToolCatalog::builtin_only();
+        catalog
+            .add_mcp_server("github", &[mcp_tool("create_issue"), mcp_tool("list_repos")], false)
+            .unwrap();
+
+        assert!(catalog.knows("mcp__github__create_issue"));
+        assert!(catalog.knows("mcp__github__list_repos"));
+        assert!(catalog.is_mcp("mcp__github__create_issue"));
+        assert!(!catalog.is_declarative("mcp__github__create_issue"));
+
+        let def = catalog.definition("mcp__github__create_issue").unwrap();
+        assert_eq!(def.name, "mcp__github__create_issue");
+        assert_eq!(def.description, "desc for create_issue");
+    }
+
+    #[test]
+    fn mcp_route_returns_server_and_original_tool_name() {
+        let mut catalog = ToolCatalog::builtin_only();
+        catalog
+            .add_mcp_server("postgres", &[mcp_tool("query")], false)
+            .unwrap();
+
+        let (server, tool) = catalog.mcp_route("mcp__postgres__query").unwrap();
+        assert_eq!(server, "postgres");
+        assert_eq!(tool, "query");
+        assert!(catalog.mcp_route("write_file").is_none());
+    }
+
+    #[test]
+    fn mcp_definitions_for_agent_include_full_id() {
+        let mut catalog = ToolCatalog::builtin_only();
+        catalog.add_mcp_server("gh", &[mcp_tool("issue")], false).unwrap();
+
+        let defs = catalog.definitions_for_agent(&["mcp__gh__issue".into()]);
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].name, "mcp__gh__issue");
+    }
+
+    #[test]
+    fn mcp_intention_routes_through_call_custom_with_full_id() {
+        let mut catalog = ToolCatalog::builtin_only();
+        catalog.add_mcp_server("gh", &[mcp_tool("issue")], false).unwrap();
+
+        let intention = catalog.intention("mcp__gh__issue", r#"{"title":"x"}"#);
+        match intention {
+            Intention::CallCustomTool { tool_name, arguments } => {
+                assert_eq!(tool_name, "mcp__gh__issue");
+                assert_eq!(arguments, r#"{"title":"x"}"#);
+            }
+            other => panic!("expected CallCustomTool, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_requires_approval_uses_per_server_default() {
+        let mut catalog = ToolCatalog::builtin_only();
+        catalog.add_mcp_server("safe", &[mcp_tool("read")], false).unwrap();
+        catalog.add_mcp_server("risky", &[mcp_tool("write")], true).unwrap();
+
+        assert!(!catalog.requires_approval("mcp__safe__read"));
+        assert!(catalog.requires_approval("mcp__risky__write"));
+    }
+
+    #[test]
+    fn mcp_double_underscore_in_segment_rejected() {
+        let mut catalog = ToolCatalog::builtin_only();
+        let err = catalog
+            .add_mcp_server("evil__server", &[mcp_tool("ok")], false)
+            .unwrap_err();
+        assert!(err.contains("__"), "got: {err}");
+
+        let err = catalog
+            .add_mcp_server("ok", &[mcp_tool("nested__name")], false)
+            .unwrap_err();
+        assert!(err.contains("__"), "got: {err}");
+    }
+
+    #[test]
+    fn mcp_id_collision_is_rejected() {
+        let mut catalog = ToolCatalog::builtin_only();
+        catalog.add_mcp_server("gh", &[mcp_tool("issue")], false).unwrap();
+        let err = catalog
+            .add_mcp_server("gh", &[mcp_tool("issue")], false)
+            .unwrap_err();
+        assert!(err.contains("collides"), "got: {err}");
+    }
+
+    #[test]
+    fn mcp_tools_with_null_input_schema_get_default_object_schema() {
+        let mut catalog = ToolCatalog::builtin_only();
+        let tool = McpTool {
+            name: "ping".into(),
+            description: None,
+            input_schema: serde_json::Value::Null,
+        };
+        catalog.add_mcp_server("svc", &[tool], false).unwrap();
+
+        let def = catalog.definition("mcp__svc__ping").unwrap();
+        assert_eq!(def.parameters["type"], "object");
     }
 }
