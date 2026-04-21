@@ -9,6 +9,8 @@
 <p align="center">
   <a href="https://pypi.org/project/zymi-core/"><img src="https://img.shields.io/pypi/v/zymi-core.svg?logo=pypi&logoColor=white" alt="PyPI" /></a>
   &nbsp;
+  <a href="https://pypi.org/project/zymi-core/"><img src="https://img.shields.io/pypi/dm/zymi-core.svg" alt="PyPI downloads/month" /></a>
+  &nbsp;
   <a href="https://github.com/metravod/zymi-core/actions/workflows/ci.yml"><img src="https://github.com/metravod/zymi-core/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI" /></a>
   &nbsp;
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT" /></a>
