@@ -23,6 +23,7 @@ use tokio::time::timeout;
 const JSONRPC_VERSION: &str = "2.0";
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum TransportError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),

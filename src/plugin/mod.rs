@@ -7,4 +7,7 @@
 //! The external-process plugin protocol (ADR-0021) is the next planned
 //! consumer.
 
+pub mod registry;
 pub mod transport;
+
+pub use registry::{PluginBuildError, PluginBuilder, PluginRegistry};

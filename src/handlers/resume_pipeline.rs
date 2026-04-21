@@ -656,6 +656,7 @@ mod tests {
         WorkspaceConfig {
             project: ProjectConfig {
                 name: "t".into(),
+                schema_version: None,
                 version: None,
                 variables: HashMap::new(),
                 llm: None,

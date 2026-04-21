@@ -9,6 +9,7 @@ use super::sqlite::SqliteEventStore;
 /// Backend selector for [`open_store`]. Add a new variant when introducing
 /// another EventStore implementation (libSQL, Postgres, ...).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum StoreBackend {
     Sqlite { path: PathBuf },
 }
