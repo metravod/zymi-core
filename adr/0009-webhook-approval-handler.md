@@ -2,6 +2,8 @@
 
 Date: 2026-04-05
 
+Status: Superseded by ADR 0022. The `WebhookApprovalHandler` struct and HTTP routes described below remain, but are reframed as the `type: http` channel under the event-sourced approval registry. The in-memory `pending: HashMap` source of truth is replaced by event-store replay; `GET /approvals` now queries the store. This document is retained for historical context.
+
 ## Context
 
 The ESAA orchestrator supports human approval via the `ApprovalHandler` trait. For automated pipelines (CI, Slack bots, admin dashboards), approvals need an HTTP interface rather than interactive terminal prompts.

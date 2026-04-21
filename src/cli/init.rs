@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-const KNOWN_EXAMPLES: &[&str] = &["research"];
+const KNOWN_EXAMPLES: &[&str] = &["research", "mcp"];
 
 /// Declarative web_search tool template shipped with `zymi init`.
 ///
@@ -164,6 +164,7 @@ pub fn exec(name: Option<String>, example: Option<&str>) -> Result<(), String> {
 
     match example {
         Some("research") => scaffold_research(&cwd, &project_name)?,
+        Some("mcp") => scaffold_mcp(&cwd, &project_name)?,
         _ => scaffold_default(&cwd, &project_name)?,
     }
 
@@ -412,6 +413,147 @@ output:
     println!("Next:");
     println!("  1. Configure your LLM provider in project.yml");
     println!("  2. Run: zymi run research");
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// MCP example scaffold
+// ---------------------------------------------------------------------------
+
+fn scaffold_mcp(root: &Path, project_name: &str) -> Result<(), String> {
+    create_dir(root, "sandbox")?;
+
+    write_file(
+        &root.join("project.yml"),
+        &format!(
+            r#"name: {project_name}
+version: "0.1"
+
+# The whole point of this example: one `mcp_servers:` entry = N tools from an
+# off-the-shelf MCP server, no per-tool YAML schemas to write. See
+# https://modelcontextprotocol.io for the protocol and a server catalogue.
+
+llm:
+  provider: openai
+  model: gpt-4o-mini
+  api_key: ${{env.OPENAI_API_KEY}}
+
+mcp_servers:
+  - name: fs
+    command:
+      - npx
+      - "-y"
+      - "@modelcontextprotocol/server-filesystem"
+      - ./sandbox
+    # `PATH` is auto-forwarded so `npx` resolves. Every other variable the
+    # parent process has (OPENAI_API_KEY, credentials, …) stays out of the
+    # child unless you name it here — ADR-0023 §security posture.
+    # The server advertises 14 tools. Narrow to what this demo actually
+    # uses — everything else stays unreachable to the agent.
+    allow:
+      - read_text_file
+      - write_file
+      - list_directory
+      - search_files
+    init_timeout_secs: 15
+    call_timeout_secs: 30
+    restart:
+      max_restarts: 2
+      backoff_secs: [1, 5]
+
+defaults:
+  timeout_secs: 60
+  max_iterations: 10
+
+policy:
+  enabled: true
+  # No shell access in this example — the agent only talks to the MCP server.
+  allow: []
+  deny: ["*"]
+
+contracts:
+  file_write:
+    allowed_dirs: ["./sandbox", "./output"]
+    deny_patterns: ["*.env", "*.key"]
+"#
+        ),
+    )?;
+
+    write_file(
+        &root.join("agents/default.yml"),
+        r#"name: default
+description: "Agent that reads/writes files via the MCP filesystem server."
+system_prompt: |
+  You are a filesystem assistant operating inside a sandboxed directory.
+
+  All file operations go through the MCP filesystem server, exposed as tools
+  prefixed with `mcp__fs__`. Paths are resolved relative to the server's
+  configured root, so `./notes.md` and `notes.md` both mean the same file
+  inside the sandbox.
+
+  Workflow:
+  1. Use `mcp__fs__list_directory` to see what is already there.
+  2. Use `mcp__fs__read_text_file` to read existing files before overwriting.
+  3. Use `mcp__fs__write_file` to produce your output.
+
+  Be concise. Do the work, then stop — do not narrate every step.
+tools:
+  - mcp__fs__list_directory
+  - mcp__fs__read_text_file
+  - mcp__fs__write_file
+  - mcp__fs__search_files
+max_iterations: 8
+"#,
+    )?;
+
+    write_file(
+        &root.join("pipelines/main.yml"),
+        r#"name: main
+description: "Single-step demo: agent uses MCP filesystem tools to fulfil a task."
+
+steps:
+  - id: do_it
+    agent: default
+    task: "${inputs.task}"
+
+input:
+  type: text
+
+output:
+  step: do_it
+"#,
+    )?;
+
+    write_file(
+        &root.join("sandbox/README.md"),
+        r#"This directory is the sandbox the MCP filesystem server has access to.
+
+Everything the agent reads and writes lives here. Feel free to drop files in
+before running the demo — the agent can list, read, search, and overwrite
+them.
+"#,
+    )?;
+
+    println!("Initialized zymi project '{project_name}' with MCP example");
+    println!();
+    println!("  project.yml              — one `mcp_servers:` entry pulls the filesystem server");
+    println!("  agents/default.yml       — agent wired to `mcp__fs__*` tools");
+    println!("  pipelines/main.yml       — single-step demo pipeline");
+    println!("  sandbox/                  — the only dir the MCP server can touch");
+    println!("  .zymi/                   — runtime data (events.db)");
+    println!();
+    println!("Prerequisites:");
+    println!("  - `node` + `npx` on PATH (`npx -y @modelcontextprotocol/server-filesystem` on first run");
+    println!("     may prompt to download the package)");
+    println!("  - `OPENAI_API_KEY` exported, or swap the provider in project.yml");
+    println!();
+    println!("Next:");
+    println!("  1. export OPENAI_API_KEY=sk-...");
+    println!("  2. zymi run main -i task=\"List everything in the sandbox, then write notes.md summarising it.\"");
+    println!();
+    println!("Tip: before wiring any new MCP server into project.yml, probe it:");
+    println!("  zymi mcp probe <name> -- <command> [args...]");
 
     Ok(())
 }

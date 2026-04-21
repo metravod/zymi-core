@@ -30,6 +30,96 @@ pub struct ProjectConfig {
     pub runtime: Option<RuntimeConfig>,
     #[serde(default)]
     pub services: Option<ServicesConfig>,
+    /// MCP servers to spawn at startup (ADR-0023). Each entry produces
+    /// one subprocess whose advertised tools are registered in the
+    /// `ToolCatalog` under `mcp__<name>__<tool>` ids.
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerConfig>,
+}
+
+/// One entry in the top-level `mcp_servers:` list (ADR-0023).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct McpServerConfig {
+    /// Logical server name. Becomes the `<server>` segment of every
+    /// catalog id produced for this server. Must not contain `__`.
+    pub name: String,
+    /// argv for the server subprocess. First element is the program.
+    pub command: Vec<String>,
+    /// Explicit environment variables. Parent env is **not** inherited
+    /// by default (ADR-0023 §security posture).
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// Allow-list of tool names to import. Mutually exclusive with
+    /// `deny`. Omitting both loads zero tools from the server with a
+    /// startup warning (opt-in UX).
+    #[serde(default)]
+    pub allow: Option<Vec<String>>,
+    /// Deny-list of tool names to skip. Mutually exclusive with `allow`.
+    #[serde(default)]
+    pub deny: Option<Vec<String>>,
+    /// If `true`, every tool imported from this server requires human
+    /// approval by default (per-tool overrides still go through the
+    /// policy engine). Defaults to `false`.
+    #[serde(default)]
+    pub requires_approval: Option<bool>,
+    /// Timeout for the `initialize` handshake. Defaults to 10s.
+    #[serde(default)]
+    pub init_timeout_secs: Option<u64>,
+    /// Timeout for individual `tools/list` / `tools/call` requests.
+    /// Defaults to 60s.
+    #[serde(default)]
+    pub call_timeout_secs: Option<u64>,
+    /// Restart policy on subprocess crash. Absent = no auto-restart:
+    /// a transport failure surfaces to the caller and the server stays
+    /// down until the runtime is restarted.
+    #[serde(default)]
+    pub restart: Option<McpRestartConfig>,
+}
+
+/// Per-server restart policy (ADR-0023 §Lifecycle). Reactive: a crash is
+/// detected on the first `tools/call` after the subprocess exits, and the
+/// registry re-spawns + re-handshakes before retrying the call.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct McpRestartConfig {
+    /// Maximum number of restart attempts over the lifetime of the
+    /// runtime. `0` or unset is equivalent to omitting `restart:`.
+    #[serde(default)]
+    pub max_restarts: Option<u32>,
+    /// Per-attempt backoff in seconds. `[1, 5, 30]` means attempt 1
+    /// waits 1s, attempt 2 waits 5s, attempt 3 (and later, if any) waits
+    /// 30s. Empty or unset defaults to `[1]`.
+    #[serde(default)]
+    pub backoff_secs: Option<Vec<u64>>,
+}
+
+impl McpServerConfig {
+    /// Effective init-handshake timeout after applying the default.
+    pub fn effective_init_timeout_secs(&self) -> u64 {
+        self.init_timeout_secs.unwrap_or(10)
+    }
+
+    /// Effective per-call timeout after applying the default.
+    pub fn effective_call_timeout_secs(&self) -> u64 {
+        self.call_timeout_secs.unwrap_or(60)
+    }
+}
+
+impl McpRestartConfig {
+    /// Resolved max-restarts value. `None` or `Some(0)` → 0.
+    pub fn effective_max_restarts(&self) -> u32 {
+        self.max_restarts.unwrap_or(0)
+    }
+
+    /// Backoff duration for the given 1-based attempt. Past the end of
+    /// the list, reuses the last element. Empty list defaults to 1s.
+    pub fn backoff_for_attempt(&self, attempt: u32) -> u64 {
+        let list = self.backoff_secs.as_deref().unwrap_or(&[]);
+        if list.is_empty() {
+            return 1;
+        }
+        let idx = (attempt.saturating_sub(1) as usize).min(list.len() - 1);
+        list[idx]
+    }
 }
 
 /// LLM provider configuration.
@@ -456,6 +546,123 @@ runtime:
         assert_eq!(rt.context.soft_cap_chars, 400_000);
         assert_eq!(rt.context.hard_cap_chars, 600_000);
         assert_eq!(rt.context.min_tail_turns, 4);
+    }
+
+    #[test]
+    fn project_with_mcp_servers_parses_full_entry() {
+        let dir = TempDir::new().unwrap();
+        let yaml = r#"
+name: test
+mcp_servers:
+  - name: github
+    command: ["npx", "-y", "@modelcontextprotocol/server-github"]
+    env:
+      GITHUB_PERSONAL_ACCESS_TOKEN: xxx
+    allow: ["create_issue", "add_issue_comment"]
+  - name: postgres
+    command: ["npx", "-y", "@modelcontextprotocol/server-postgres", "postgres://localhost/db"]
+    deny: ["drop_table"]
+    requires_approval: true
+"#;
+        let path = write_file(&dir, "project.yml", yaml);
+        let config = load_project(&path).unwrap();
+        assert_eq!(config.mcp_servers.len(), 2);
+
+        let gh = &config.mcp_servers[0];
+        assert_eq!(gh.name, "github");
+        assert_eq!(gh.command[0], "npx");
+        assert_eq!(gh.env.get("GITHUB_PERSONAL_ACCESS_TOKEN").unwrap(), "xxx");
+        assert_eq!(gh.allow.as_deref().unwrap(), &["create_issue", "add_issue_comment"]);
+        assert!(gh.deny.is_none());
+        assert!(gh.requires_approval.is_none());
+
+        let pg = &config.mcp_servers[1];
+        assert_eq!(pg.name, "postgres");
+        assert_eq!(pg.deny.as_deref().unwrap(), &["drop_table"]);
+        assert_eq!(pg.requires_approval, Some(true));
+    }
+
+    #[test]
+    fn project_without_mcp_servers_is_empty_vec() {
+        let dir = TempDir::new().unwrap();
+        let path = write_file(&dir, "project.yml", "name: test\n");
+        let config = load_project(&path).unwrap();
+        assert!(config.mcp_servers.is_empty());
+    }
+
+    #[test]
+    fn mcp_server_timeouts_and_restart_parse() {
+        let dir = TempDir::new().unwrap();
+        let yaml = r#"
+name: test
+mcp_servers:
+  - name: slow
+    command: ["./slow-server"]
+    init_timeout_secs: 30
+    call_timeout_secs: 120
+    restart:
+      max_restarts: 3
+      backoff_secs: [1, 5, 30]
+"#;
+        let path = write_file(&dir, "project.yml", yaml);
+        let config = load_project(&path).unwrap();
+        let srv = &config.mcp_servers[0];
+        assert_eq!(srv.init_timeout_secs, Some(30));
+        assert_eq!(srv.call_timeout_secs, Some(120));
+        assert_eq!(srv.effective_init_timeout_secs(), 30);
+        assert_eq!(srv.effective_call_timeout_secs(), 120);
+        let restart = srv.restart.as_ref().unwrap();
+        assert_eq!(restart.effective_max_restarts(), 3);
+        assert_eq!(restart.backoff_for_attempt(1), 1);
+        assert_eq!(restart.backoff_for_attempt(2), 5);
+        assert_eq!(restart.backoff_for_attempt(3), 30);
+        // Past the list end → stays at the tail value.
+        assert_eq!(restart.backoff_for_attempt(7), 30);
+    }
+
+    #[test]
+    fn mcp_server_timeout_defaults_when_unset() {
+        let cfg = McpServerConfig {
+            name: "x".into(),
+            command: vec!["true".into()],
+            env: HashMap::new(),
+            allow: None,
+            deny: None,
+            requires_approval: None,
+            init_timeout_secs: None,
+            call_timeout_secs: None,
+            restart: None,
+        };
+        assert_eq!(cfg.effective_init_timeout_secs(), 10);
+        assert_eq!(cfg.effective_call_timeout_secs(), 60);
+    }
+
+    #[test]
+    fn mcp_restart_empty_backoff_defaults_to_one_second() {
+        let r = McpRestartConfig {
+            max_restarts: Some(2),
+            backoff_secs: Some(Vec::new()),
+        };
+        assert_eq!(r.backoff_for_attempt(1), 1);
+        assert_eq!(r.backoff_for_attempt(99), 1);
+    }
+
+    #[test]
+    fn mcp_restart_missing_backoff_defaults_to_one_second() {
+        let r = McpRestartConfig {
+            max_restarts: Some(1),
+            backoff_secs: None,
+        };
+        assert_eq!(r.backoff_for_attempt(1), 1);
+    }
+
+    #[test]
+    fn mcp_restart_unset_max_is_zero() {
+        let r = McpRestartConfig {
+            max_restarts: None,
+            backoff_secs: None,
+        };
+        assert_eq!(r.effective_max_restarts(), 0);
     }
 
     #[test]

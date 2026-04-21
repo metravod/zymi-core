@@ -59,28 +59,62 @@ fn validate_agent_tools(
     Ok(())
 }
 
-/// Resolver that combines the static [`super::agent::KNOWN_TOOLS`] list with
-/// declarative tool names loaded from `tools/*.yml`. Used by
-/// [`super::load_project_dir`] which runs before a `Runtime` (and therefore
-/// a `ToolCatalog`) exists.
+/// Resolver used by [`super::load_project_dir`] at config-load time, before a
+/// [`Runtime`](crate::runtime::Runtime) (and therefore a
+/// [`ToolCatalog`](crate::runtime::ToolCatalog)) exists.
+///
+/// Accepts three sources of tool names:
+/// 1. Built-ins from [`super::agent::KNOWN_TOOLS`].
+/// 2. Declarative tool names loaded from `tools/*.yml`.
+/// 3. Any `mcp__<server>__<tool>` where `<server>` is declared in
+///    `project.mcp_servers`. Per-tool name existence is deferred to the
+///    runtime — the server only advertises its `tools/list` at startup, so
+///    load-time validation would require spawning subprocesses. Typos in the
+///    server name are still caught here.
 pub struct ConfigToolNameResolver {
     declarative_names: Vec<String>,
+    mcp_server_names: Vec<String>,
 }
 
 impl ConfigToolNameResolver {
     pub fn new(declarative_names: Vec<String>) -> Self {
-        Self { declarative_names }
+        Self {
+            declarative_names,
+            mcp_server_names: Vec::new(),
+        }
+    }
+
+    /// Attach the list of MCP server names from `project.mcp_servers`. Any
+    /// agent tool name of the form `mcp__<server>__<tool>` is accepted as
+    /// long as `<server>` appears here; the `<tool>` segment is not checked
+    /// until runtime.
+    pub fn with_mcp_servers(mut self, names: Vec<String>) -> Self {
+        self.mcp_server_names = names;
+        self
     }
 }
 
 impl ToolNameResolver for ConfigToolNameResolver {
     fn knows(&self, name: &str) -> bool {
-        super::agent::KNOWN_TOOLS.contains(&name) || self.declarative_names.iter().any(|n| n == name)
+        if super::agent::KNOWN_TOOLS.contains(&name)
+            || self.declarative_names.iter().any(|n| n == name)
+        {
+            return true;
+        }
+        if let Some(rest) = name.strip_prefix(crate::mcp::MCP_PREFIX) {
+            if let Some((server, tool)) = rest.split_once("__") {
+                return !tool.is_empty() && self.mcp_server_names.iter().any(|s| s == server);
+            }
+        }
+        false
     }
 
     fn all_tool_names(&self) -> Vec<&str> {
         let mut names: Vec<&str> = super::agent::KNOWN_TOOLS.to_vec();
         names.extend(self.declarative_names.iter().map(|s| s.as_str()));
+        // MCP tool names aren't known at load time; surface the server names
+        // so the help text hints at the right prefix.
+        names.extend(self.mcp_server_names.iter().map(|s| s.as_str()));
         names
     }
 }
@@ -356,6 +390,42 @@ mod tests {
         );
 
         assert!(validate_workspace(&agents, &pipelines, &ConfigToolNameResolver::new(vec![])).is_ok());
+    }
+
+    #[test]
+    fn mcp_tool_accepted_when_server_declared() {
+        let mut agents = HashMap::new();
+        agents.insert(
+            "a".into(),
+            agent("a", vec!["mcp__fs__read_text_file", "mcp__fs__write_file"]),
+        );
+
+        let resolver =
+            ConfigToolNameResolver::new(vec![]).with_mcp_servers(vec!["fs".into()]);
+        assert!(validate_workspace(&agents, &HashMap::new(), &resolver).is_ok());
+    }
+
+    #[test]
+    fn mcp_tool_rejected_when_server_not_declared() {
+        let mut agents = HashMap::new();
+        agents.insert("a".into(), agent("a", vec!["mcp__github__create_issue"]));
+
+        // project.mcp_servers only declares `fs`; the agent references `github`.
+        let resolver =
+            ConfigToolNameResolver::new(vec![]).with_mcp_servers(vec!["fs".into()]);
+        let err = validate_workspace(&agents, &HashMap::new(), &resolver).unwrap_err();
+        assert!(matches!(err, ConfigError::Validation { message, .. } if message.contains("mcp__github__create_issue")));
+    }
+
+    #[test]
+    fn mcp_prefix_without_tool_segment_rejected() {
+        // `mcp__fs__` with empty tool name is not a valid reference.
+        let mut agents = HashMap::new();
+        agents.insert("a".into(), agent("a", vec!["mcp__fs__"]));
+        let resolver =
+            ConfigToolNameResolver::new(vec![]).with_mcp_servers(vec!["fs".into()]);
+        let err = validate_workspace(&agents, &HashMap::new(), &resolver).unwrap_err();
+        assert!(matches!(err, ConfigError::Validation { .. }));
     }
 
     #[test]

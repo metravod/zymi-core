@@ -1,6 +1,24 @@
-# zymi-core
+<p align="center">
+  <img src="assets/zymi-badge.png" alt="zymi" width="220" />
+</p>
 
-Event-sourced agent engine for auditable AI workflows in Rust, YAML, and Python.
+<h1 align="center">zymi-core</h1>
+
+<p align="center"><em>Event-sourced agent engine for auditable AI workflows — Rust core, Python bindings, YAML configs.</em></p>
+
+<p align="center">
+  <a href="https://pypi.org/project/zymi-core/"><img src="https://img.shields.io/pypi/v/zymi-core.svg?logo=pypi&logoColor=white" alt="PyPI" /></a>
+  &nbsp;
+  <a href="https://pypi.org/project/zymi-core/"><img src="https://img.shields.io/pypi/dm/zymi-core.svg" alt="PyPI downloads/month" /></a>
+  &nbsp;
+  <a href="https://github.com/metravod/zymi-core/actions/workflows/ci.yml"><img src="https://github.com/metravod/zymi-core/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI" /></a>
+  &nbsp;
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT" /></a>
+  &nbsp;
+  <a href="https://github.com/metravod/zymi-core/stargazers"><img src="https://img.shields.io/github/stars/metravod/zymi-core.svg?style=social" alt="GitHub stars" /></a>
+</p>
+
+---
 
 `zymi-core` helps you build agent workflows you can inspect after the fact. Every run is recorded as an immutable event stream in SQLite, agent side effects are mediated through intentions and boundary contracts, and pipelines execute as DAGs with parallel steps when possible.
 
@@ -10,17 +28,20 @@ Event-sourced agent engine for auditable AI workflows in Rust, YAML, and Python.
 - **Safer side effects**: agents emit intentions first; contracts and approvals decide what is allowed to execute.
 - **Practical workflows**: define agents and DAG pipelines in YAML, then run them from a small CLI.
 - **Declarative custom tools**: add HTTP and shell tools in `tools/*.yml` — no Rust code required. `zymi init` includes a working example.
+- **MCP client built in**: drop any [Model Context Protocol][mcp] server into `project.yml` and its tools appear as `mcp__<server>__<tool>` — no per-tool schema authoring. Probe new servers with `zymi mcp probe`.
 - **Flexible integration points**: use the Rust crate, Python bindings, or both — Python can drive pipelines directly via `Runtime.for_project(...).run_pipeline(...)`, no subprocess.
 - **LLM-provider ready**: OpenAI-compatible providers, Anthropic support, Python tools, and LangFuse event services.
 - **Automatic context management**: observation masking compresses older tool results in-place (~2x cost reduction, no extra LLM calls), with LLM summarization as a graduated fallback when the context grows further.
 - **JSON Schemas for configs**: `zymi schema project|agent|pipeline|tool` outputs draft-07 JSON Schema for IDE autocomplete and LLM-assisted config generation.
+
+[mcp]: https://modelcontextprotocol.io
 
 ## Installation
 
 | If you want to... | Install with... |
 | --- | --- |
 | CLI + Python bindings | `pip install zymi-core` |
-| Rust crate only | `zymi-core = "0.1"` |
+| Rust crate only | `zymi-core = "0.2"` |
 
 `pip install zymi-core` gives you both the `zymi` CLI command and the `zymi_core` Python module.
 
@@ -66,9 +87,13 @@ What this gives you:
 ```bash
 zymi init --name my-project
 zymi init --example research
+zymi init --example mcp              # scaffold a project wired to an MCP server
 
 zymi run main -i task="Summarize the architecture"
 zymi run research -i topic="Rust event sourcing"
+
+# Probe any MCP server without a project dir — see what it advertises
+zymi mcp probe fetch -- uvx mcp-server-fetch
 
 # Long-running mode: react to PipelineRequested events from any process
 zymi serve research
@@ -212,6 +237,59 @@ tools:
 
 `${env.*}` variables are resolved at parse time; `${args.*}` are resolved at call time from the LLM's arguments. Name collisions with built-in tools are a hard error.
 
+### MCP Servers
+
+Declarative tools cover HTTP and shell. For everything more involved — a filesystem sandbox, a git client, a search index, a proprietary API with its own protocol quirks — [Model Context Protocol][mcp] servers are already a large and growing catalogue, and `zymi-core` speaks the protocol out of the box.
+
+One entry in `project.yml`:
+
+```yaml
+mcp_servers:
+  - name: fs
+    command: [npx, -y, "@modelcontextprotocol/server-filesystem", ./sandbox]
+    allow: [read_text_file, write_file, list_directory]  # optional whitelist
+    init_timeout_secs: 15
+    call_timeout_secs: 30
+    restart:
+      max_restarts: 2
+      backoff_secs: [1, 5]
+```
+
+And the agent gets the tools under a namespaced prefix — no per-tool YAML, no Rust, the definitions come from the server's `tools/list` at startup:
+
+```yaml
+# agents/default.yml
+tools:
+  - mcp__fs__read_text_file
+  - mcp__fs__write_file
+  - mcp__fs__list_directory
+```
+
+`zymi run` boots declared servers, waits for their handshakes, and publishes `mcp_server_connected { server, tool_count }`; on shutdown each server gets `mcp_server_disconnected { reason }`. Every tool call is the usual `tool_started` / `tool_finished` pair — the audit trail is identical to any other tool. Only env vars named under `env:` reach the child process (one exception: `PATH` is auto-forwarded so `npx` / `uvx` / `python` resolve), per [ADR-0023](adr/0023-mcp-client-integration.md).
+
+**Try it end-to-end:**
+
+```bash
+mkdir zymi-mcp-demo && cd zymi-mcp-demo
+zymi init --example mcp
+export OPENAI_API_KEY=sk-...
+zymi run main -i task="List everything in the sandbox, then write notes.md summarising it."
+```
+
+**Before wiring a new server into `project.yml`, probe it:**
+
+```bash
+zymi mcp probe <name> -- <command> [args...]
+
+# Examples:
+zymi mcp probe fs    -- npx -y @modelcontextprotocol/server-filesystem /tmp
+zymi mcp probe fetch -- uvx mcp-server-fetch              # keyless
+zymi mcp probe gh    --env GITHUB_PERSONAL_ACCESS_TOKEN=ghp_... \
+                     -- npx -y @modelcontextprotocol/server-github
+```
+
+`probe` spawns the server, completes the MCP handshake, prints one line per advertised tool, and shuts down cleanly — use its output to pick your `allow:` whitelist.
+
 ## Python Bindings
 
 The same `pip install zymi-core` that gives you the CLI also exposes a `Runtime` for running pipelines directly, plus the lower-level `Event`, `EventBus`, `EventStore`, `Subscription`, and `ToolRegistry` primitives for custom integrations.
@@ -340,7 +418,7 @@ Add the crate to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-zymi-core = "0.1"
+zymi-core = "0.2"
 ```
 
 Example:

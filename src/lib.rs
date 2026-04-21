@@ -10,6 +10,7 @@ pub mod esaa;
 pub mod events;
 #[cfg(feature = "runtime")]
 pub mod handlers;
+pub mod mcp;
 #[cfg(feature = "runtime")]
 pub mod llm;
 pub mod policy;

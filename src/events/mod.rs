@@ -221,6 +221,25 @@ pub enum EventKind {
         error: Option<String>,
     },
 
+    // -- MCP server lifecycle (ADR-0023) --
+    /// An MCP server subprocess finished its `initialize` handshake and
+    /// its tools have been filtered + registered in the [`ToolCatalog`].
+    /// History-only: projections do not rebuild the subprocess on replay.
+    McpServerConnected {
+        /// Logical server name from `mcp_servers: - name:` in project.yml.
+        server: String,
+        /// Number of tools actually registered after applying allow/deny.
+        tool_count: usize,
+    },
+    /// An MCP server subprocess exited or was shut down.
+    /// History-only.
+    McpServerDisconnected {
+        server: String,
+        /// Free-form cause: `"shutdown"` on orderly stop, `"spawn_failed"`,
+        /// `"init_failed"`, `"crash"`, etc.
+        reason: String,
+    },
+
     /// Marker emitted at the start of a forked resume run (ADR-0018).
     /// History-only: projections ignore it. The new stream copies the parent's
     /// frozen step events as if they happened on the new stream; this marker
@@ -260,6 +279,8 @@ impl EventKind {
             EventKind::ShellSessionClosed { .. } => "shell_session_closed",
             EventKind::PipelineRequested { .. } => "pipeline_requested",
             EventKind::PipelineCompleted { .. } => "pipeline_completed",
+            EventKind::McpServerConnected { .. } => "mcp_server_connected",
+            EventKind::McpServerDisconnected { .. } => "mcp_server_disconnected",
             EventKind::ResumeForked { .. } => "resume_forked",
         }
     }
@@ -523,6 +544,37 @@ mod tests {
         if let EventKind::LlmCallCompleted { response_message, has_tool_calls, .. } = kind {
             assert!(response_message.is_none(), "response_message should default to None");
             assert!(has_tool_calls);
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn mcp_server_events_serialization_roundtrip() {
+        let kind = EventKind::McpServerConnected {
+            server: "github".into(),
+            tool_count: 3,
+        };
+        let json = serde_json::to_string(&kind).unwrap();
+        let back: EventKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.tag(), "mcp_server_connected");
+        if let EventKind::McpServerConnected { server, tool_count } = back {
+            assert_eq!(server, "github");
+            assert_eq!(tool_count, 3);
+        } else {
+            panic!("wrong variant");
+        }
+
+        let kind = EventKind::McpServerDisconnected {
+            server: "github".into(),
+            reason: "shutdown".into(),
+        };
+        let json = serde_json::to_string(&kind).unwrap();
+        let back: EventKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.tag(), "mcp_server_disconnected");
+        if let EventKind::McpServerDisconnected { server, reason } = back {
+            assert_eq!(server, "github");
+            assert_eq!(reason, "shutdown");
         } else {
             panic!("wrong variant");
         }

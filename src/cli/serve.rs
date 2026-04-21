@@ -95,7 +95,8 @@ async fn serve_loop(
         Runtime::builder(workspace, root.clone())
             .with_approval_handler(Arc::clone(&approval_handler))
             .with_tail_policy(tail_policy)
-            .build()?,
+            .build_async()
+            .await?,
     );
 
     let watcher = StoreTailWatcher::new(Arc::clone(runtime.store()), Arc::clone(runtime.bus()))
@@ -121,5 +122,6 @@ async fn serve_loop(
     }
 
     watcher.stop().await;
+    runtime.shutdown_mcp().await;
     Ok(())
 }

@@ -55,13 +55,22 @@ pub fn exec(
     let _guard = rt.enter();
     let approval_handler = rt.block_on(super::build_approval_handler(approval_mode, callback_url))?;
 
-    let runtime = Runtime::builder(workspace, root.to_path_buf())
-        .with_approval_handler(approval_handler)
-        .build()?;
+    let runtime = rt.block_on(
+        Runtime::builder(workspace, root.to_path_buf())
+            .with_approval_handler(approval_handler)
+            .build_async(),
+    )?;
 
     let cmd = RunPipeline::new(pipeline.to_string(), inputs);
 
-    let result = rt.block_on(run_pipeline::handle(&runtime, cmd))?;
+    let result = rt.block_on(run_pipeline::handle(&runtime, cmd));
+
+    // Always shut down MCP subprocesses before returning — this publishes
+    // McpServerDisconnected events for the TUI and lets `kill_on_drop`
+    // reap predictably.
+    rt.block_on(runtime.shutdown_mcp());
+
+    let result = result?;
 
     println!("---");
     if result.success {

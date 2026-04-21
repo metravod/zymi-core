@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 use crate::config::tool::{HttpMethod, ImplementationConfig};
 use crate::engine::tools::{execute_builtin_tool, MemoryStore};
+use crate::mcp::McpRegistry;
 use super::shell_session::{ShellSessionPool};
 use super::tool_catalog::ToolCatalog;
 
@@ -99,16 +100,29 @@ impl ActionExecutor for BuiltinActionExecutor {
 /// Catalog-aware executor: dispatches approved tool calls through the
 /// [`ToolCatalog`]. Built-in tools delegate to [`execute_builtin_tool`];
 /// `execute_shell_command` is routed to the persistent [`ShellSessionPool`];
-/// declarative `kind: http` tools are dispatched via reqwest.
+/// declarative `kind: http` tools are dispatched via reqwest; MCP-backed
+/// tools are dispatched via the [`McpRegistry`].
 #[derive(Clone)]
 pub struct CatalogActionExecutor {
     catalog: Arc<ToolCatalog>,
     shell_pool: Arc<ShellSessionPool>,
+    mcp: Option<Arc<McpRegistry>>,
 }
 
 impl CatalogActionExecutor {
     pub fn new(catalog: Arc<ToolCatalog>, shell_pool: Arc<ShellSessionPool>) -> Self {
-        Self { catalog, shell_pool }
+        Self {
+            catalog,
+            shell_pool,
+            mcp: None,
+        }
+    }
+
+    /// Attach an MCP registry. Calls to tools registered under `mcp__*` ids
+    /// will be routed via this registry.
+    pub fn with_mcp(mut self, registry: Arc<McpRegistry>) -> Self {
+        self.mcp = Some(registry);
+        self
     }
 }
 
@@ -122,6 +136,9 @@ impl ActionExecutor for CatalogActionExecutor {
     ) -> Result<String, String> {
         if tool_name == "execute_shell_command" {
             return self.execute_shell(arguments_json, ctx).await;
+        }
+        if self.catalog.is_mcp(tool_name) {
+            return self.execute_mcp(tool_name, arguments_json).await;
         }
         if self.catalog.is_declarative(tool_name) {
             let config = self.catalog.declarative_config(tool_name)
@@ -146,6 +163,67 @@ impl ActionExecutor for CatalogActionExecutor {
             )
             .await
         }
+    }
+}
+
+impl CatalogActionExecutor {
+    /// Route an `mcp__server__tool` call through the [`McpRegistry`].
+    ///
+    /// Server-reported tool errors (`isError: true`) are returned as `Err` so
+    /// the orchestrator records a `ToolCallCompleted { is_error: true }`,
+    /// matching how declarative tool failures already behave.
+    async fn execute_mcp(&self, tool_name: &str, arguments_json: &str) -> Result<String, String> {
+        let (server, tool) = self
+            .catalog
+            .mcp_route(tool_name)
+            .ok_or_else(|| format!("mcp tool '{tool_name}' not registered"))?;
+        let registry = self
+            .mcp
+            .as_ref()
+            .ok_or_else(|| format!("mcp tool '{tool_name}' called but no registry configured"))?;
+
+        let arguments: serde_json::Value = if arguments_json.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(arguments_json)
+                .map_err(|e| format!("mcp tool '{tool_name}' invalid arguments json: {e}"))?
+        };
+
+        let result = registry
+            .call(server, tool, arguments)
+            .await
+            .map_err(|e| format!("mcp tool '{tool_name}' transport error: {e}"))?;
+
+        let text = render_mcp_content(&result.content);
+        if result.is_error {
+            Err(text)
+        } else {
+            Ok(text)
+        }
+    }
+}
+
+/// Flatten the MCP `content` array into a single string for the LLM.
+///
+/// MCP content blocks are heterogeneous (`text`, `image`, `resource`, …).
+/// v1 surfaces the text portions concatenated; non-text blocks are rendered
+/// as a JSON debug stub so the LLM at least sees that something arrived.
+fn render_mcp_content(content: &[serde_json::Value]) -> String {
+    let mut parts: Vec<String> = Vec::with_capacity(content.len());
+    for block in content {
+        let kind = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if kind == "text" {
+            if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                parts.push(text.to_string());
+                continue;
+            }
+        }
+        parts.push(block.to_string());
+    }
+    if parts.is_empty() {
+        "(no content)".to_string()
+    } else {
+        parts.join("\n")
     }
 }
 
@@ -470,5 +548,234 @@ mod tests {
     fn parse_args_invalid_json() {
         let args = parse_args_for_interpolation("not json");
         assert!(args.is_empty());
+    }
+
+    // ── MCP dispatch ──────────────────────────────────────────────────────
+    //
+    // Spawns a duplex-stream "fake MCP server" task and wires it into a
+    // McpServerConnection without ever launching a subprocess. The fake
+    // answers `initialize`, swallows `notifications/initialized`, and replies
+    // to `tools/call` according to a per-test script.
+
+    use crate::mcp::{McpRegistry, McpServerConnection, Transport};
+    use serde_json::Value;
+    use tokio::io::{duplex, AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    async fn spawn_fake_mcp(
+        responder: impl Fn(Value) -> Value + Send + Sync + 'static,
+    ) -> (Arc<McpServerConnection>, tokio::task::JoinHandle<()>) {
+        let (client_to_server_w, client_to_server_r) = duplex(8192);
+        let (server_to_client_w, server_to_client_r) = duplex(8192);
+
+        let server = tokio::spawn(async move {
+            let mut reader = BufReader::new(client_to_server_r);
+            let mut writer = server_to_client_w;
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+                let req: Value = match serde_json::from_str(line.trim()) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if req.get("id").is_none() {
+                    // notification — drop it
+                    continue;
+                }
+                let id = req["id"].clone();
+                let method = req["method"].as_str().unwrap_or("").to_string();
+                let response = if method == "initialize" {
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "protocolVersion": "2024-11-05",
+                            "capabilities": {"tools": {}},
+                            "serverInfo": {"name": "fake", "version": "0"}
+                        }
+                    })
+                } else if method == "tools/call" {
+                    let tool_result = responder(req["params"].clone());
+                    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": tool_result})
+                } else {
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {"code": -32601, "message": "method not found"}
+                    })
+                };
+                let mut data = serde_json::to_vec(&response).unwrap();
+                data.push(b'\n');
+                if writer.write_all(&data).await.is_err() {
+                    return;
+                }
+                let _ = writer.flush().await;
+            }
+        });
+
+        let transport = Transport::new(BufReader::new(server_to_client_r), client_to_server_w);
+        let conn = McpServerConnection::from_transport_for_test(
+            "fake".into(),
+            transport,
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("handshake should succeed");
+        (Arc::new(conn), server)
+    }
+
+    fn mcp_text_result(text: &str, is_error: bool) -> Value {
+        serde_json::json!({
+            "content": [{"type": "text", "text": text}],
+            "isError": is_error
+        })
+    }
+
+    #[tokio::test]
+    async fn catalog_executor_dispatches_mcp_tool() {
+        let (conn, _server) = spawn_fake_mcp(|params| {
+            assert_eq!(params["name"], "create_issue");
+            assert_eq!(params["arguments"]["title"], "bug");
+            mcp_text_result("issue #42 created", false)
+        })
+        .await;
+
+        let mut registry = McpRegistry::new();
+        registry.insert("github", conn);
+
+        let mut catalog = ToolCatalog::builtin_only();
+        catalog
+            .add_mcp_server(
+                "github",
+                &[crate::mcp::McpTool {
+                    name: "create_issue".into(),
+                    description: Some("create an issue".into()),
+                    input_schema: serde_json::json!({"type": "object"}),
+                }],
+                false,
+            )
+            .unwrap();
+
+        let pool = Arc::new(ShellSessionPool::new(Duration::from_secs(60)));
+        let executor = CatalogActionExecutor::new(Arc::new(catalog), pool)
+            .with_mcp(Arc::new(registry));
+
+        let memory = test_memory_store();
+        let root = PathBuf::from(".");
+        let ctx = ActionContext {
+            project_root: &root,
+            memory: &memory,
+            stream_id: "test",
+            correlation_id: Uuid::new_v4(),
+        };
+
+        let result = executor
+            .execute("mcp__github__create_issue", r#"{"title":"bug"}"#, &ctx)
+            .await
+            .unwrap();
+        assert_eq!(result, "issue #42 created");
+    }
+
+    #[tokio::test]
+    async fn mcp_server_reported_tool_error_surfaces_as_err() {
+        let (conn, _server) =
+            spawn_fake_mcp(|_| mcp_text_result("rate limited", true)).await;
+
+        let mut registry = McpRegistry::new();
+        registry.insert("github", conn);
+
+        let mut catalog = ToolCatalog::builtin_only();
+        catalog
+            .add_mcp_server(
+                "github",
+                &[crate::mcp::McpTool {
+                    name: "create_issue".into(),
+                    description: None,
+                    input_schema: serde_json::json!({}),
+                }],
+                false,
+            )
+            .unwrap();
+
+        let pool = Arc::new(ShellSessionPool::new(Duration::from_secs(60)));
+        let executor = CatalogActionExecutor::new(Arc::new(catalog), pool)
+            .with_mcp(Arc::new(registry));
+
+        let memory = test_memory_store();
+        let root = PathBuf::from(".");
+        let ctx = ActionContext {
+            project_root: &root,
+            memory: &memory,
+            stream_id: "test",
+            correlation_id: Uuid::new_v4(),
+        };
+
+        let err = executor
+            .execute("mcp__github__create_issue", "{}", &ctx)
+            .await
+            .unwrap_err();
+        assert_eq!(err, "rate limited");
+    }
+
+    #[tokio::test]
+    async fn mcp_call_without_registry_is_explicit_error() {
+        let mut catalog = ToolCatalog::builtin_only();
+        catalog
+            .add_mcp_server(
+                "github",
+                &[crate::mcp::McpTool {
+                    name: "issue".into(),
+                    description: None,
+                    input_schema: serde_json::json!({}),
+                }],
+                false,
+            )
+            .unwrap();
+
+        let pool = Arc::new(ShellSessionPool::new(Duration::from_secs(60)));
+        let executor = CatalogActionExecutor::new(Arc::new(catalog), pool);
+
+        let memory = test_memory_store();
+        let root = PathBuf::from(".");
+        let ctx = ActionContext {
+            project_root: &root,
+            memory: &memory,
+            stream_id: "test",
+            correlation_id: Uuid::new_v4(),
+        };
+
+        let err = executor
+            .execute("mcp__github__issue", "{}", &ctx)
+            .await
+            .unwrap_err();
+        assert!(err.contains("no registry"), "got: {err}");
+    }
+
+    #[test]
+    fn render_mcp_content_concatenates_text_blocks() {
+        let blocks = vec![
+            serde_json::json!({"type": "text", "text": "first"}),
+            serde_json::json!({"type": "text", "text": "second"}),
+        ];
+        assert_eq!(super::render_mcp_content(&blocks), "first\nsecond");
+    }
+
+    #[test]
+    fn render_mcp_content_falls_back_for_non_text_blocks() {
+        let blocks = vec![
+            serde_json::json!({"type": "text", "text": "hi"}),
+            serde_json::json!({"type": "image", "data": "..."}),
+        ];
+        let rendered = super::render_mcp_content(&blocks);
+        assert!(rendered.starts_with("hi\n"), "got: {rendered}");
+        assert!(rendered.contains("image"));
+    }
+
+    #[test]
+    fn render_mcp_content_empty_returns_placeholder() {
+        assert_eq!(super::render_mcp_content(&[]), "(no content)");
     }
 }
