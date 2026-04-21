@@ -6,6 +6,8 @@
 
 <p align="center"><em>Event-sourced agent engine for auditable AI workflows — Rust core, Python bindings, YAML configs.</em></p>
 
+<p align="center"><sub>Pronounced <em>zoomi</em> — like dog zoomies.</sub></p>
+
 <p align="center">
   <a href="https://pypi.org/project/zymi-core/"><img src="https://img.shields.io/pypi/v/zymi-core.svg?logo=pypi&logoColor=white" alt="PyPI" /></a>
   &nbsp;
