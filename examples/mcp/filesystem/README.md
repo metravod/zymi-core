@@ -56,4 +56,18 @@ cargo run --example mcp_probe -- \
 Output is one line per tool with its one-line description — use this to
 decide what belongs in `allow:`.
 
+The probe works against any MCP server, not just this one. A keyless
+example using the official `fetch` server:
+
+```bash
+cargo run --example mcp_probe -- fetch uvx mcp-server-fetch
+```
+
+```text
+probe: spawning fetch via ["uvx", "mcp-server-fetch"]
+probe: handshake ok
+server 'fetch' advertises 1 tool(s):
+  - fetch — Fetches a URL from the internet and optionally extracts its contents as markdown.
+```
+
 [mcp-fs]: https://www.npmjs.com/package/@modelcontextprotocol/server-filesystem
