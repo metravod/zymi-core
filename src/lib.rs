@@ -13,6 +13,7 @@ pub mod handlers;
 pub mod mcp;
 #[cfg(feature = "runtime")]
 pub mod llm;
+pub mod plugin;
 pub mod policy;
 #[cfg(feature = "python")]
 #[allow(clippy::useless_conversion)]

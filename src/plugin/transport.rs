@@ -1,11 +1,11 @@
 //! JSON-RPC 2.0 transport over newline-delimited JSON streams.
 //!
-//! Per the MCP spec, stdio messages are framed as one complete JSON object per
-//! line (no embedded newlines). This differs from LSP's `Content-Length`
-//! framing — MCP deliberately picked the simpler line form.
+//! One complete JSON object per line, no embedded newlines. This differs from
+//! LSP's `Content-Length` framing — both MCP (ADR-0023) and the external-
+//! process plugin protocol (ADR-0021) pick this simpler line form.
 //!
-//! This module owns the wire format only. Subprocess lifecycle, tool
-//! registration, and the MCP handshake live in higher layers (slice 2+).
+//! This module owns the wire format only. Subprocess lifecycle, protocol-
+//! specific handshakes, and capability negotiation live in higher layers.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -93,7 +93,8 @@ impl Transport {
     /// Build a transport over the given reader/writer halves. The reader is
     /// consumed by a background task that demultiplexes responses to pending
     /// requests by `id`. Server-initiated frames (notifications, sampling
-    /// requests) are logged at `debug` and dropped — v1 has no consumers.
+    /// requests) are logged at `debug` and dropped — callers that need them
+    /// will grow a subscriber hook in a later slice.
     pub fn new<R, W>(reader: R, writer: W) -> Self
     where
         R: AsyncBufRead + Send + Unpin + 'static,
@@ -201,18 +202,19 @@ where
                         // Servers occasionally print log lines to stdout. The
                         // spec disallows it but real servers do it; skip
                         // gracefully rather than killing the transport.
-                        log::debug!("mcp: skipping non-jsonrpc line: {trimmed}");
+                        log::debug!("plugin transport: skipping non-jsonrpc line: {trimmed}");
                         continue;
                     }
                 };
                 if frame.method.is_some() {
-                    // Server notification or server-initiated request — v1
-                    // has no consumers (no resources/prompts/sampling).
-                    log::debug!("mcp: dropping server-initiated frame: {trimmed}");
+                    // Server-initiated frame (notification or request). v1
+                    // has no subscriber hook; higher layers that need these
+                    // will grow one in a later slice.
+                    log::debug!("plugin transport: dropping server-initiated frame: {trimmed}");
                     continue;
                 }
                 let Some(id) = frame.id else {
-                    log::debug!("mcp: response without id: {trimmed}");
+                    log::debug!("plugin transport: response without id: {trimmed}");
                     continue;
                 };
                 let entry = pending.lock().await.remove(&id);
@@ -228,11 +230,11 @@ where
                     };
                     let _ = tx.send(result);
                 } else {
-                    log::debug!("mcp: response for unknown id {id}");
+                    log::debug!("plugin transport: response for unknown id {id}");
                 }
             }
             Err(e) => {
-                log::debug!("mcp: reader io error: {e}");
+                log::debug!("plugin transport: reader io error: {e}");
                 fail_all_pending(&pending, TransportError::Closed).await;
                 return;
             }
