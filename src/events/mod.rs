@@ -67,8 +67,14 @@ impl Event {
 }
 
 /// Domain events covering the full lifecycle of agent processing.
+///
+/// `#[non_exhaustive]`: new variants land in every plugin-expanding slice
+/// (connectors in P3, approvals in P5). External Rust consumers get the
+/// stability contract via `schema_version` in `project.yml` (ADR-0020) and
+/// must handle unknown variants at the Rust level.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
+#[non_exhaustive]
 pub enum EventKind {
     // -- Inbound --
     UserMessageReceived {
@@ -287,6 +293,7 @@ impl EventKind {
 }
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum EventStoreError {
     #[error("connection error: {0}")]
     Connection(String),

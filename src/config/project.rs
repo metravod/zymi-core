@@ -10,10 +10,24 @@ use crate::policy::PolicyConfig;
 use super::error::{parse_error, ConfigError};
 use super::template;
 
+/// Current YAML schema version. Bumped per the semver contract in ADR-0020:
+/// adding a new `type:` or optional field bumps the minor segment; removing
+/// or renaming a `type:` or required field bumps the major segment. `"1"` is
+/// the initial stable contract cut at P2 (v0.3).
+pub const SCHEMA_VERSION: &str = "1";
+
 /// Top-level project configuration (`project.yml`).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ProjectConfig {
     pub name: String,
+    /// YAML-schema version this project targets. See [`SCHEMA_VERSION`] and
+    /// ADR-0020 for the compatibility contract. Omitting the field is
+    /// equivalent to "pinned to whatever the running zymi-core supports" —
+    /// tolerated for backwards compatibility but warned about in CLI
+    /// validation (future slice). New projects scaffolded by `zymi init`
+    /// set this field explicitly.
+    #[serde(default, rename = "schema_version")]
+    pub schema_version: Option<String>,
     #[serde(default)]
     pub version: Option<String>,
     #[serde(default)]

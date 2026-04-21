@@ -110,3 +110,14 @@ Python bindings remain a third, lower-priority hatch for users who want to embed
 - ADR 0021: connectors (`connectors:`, `outputs:`) and the external-process plugin protocol.
 - ADR 0022: event-sourced approvals under `approvals:`.
 - ADR 0023: MCP client as the first non-trivial tool-provider plugin (`mcp_servers:`).
+
+## Implementation progress
+
+**2026-04-21 (v0.3 groundwork, P2):**
+
+- Stdio JSON-RPC 2.0 transport extracted from `src/mcp/transport.rs` into `src/plugin/transport.rs`. `src/mcp` re-exports `Transport`/`TransportError` so existing downstream modules (`src/runtime/mod.rs`) keep compiling. The external-process plugin protocol (ADR 0021) will share this module.
+- Generic `PluginRegistry<T>` + `PluginBuilder<T>` trait landed in `src/plugin/registry.rs`. Construction-side only: `type:`-keyed dispatch, duplicate-name detection, typed error surface. No category traits or concrete builders yet — P3 (`InboundConnector`, `http_inbound`) is the first real consumer.
+- `mcp_servers:` **not migrated** onto the generic registry. Every entry today is an MCP stdio server — there is no `type:` discriminator to dispatch on, and introducing `type: stdio` with a default would be pattern-theatre. The live-connection pool (`McpRegistry`) remains category-specific; only the construction-side gets uniformed, and `mcp_servers:` will plug in once it actually gains a second `type:` (e.g. HTTP+SSE in a follow-up ADR).
+- Service layer (ADR 0010, Langfuse dispatch): **intentionally deferred** and explicitly off-roadmap for new work. Existing code stays as-is behind the `services` feature; observability is owned by the native event store / TUI, not third-party exporters. `services:` remains a valid plugin category slot for residual integrations that don't fit `tools:` / `connectors:` / `outputs:` / `approvals:` / `mcp_servers:`, but Langfuse is not the template for future work.
+- `#[non_exhaustive]` on `EventKind`, `EventStoreError`, `StoreBackend`, and `TransportError`. Protects external Rust consumers when P3/P5/P10 add variants. Stability contract is on the YAML schema, not the Rust API.
+- `schema_version` field added to `project.yml` (`SCHEMA_VERSION = "1"`). Tolerates absence for backwards compat; new projects scaffolded by `zymi init` should set it explicitly once P3 scaffolding lands.
