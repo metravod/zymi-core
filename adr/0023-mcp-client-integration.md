@@ -81,7 +81,7 @@ On server crash mid-operation:
 MCP servers execute arbitrary third-party code (they are npm packages in the common case). Two defaults matter:
 
 - **Explicit allow-list per server is recommended, not required.** We do not auto-register every tool an MCP server offers without the user opting-in via `allow:`. The first-run experience with `allow:` omitted is a startup warning: "server `github` exposes 32 tools; none registered. Specify `allow:` or `deny: []`".
-- **Env isolation.** Only keys explicitly named under `env:` are forwarded. The parent process's environment is *not* inherited by default; this is the opposite of the usual subprocess convention but is the right default for a tool-loading surface.
+- **Env isolation.** Only keys explicitly named under `env:` are forwarded. The parent process's environment is *not* inherited by default; this is the opposite of the usual subprocess convention but is the right default for a tool-loading surface. **Exception: `PATH` is auto-forwarded** — see the addendum below.
 
 These defaults are called out in the README and MCP section docs.
 
@@ -127,3 +127,17 @@ Implemented as a standalone module (`src/mcp/transport.rs`) reusable by the conn
 
 - No existing user config breaks. This ADR adds a new top-level section (`mcp_servers:`) and a new tool-id prefix (`mcp://`). Native declarative tools (ADR 0014) and Python-decorated tools (ADR 0007) continue to work unchanged and coexist with MCP tools in the same `ToolCatalog`.
 - `src/mcp/` is a new module. No existing `src/` tree is disturbed beyond the `ToolCatalog` gaining an MCP-backed tool variant.
+
+## Addendum 2026-04-21 — `PATH` is auto-forwarded
+
+First-run testing of Slice 6 (`examples/mcp/filesystem/`) surfaced that the blanket "parent env is not inherited" rule makes every npm/uvx/pip-distributed MCP server fail with `ENOENT` on the first spawn, because the child has no `PATH` to resolve `node` / `npx` / `python` / `uvx`. The original §security-posture text collapsed two distinct concerns — binary lookup and secret isolation — into one switch.
+
+Decision: the child process's environment is constructed by taking the user's `env:` block and, if it contains no `PATH`, layering the parent's `PATH` in on top. An explicit `PATH` under `env:` still wins. No other parent variables are forwarded.
+
+Rationale:
+
+- **Isolation that matters is about secrets.** API tokens, credentials, and private data must not leak into a tool-loading surface. `PATH` is a directory-lookup mechanism, not data — leaking it to the child has no security cost.
+- **Mechanical necessity is not a user choice.** Every npm-distributed MCP server in the surveyed corpus needs `PATH`. Requiring each user to hand-write `PATH: ${env.PATH}` in every server entry is bureaucracy without benefit — and a near-universal first-run footgun.
+- **Conservatism beats generality.** `HOME`, `USER`, `LANG`, npm cache dirs, etc. are also needed by some servers — but not all. We forward only `PATH` now; if demand for a broader allowlist or an opt-in `inherit_env:` knob shows up, we revisit.
+
+Implementation: `src/mcp/connection.rs::resolve_child_env` owns the rule, with unit tests covering (a) parent-PATH gets forwarded when user omitted one, (b) user-supplied `PATH` wins over parent, (c) no other parent keys leak.

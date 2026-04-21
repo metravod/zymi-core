@@ -1,0 +1,13 @@
+name: main
+description: "Single-step demo: agent uses MCP filesystem tools to fulfil a task."
+
+steps:
+  - id: do_it
+    agent: default
+    task: "${inputs.task}"
+
+input:
+  type: text
+
+output:
+  step: do_it

@@ -139,12 +139,17 @@ pub fn load_project_dir(root: &Path) -> Result<WorkspaceConfig, ConfigError> {
         }
     }
 
-    // 6. Cross-validate (builtin + declarative tool names from tools/*.yml).
+    // 6. Cross-validate (builtin + declarative tool names from tools/*.yml,
+    //    plus any `mcp__<server>__*` where `<server>` is declared in
+    //    project.mcp_servers — actual MCP tool names resolve at runtime).
     let declarative_names: Vec<String> = tools.keys().cloned().collect();
+    let mcp_server_names: Vec<String> =
+        project.mcp_servers.iter().map(|s| s.name.clone()).collect();
     validate::validate_workspace(
         &agents,
         &pipelines,
-        &validate::ConfigToolNameResolver::new(declarative_names),
+        &validate::ConfigToolNameResolver::new(declarative_names)
+            .with_mcp_servers(mcp_server_names),
     )?;
 
     Ok(WorkspaceConfig {

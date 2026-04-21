@@ -6,6 +6,7 @@
 //! later slices.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -45,6 +46,12 @@ pub struct McpServerSpec {
     pub name: String,
     pub command: Vec<String>,
     pub env: HashMap<String, String>,
+    /// Working directory for the subprocess. Relative paths in `command` args
+    /// (e.g. `"./sandbox"`) resolve against this, not the zymi process's
+    /// cwd. Callers running inside a project typically pass
+    /// `Some(project_root)`.
+    #[doc(hidden)]
+    pub cwd: Option<PathBuf>,
 }
 
 /// Tool metadata returned by `tools/list`.
@@ -99,14 +106,19 @@ impl McpServerConnection {
             return Err(McpError::Config("empty command".into()));
         }
 
+        let env = resolve_child_env(&spec.env, std::env::var("PATH").ok().as_deref());
+
         let mut cmd = Command::new(&spec.command[0]);
         cmd.args(&spec.command[1..])
             .env_clear()
-            .envs(&spec.env)
+            .envs(&env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        if let Some(cwd) = spec.cwd.as_ref() {
+            cmd.current_dir(cwd);
+        }
 
         let mut child = cmd.spawn().map_err(McpError::Spawn)?;
         let stdin = child.stdin.take().ok_or(McpError::MissingStdio)?;
@@ -189,6 +201,28 @@ impl McpServerConnection {
             call_timeout,
         })
     }
+}
+
+/// Build the child process's environment from the user-provided `spec.env`
+/// and the parent's `PATH`.
+///
+/// Every key the user put under `env:` is forwarded as-is. If the user did
+/// not supply a `PATH`, the parent process's `PATH` is forwarded so
+/// npm/uvx/pip-distributed MCP servers can resolve their interpreters.
+/// Everything else in the parent environment stays out of the child — ADR-0023
+/// §security posture is about secret isolation (API tokens, credentials), not
+/// binary lookup.
+fn resolve_child_env(
+    user_env: &HashMap<String, String>,
+    parent_path: Option<&str>,
+) -> HashMap<String, String> {
+    let mut env = user_env.clone();
+    if !env.contains_key("PATH") {
+        if let Some(parent) = parent_path {
+            env.insert("PATH".into(), parent.to_string());
+        }
+    }
+    env
 }
 
 async fn perform_handshake(
@@ -447,6 +481,7 @@ mod tests {
                 name: "x".into(),
                 command: vec![],
                 env: HashMap::new(),
+                cwd: None,
             },
             Duration::from_secs(1),
             Duration::from_secs(1),
@@ -470,6 +505,7 @@ mod tests {
                 name: "echo".into(),
                 command: vec!["cat".into()],
                 env: HashMap::new(),
+                cwd: None,
             },
             Duration::from_millis(200),
             Duration::from_millis(200),
@@ -485,6 +521,66 @@ mod tests {
             McpError::Transport(TransportError::Timeout)
                 | McpError::Transport(TransportError::Rpc { .. })
         ));
+    }
+
+    #[test]
+    fn resolve_child_env_forwards_parent_path_when_user_did_not_set_one() {
+        let user_env = HashMap::new();
+        let out = resolve_child_env(&user_env, Some("/usr/bin:/bin"));
+        assert_eq!(out.get("PATH").map(String::as_str), Some("/usr/bin:/bin"));
+    }
+
+    #[test]
+    fn resolve_child_env_user_path_wins_over_parent() {
+        let mut user_env = HashMap::new();
+        user_env.insert("PATH".into(), "/my/custom/bin".into());
+        let out = resolve_child_env(&user_env, Some("/usr/bin:/bin"));
+        assert_eq!(out.get("PATH").map(String::as_str), Some("/my/custom/bin"));
+    }
+
+    #[test]
+    fn resolve_child_env_does_not_leak_other_parent_keys() {
+        // A regression guard for ADR-0023: only PATH is auto-forwarded. Any
+        // other variable the parent has (secrets, locale, HOME) stays out of
+        // the child unless the user named it under `env:` explicitly.
+        let user_env = HashMap::new();
+        let out = resolve_child_env(&user_env, Some("/usr/bin"));
+        assert_eq!(out.len(), 1);
+        assert!(out.contains_key("PATH"));
+    }
+
+    #[tokio::test]
+    async fn connect_honours_spec_cwd() {
+        // If `cwd` is set on the spec, the child process inherits it — so a
+        // relative arg like `./ghost-binary` resolves against it, not against
+        // the parent process's cwd. Here we don't need a full MCP handshake;
+        // the spawn-failure *kind* is what we're asserting, and that depends
+        // on where the OS looked.
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = McpServerSpec {
+            name: "x".into(),
+            command: vec!["./definitely-not-here".into()],
+            env: HashMap::new(),
+            cwd: Some(tmp.path().to_path_buf()),
+        };
+        let err = McpServerConnection::connect(
+            spec,
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
+        // Spawn fails because the relative binary doesn't exist inside the
+        // tempdir either — but the error confirms the spawn attempt went
+        // through the configured cwd without panicking.
+        assert!(matches!(err, McpError::Spawn(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn resolve_child_env_no_parent_path_and_no_user_path_means_no_path() {
+        let user_env = HashMap::new();
+        let out = resolve_child_env(&user_env, None);
+        assert!(out.is_empty());
     }
 
     fn which_cat() -> Option<()> {

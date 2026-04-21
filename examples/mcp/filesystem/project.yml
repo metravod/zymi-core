@@ -1,0 +1,48 @@
+name: mcp-filesystem-demo
+version: "0.1"
+
+# The whole point of this demo: one `mcp_servers:` entry = N tools from an
+# off-the-shelf npm package, no per-tool YAML schemas to write.
+
+llm:
+  provider: openai
+  model: gpt-4o-mini
+  api_key: ${env.OPENAI_API_KEY}
+
+mcp_servers:
+  - name: fs
+    command:
+      - npx
+      - "-y"
+      - "@modelcontextprotocol/server-filesystem"
+      - ./sandbox
+    # `PATH` is auto-forwarded so `npx` resolves. Every other variable the
+    # parent process has (OPENAI_API_KEY, credentials, …) stays out of the
+    # child unless you name it here — ADR-0023 §security posture.
+    # The server advertises 14 tools. Narrow to what this demo actually
+    # uses — everything else stays unreachable to the agent.
+    allow:
+      - read_text_file
+      - write_file
+      - list_directory
+      - search_files
+    init_timeout_secs: 15
+    call_timeout_secs: 30
+    restart:
+      max_restarts: 2
+      backoff_secs: [1, 5]
+
+defaults:
+  timeout_secs: 60
+  max_iterations: 10
+
+policy:
+  enabled: true
+  # No shell access in this demo — the agent only talks to the MCP server.
+  allow: []
+  deny: ["*"]
+
+contracts:
+  file_write:
+    allowed_dirs: ["./sandbox", "./output"]
+    deny_patterns: ["*.env", "*.key"]

@@ -287,7 +287,8 @@ impl RuntimeBuilder {
         // the injected store or open the SQLite default.
         let bus_for_mcp = self.resolve_bus_for_startup()?;
 
-        let outcome = spawn_mcp_servers(&mcp_specs, Arc::clone(&bus_for_mcp)).await?;
+        let outcome =
+            spawn_mcp_servers(&mcp_specs, &self.project_root, Arc::clone(&bus_for_mcp)).await?;
 
         // Publish per-server startup failures before proceeding. The runtime
         // keeps building with whatever servers did connect — partial MCP
@@ -517,6 +518,7 @@ struct FailedServer {
 /// runtime failures.
 async fn spawn_mcp_servers(
     specs: &[McpServerConfig],
+    project_root: &Path,
     bus: Arc<EventBus>,
 ) -> Result<SpawnOutcome, String> {
     // Pre-flight validation — all config-shape errors surface before we
@@ -549,6 +551,7 @@ async fn spawn_mcp_servers(
             name: cfg.name.clone(),
             command: cfg.command.clone(),
             env: cfg.env.clone(),
+            cwd: Some(project_root.to_path_buf()),
         };
         let init_timeout = Duration::from_secs(cfg.effective_init_timeout_secs());
         let call_timeout = Duration::from_secs(cfg.effective_call_timeout_secs());
@@ -779,7 +782,7 @@ mod mcp_tests {
         let mut cfg = make_cfg("x", vec!["true".into()]);
         cfg.allow = Some(vec!["a".into()]);
         cfg.deny = Some(vec!["b".into()]);
-        let err = spawn_mcp_servers(&[cfg], test_bus()).await.unwrap_err();
+        let err = spawn_mcp_servers(&[cfg], Path::new("."), test_bus()).await.unwrap_err();
         assert!(err.contains("mutually exclusive"), "got: {err}");
     }
 
@@ -789,14 +792,14 @@ mod mcp_tests {
             make_cfg("gh", vec!["true".into()]),
             make_cfg("gh", vec!["true".into()]),
         ];
-        let err = spawn_mcp_servers(&cfgs, test_bus()).await.unwrap_err();
+        let err = spawn_mcp_servers(&cfgs, Path::new("."), test_bus()).await.unwrap_err();
         assert!(err.contains("duplicate"), "got: {err}");
     }
 
     #[tokio::test]
     async fn spawn_rejects_double_underscore_in_server_name() {
         let cfg = make_cfg("evil__name", vec!["true".into()]);
-        let err = spawn_mcp_servers(&[cfg], test_bus()).await.unwrap_err();
+        let err = spawn_mcp_servers(&[cfg], Path::new("."), test_bus()).await.unwrap_err();
         assert!(err.contains("__"), "got: {err}");
     }
 
@@ -809,7 +812,7 @@ mod mcp_tests {
             "ghost",
             vec!["/definitely/does/not/exist/zymi-mcp-test".into()],
         );
-        let outcome = spawn_mcp_servers(&[cfg], test_bus()).await.unwrap();
+        let outcome = spawn_mcp_servers(&[cfg], Path::new("."), test_bus()).await.unwrap();
         assert_eq!(outcome.failures.len(), 1);
         assert_eq!(outcome.failures[0].name, "ghost");
         assert!(
@@ -836,7 +839,7 @@ mod mcp_tests {
             return; // skip on platforms without cat
         }
         let cfg = make_cfg("silent", vec!["cat".into()]);
-        let outcome = spawn_mcp_servers(&[cfg], test_bus()).await.unwrap();
+        let outcome = spawn_mcp_servers(&[cfg], Path::new("."), test_bus()).await.unwrap();
         assert_eq!(outcome.failures.len(), 1);
         assert_eq!(outcome.failures[0].reason, "init_timeout");
     }
@@ -869,6 +872,7 @@ mod mcp_tests {
             name: "x".into(),
             command: vec!["true".into()],
             env: HashMap::new(),
+            cwd: None,
         };
         let policy = build_restart_policy(
             &cfg,
@@ -890,6 +894,7 @@ mod mcp_tests {
             name: "x".into(),
             command: vec!["true".into()],
             env: HashMap::new(),
+            cwd: None,
         };
         let policy = build_restart_policy(
             &cfg,
@@ -911,6 +916,7 @@ mod mcp_tests {
             name: "x".into(),
             command: vec!["true".into()],
             env: HashMap::new(),
+            cwd: None,
         };
         let policy = build_restart_policy(
             &cfg,
