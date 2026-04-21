@@ -1,6 +1,0 @@
-# Per-run state: the demo creates these on first `zymi run`. Only the
-# scaffold (project.yml, agents/, pipelines/, README.md, and the sandbox
-# README so the dir isn't empty) is checked in.
-.zymi/
-sandbox/*
-!sandbox/README.md

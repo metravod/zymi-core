@@ -1,6 +1,7 @@
 mod event_fmt;
 mod events;
 mod init;
+mod mcp;
 mod observe;
 mod pipelines;
 mod resume;
@@ -16,6 +17,40 @@ use std::process;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
+
+#[derive(Subcommand)]
+enum McpCommand {
+    /// Spawn an MCP server, handshake, list its tools, and shut down.
+    ///
+    /// Does not require a project directory or an LLM — use it to discover
+    /// what a server advertises before writing an `allow:` whitelist.
+    ///
+    /// Example:
+    ///   zymi mcp probe fs -- npx -y @modelcontextprotocol/server-filesystem /tmp
+    ///   zymi mcp probe fetch -- uvx mcp-server-fetch
+    Probe {
+        /// Name used in the handshake (cosmetic — doesn't have to match project.yml)
+        name: String,
+
+        /// Extra env var for the child process, repeatable. Only PATH is
+        /// auto-forwarded from the parent; everything else stays out of the
+        /// child unless named here.
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        env: Vec<String>,
+
+        /// Handshake deadline in seconds
+        #[arg(long, default_value = "15")]
+        init_timeout_secs: u64,
+
+        /// Per-call deadline in seconds (affects tools/list here)
+        #[arg(long, default_value = "30")]
+        call_timeout_secs: u64,
+
+        /// Command and args for the MCP server (prefix with `--`)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+}
 
 /// zymi — event-sourced agent engine CLI
 #[derive(Parser)]
@@ -189,6 +224,12 @@ enum Command {
         dir: Option<PathBuf>,
     },
 
+    /// MCP server utilities (probe a server, inspect tools)
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
+    },
+
     /// Print JSON Schema for a config kind (project, agent, pipeline, tool)
     Schema {
         /// Config kind: project, agent, pipeline, tool
@@ -276,6 +317,15 @@ fn dispatch(cli: Cli) {
             callback_url.as_deref(),
             resolve_root(dir.as_deref()),
         ),
+        Command::Mcp { command } => match command {
+            McpCommand::Probe {
+                name,
+                env,
+                init_timeout_secs,
+                call_timeout_secs,
+                command,
+            } => mcp::exec_probe(&name, &command, &env, init_timeout_secs, call_timeout_secs),
+        },
         Command::Schema { kind, all } => schema::exec(kind.as_deref(), all),
     };
 

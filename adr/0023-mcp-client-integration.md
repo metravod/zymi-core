@@ -130,7 +130,7 @@ Implemented as a standalone module (`src/mcp/transport.rs`) reusable by the conn
 
 ## Addendum 2026-04-21 — `PATH` is auto-forwarded
 
-First-run testing of Slice 6 (`examples/mcp/filesystem/`) surfaced that the blanket "parent env is not inherited" rule makes every npm/uvx/pip-distributed MCP server fail with `ENOENT` on the first spawn, because the child has no `PATH` to resolve `node` / `npx` / `python` / `uvx`. The original §security-posture text collapsed two distinct concerns — binary lookup and secret isolation — into one switch.
+First-run testing of Slice 6 (`zymi init --example mcp`) surfaced that the blanket "parent env is not inherited" rule makes every npm/uvx/pip-distributed MCP server fail with `ENOENT` on the first spawn, because the child has no `PATH` to resolve `node` / `npx` / `python` / `uvx`. The original §security-posture text collapsed two distinct concerns — binary lookup and secret isolation — into one switch.
 
 Decision: the child process's environment is constructed by taking the user's `env:` block and, if it contains no `PATH`, layering the parent's `PATH` in on top. An explicit `PATH` under `env:` still wins. No other parent variables are forwarded.
 
