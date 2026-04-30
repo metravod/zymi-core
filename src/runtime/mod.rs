@@ -82,6 +82,13 @@ pub struct Runtime {
     /// `mcp_servers:` list was empty or when the sync [`RuntimeBuilder::build`]
     /// path was used.
     mcp_registry: Option<Arc<McpRegistry>>,
+    /// Handles to every connector/output task started from
+    /// `project.connectors` and `project.outputs`. Empty for sync-built
+    /// runtimes or projects with no declarative plugins. Wrapped in
+    /// [`std::sync::Mutex`] so `shutdown_connectors` can drain them
+    /// without moving out of the `Arc<Runtime>` callers hold.
+    #[cfg(feature = "connectors")]
+    plugin_handles: Arc<std::sync::Mutex<Vec<crate::connectors::PluginHandle>>>,
 }
 
 impl Runtime {
@@ -158,6 +165,46 @@ impl Runtime {
     pub fn mcp_registry(&self) -> Option<&Arc<McpRegistry>> {
         self.mcp_registry.as_ref()
     }
+
+    /// Graceful shutdown of every connector / output task.
+    ///
+    /// For each handle we cancel its token and await the `JoinHandle` up to
+    /// [`CONNECTOR_SHUTDOWN_DEADLINE`]. In-flight work is allowed to
+    /// finish inside that budget — axum's graceful-shutdown drains
+    /// accepted HTTP requests (`http_inbound`), an outbound retry loop
+    /// completes the current attempt before checking the cancel token
+    /// (`http_post`), and `http_poll` finishes the current tick and
+    /// persists its cursor before exiting. If a task is still stuck past
+    /// the deadline (a remote taking the full 30s reqwest timeout plus a
+    /// 30s backoff is a realistic worst case) we log and move on rather
+    /// than wedging process exit.
+    ///
+    /// Idempotent: the handle list is drained on first call, the token is
+    /// only reacted to once, so a second call is a no-op.
+    #[cfg(feature = "connectors")]
+    pub async fn shutdown_connectors(&self) {
+        let handles: Vec<crate::connectors::PluginHandle> = {
+            let mut guard = self.plugin_handles.lock().expect("plugin_handles lock");
+            std::mem::take(&mut *guard)
+        };
+        for handle in handles {
+            let name = handle.name.clone();
+            let type_name = handle.type_name;
+            handle.shutdown.cancel();
+            match tokio::time::timeout(CONNECTOR_SHUTDOWN_DEADLINE, handle.join).await {
+                Ok(_) => {}
+                Err(_) => log::warn!(
+                    "{type_name} '{name}' did not shut down within {:?}; leaving task detached",
+                    CONNECTOR_SHUTDOWN_DEADLINE
+                ),
+            }
+        }
+    }
+
+    /// No-op shutdown when the `connectors` feature is disabled. Kept so
+    /// CLI entrypoints can call it unconditionally.
+    #[cfg(not(feature = "connectors"))]
+    pub async fn shutdown_connectors(&self) {}
 
     /// Best-effort shutdown of every live MCP server. Publishes one
     /// [`EventKind::McpServerDisconnected`] per server with
@@ -277,25 +324,30 @@ impl RuntimeBuilder {
     /// [`McpRegistry`] into the action executor.
     pub async fn build_async(self) -> Result<Runtime, String> {
         let mcp_specs = self.workspace.project.mcp_servers.clone();
-        if mcp_specs.is_empty() {
+        let connector_entries = self.workspace.project.connectors.clone();
+        let output_entries = self.workspace.project.outputs.clone();
+
+        // Fast path: no MCP, no connectors, no outputs — reuse the sync build.
+        if mcp_specs.is_empty() && connector_entries.is_empty() && output_entries.is_empty() {
             return self.build_inner(McpStartState::default());
         }
 
-        // We need the bus early so `spawn_mcp_servers` can wire it into the
-        // registry (restart/crash events must be publishable mid-call). If
-        // the caller didn't inject one, mirror `build_inner`'s default: reuse
-        // the injected store or open the SQLite default.
-        let bus_for_mcp = self.resolve_bus_for_startup()?;
+        // We need the bus early so both `spawn_mcp_servers` and the
+        // connector tasks wire themselves to the same bus `build_inner`
+        // will end up owning. If the caller didn't inject one, mirror
+        // `build_inner`'s default.
+        let bus_for_startup = self.resolve_bus_for_startup()?;
 
-        let outcome =
-            spawn_mcp_servers(&mcp_specs, &self.project_root, Arc::clone(&bus_for_mcp)).await?;
+        let mcp_outcome = if mcp_specs.is_empty() {
+            SpawnOutcome::default()
+        } else {
+            spawn_mcp_servers(&mcp_specs, &self.project_root, Arc::clone(&bus_for_startup)).await?
+        };
 
-        // Publish per-server startup failures before proceeding. The runtime
-        // keeps building with whatever servers did connect — partial MCP
-        // failure is not a startup error (ADR-0023 §Lifecycle).
-        for failure in &outcome.failures {
+        // Publish per-server MCP startup failures before proceeding.
+        for failure in &mcp_outcome.failures {
             publish_system_event(
-                &bus_for_mcp,
+                &bus_for_startup,
                 EventKind::McpServerDisconnected {
                     server: failure.name.clone(),
                     reason: failure.reason.clone(),
@@ -304,11 +356,12 @@ impl RuntimeBuilder {
             .await;
         }
 
-        let self_with_bus = self.with_event_bus(Arc::clone(&bus_for_mcp));
-        let runtime = self_with_bus.build_inner(outcome.state)?;
+        let project_root = self.project_root.clone();
+        let self_with_bus = self.with_event_bus(Arc::clone(&bus_for_startup));
+        let runtime = self_with_bus.build_inner(mcp_outcome.state)?;
 
-        // Publish one McpServerConnected per live server so the TUI / `zymi
-        // runs` surface observes the startup lifecycle (ADR-0023).
+        // Publish one McpServerConnected per live server so the TUI /
+        // `zymi runs` surface observes the startup lifecycle (ADR-0023).
         if let Some(registry) = runtime.mcp_registry.as_ref() {
             for name in registry.server_names() {
                 let tool_count = runtime.tool_catalog.mcp_tool_count(name);
@@ -321,6 +374,54 @@ impl RuntimeBuilder {
                 )
                 .await;
             }
+        }
+
+        // ── Connectors & outputs (ADR-0021) ────────────────────────────
+        #[cfg(feature = "connectors")]
+        {
+            let connector_startup = crate::connectors::spawn_connectors(
+                &connector_entries,
+                Arc::clone(runtime.bus()),
+                project_root.clone(),
+            )
+            .await?;
+            let output_startup = crate::connectors::spawn_outputs(
+                &output_entries,
+                Arc::clone(runtime.bus()),
+                project_root.clone(),
+            )
+            .await?;
+
+            if !connector_startup.failures.is_empty() || !output_startup.failures.is_empty() {
+                let all: Vec<String> = connector_startup
+                    .failures
+                    .iter()
+                    .chain(output_startup.failures.iter())
+                    .map(|(n, e)| format!("{n}: {e}"))
+                    .collect();
+                log::warn!(
+                    "declarative plugin startup produced {} failure(s): {}",
+                    all.len(),
+                    all.join("; ")
+                );
+            }
+
+            let mut guard = runtime
+                .plugin_handles
+                .lock()
+                .expect("plugin_handles lock");
+            guard.extend(connector_startup.handles);
+            guard.extend(output_startup.handles);
+        }
+        #[cfg(not(feature = "connectors"))]
+        {
+            if !connector_entries.is_empty() || !output_entries.is_empty() {
+                log::warn!(
+                    "project declares `connectors:` or `outputs:` but zymi-core was built \
+                     without the `connectors` feature — they will be ignored"
+                );
+            }
+            let _ = project_root;
         }
 
         Ok(runtime)
@@ -468,6 +569,8 @@ impl RuntimeBuilder {
             shell_pool,
             tail_policy: tail_policy.unwrap_or_default(),
             mcp_registry: mcp_state.registry,
+            #[cfg(feature = "connectors")]
+            plugin_handles: Arc::new(std::sync::Mutex::new(Vec::new())),
         })
     }
 }
@@ -485,6 +588,14 @@ struct McpStartState {
 /// MCP shutdown grace. Kept local to the runtime: per-server handshake and
 /// call timeouts live in [`crate::config::McpServerConfig`] (Slice 5).
 const MCP_SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
+
+/// Upper bound on how long we wait for a single declarative connector or
+/// output to drain in-flight work during [`Runtime::shutdown_connectors`].
+/// Chosen to comfortably cover axum serving a slow webhook (up to
+/// reqwest's default 30s) plus a single retry-backoff slot, without
+/// letting a pathological remote hang process exit for minutes.
+#[cfg(feature = "connectors")]
+const CONNECTOR_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Outcome of `spawn_mcp_servers` — the live registry plus a list of
 /// per-server startup failures. Failures are surfaced as

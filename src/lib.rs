@@ -4,6 +4,8 @@ pub mod cli;
 #[cfg(feature = "runtime")]
 pub mod commands;
 pub mod config;
+#[cfg(feature = "connectors")]
+pub mod connectors;
 #[cfg(feature = "runtime")]
 pub mod engine;
 pub mod esaa;

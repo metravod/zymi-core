@@ -669,6 +669,8 @@ mod tests {
                     context: Default::default(),
                 }),
                 mcp_servers: Vec::new(),
+                connectors: Vec::new(),
+                outputs: Vec::new(),
             },
             agents,
             pipelines,

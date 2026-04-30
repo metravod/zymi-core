@@ -67,7 +67,9 @@ pub fn exec(
 
     // Always shut down MCP subprocesses before returning — this publishes
     // McpServerDisconnected events for the TUI and lets `kill_on_drop`
-    // reap predictably.
+    // reap predictably. Declarative connectors / outputs get the same
+    // best-effort cancellation.
+    rt.block_on(runtime.shutdown_connectors());
     rt.block_on(runtime.shutdown_mcp());
 
     let result = result?;
