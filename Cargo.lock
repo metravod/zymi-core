@@ -3007,7 +3007,7 @@ checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
 
 [[package]]
 name = "zymi-core"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "axum",
