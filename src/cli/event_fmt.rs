@@ -72,7 +72,9 @@ pub fn indent_level(kind: &EventKind) -> u8 {
         | EventKind::WorkflowStarted { .. }
         | EventKind::WorkflowCompleted { .. }
         | EventKind::McpServerConnected { .. }
-        | EventKind::McpServerDisconnected { .. } => 0,
+        | EventKind::McpServerDisconnected { .. }
+        | EventKind::OutboundDispatched { .. }
+        | EventKind::OutboundFailed { .. } => 0,
 
         EventKind::WorkflowNodeStarted { .. }
         | EventKind::WorkflowNodeCompleted { .. }
@@ -423,6 +425,27 @@ pub fn format_event(event: &Event) -> FormattedEvent {
             } else {
                 EventColor::Warning
             },
+            indent,
+        },
+
+        EventKind::OutboundDispatched { sink, sink_type, status, triggered_by } => FormattedEvent {
+            icon: "↗",
+            label: format!("→{sink}"),
+            short_detail: format!("{sink_type} HTTP {status} (on {triggered_by})"),
+            full_detail: format!(
+                "sink: {sink}\ntype: {sink_type}\nstatus: {status}\ntriggered_by: {triggered_by}"
+            ),
+            color: EventColor::Success,
+            indent,
+        },
+        EventKind::OutboundFailed { sink, sink_type, reason, triggered_by } => FormattedEvent {
+            icon: "⚠",
+            label: format!("→{sink} FAIL"),
+            short_detail: format!("{}: {}", sink_type, truncate(reason, 60)),
+            full_detail: format!(
+                "sink: {sink}\ntype: {sink_type}\ntriggered_by: {triggered_by}\nreason: {reason}"
+            ),
+            color: EventColor::Failure,
             indent,
         },
     }

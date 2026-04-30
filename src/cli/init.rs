@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-const KNOWN_EXAMPLES: &[&str] = &["research", "mcp"];
+const KNOWN_EXAMPLES: &[&str] = &["research", "mcp", "telegram"];
 
 /// Declarative web_search tool template shipped with `zymi init`.
 ///
@@ -70,11 +70,14 @@ parameters:
 #     Authorization: "Bearer ${env.TAVILY_API_KEY}"
 #   body_template: '{"query": "${args.query}", "max_results": 5}'
 
-# Placeholder — returns a message instead of real results.
-# Replace with one of the provider blocks above.
+# Placeholder — when no provider is wired, the tool's *output* is read by
+# the agent, not the user. So the message is written *to the model* as
+# instructions, not as an admin error. Without this, models read
+# "not configured" as a generic failure and refuse to answer at all.
+# Once you uncomment a real provider above, this whole block goes away.
 implementation:
   kind: shell
-  command_template: "echo 'web_search is not configured. Edit tools/web_search.yml to connect a search provider.'"
+  command_template: "echo 'WEB_SEARCH_DISABLED: this project has no search provider wired. Answer the user using your own training knowledge. If the question is time-sensitive (current events, weather, prices, news), give your best general or seasonal answer based on training data and add ONE short line acknowledging that you could not check live sources. Do not refuse to answer; do not mention this tool by name.'"
 "#;
 
 /// Declarative web_scrape tool template shipped with `zymi init`.
@@ -127,11 +130,13 @@ parameters:
 #   headers:
 #     Accept: "text/plain"
 
-# Placeholder — returns a message instead of real results.
-# Replace with one of the provider blocks above.
+# Placeholder — see the note in tools/web_search.yml. The tool's output is
+# read by the agent, so the message is written *to the model* as
+# instructions, not as an admin error. Once you uncomment a real
+# provider above, this block goes away.
 implementation:
   kind: shell
-  command_template: "echo 'web_scrape is not configured. Edit tools/web_scrape.yml to connect a scraping provider.'"
+  command_template: "echo 'WEB_SCRAPE_DISABLED: this project has no scraping provider wired. Tell the user briefly that you cannot fetch the page contents directly, then offer to discuss what you already know about the URL or the topic. Do not refuse to engage; do not mention this tool by name.'"
 "#;
 
 pub fn exec(name: Option<String>, example: Option<&str>) -> Result<(), String> {
@@ -165,6 +170,7 @@ pub fn exec(name: Option<String>, example: Option<&str>) -> Result<(), String> {
     match example {
         Some("research") => scaffold_research(&cwd, &project_name)?,
         Some("mcp") => scaffold_mcp(&cwd, &project_name)?,
+        Some("telegram") => scaffold_telegram(&cwd, &project_name)?,
         _ => scaffold_default(&cwd, &project_name)?,
     }
 
@@ -554,6 +560,255 @@ them.
     println!();
     println!("Tip: before wiring any new MCP server into project.yml, probe it:");
     println!("  zymi mcp probe <name> -- <command> [args...]");
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Telegram example scaffold
+// ---------------------------------------------------------------------------
+
+fn scaffold_telegram(root: &Path, project_name: &str) -> Result<(), String> {
+    // -- project.yml --
+    // `http_poll` calls Telegram's `getUpdates` over long-polling, so this
+    // works from a laptop without ngrok / HTTPS. `http_post` sends replies
+    // on every `ResponseReady` event the agent produces. `filter:` pins the
+    // bot to a set of usernames — critical, since a leaked bot token lets
+    // anyone spam the agent otherwise.
+    write_file(
+        &root.join("project.yml"),
+        &format!(
+            r#"name: {project_name}
+version: "0.1"
+
+llm:
+  provider: openai
+  model: gpt-4o-mini
+  api_key: ${{env.OPENAI_API_KEY}}
+
+defaults:
+  timeout_secs: 60
+  max_iterations: 8
+
+policy:
+  enabled: true
+  # `web_search` / `web_scrape` ship with a `kind: shell` placeholder that
+  # echoes "not configured" when no provider is wired. We allow `echo` so
+  # the placeholder can run; once you uncomment a real HTTP provider in
+  # `tools/*.yml`, neither tool touches the shell at all.
+  allow: ["echo *"]
+  deny: ["*"]
+
+# ── Telegram I/O (declarative, no Rust required) ────────────────────────────
+#
+# Edit the `filter:` list below to include your Telegram username (case-
+# sensitive, without the @). Anyone else messaging the bot is silently
+# dropped. Remove the filter block to accept everyone — only do that for a
+# throwaway bot.
+
+connectors:
+  - type: http_poll
+    name: telegram
+    url: "https://api.telegram.org/bot${{env.TELEGRAM_BOT_TOKEN}}/getUpdates"
+    method: GET
+    interval_secs: 2
+    extract:
+      items:     "$.result[*]"
+      stream_id: "$.message.chat.id"
+      content:   "$.message.text"
+      user:      "$.message.from.username"
+    cursor:
+      param: offset
+      from_item: "$.update_id"
+      plus_one: true
+      persist: true
+    filter:
+      "$.message.from.username":
+        one_of: ["your_username_here"]
+    # Every accepted update fires `chat` pipeline with `inputs.message`
+    # set to the message text. `zymi serve chat` picks it up.
+    pipeline: chat
+    pipeline_input: message
+
+outputs:
+  - type: http_post
+    name: telegram_reply
+    on: [ResponseReady]
+    url: "https://api.telegram.org/bot${{env.TELEGRAM_BOT_TOKEN}}/sendMessage"
+    method: POST
+    headers:
+      Content-Type: "application/json"
+    body_template: |
+      {{
+        "chat_id": "{{{{ event.stream_id }}}}",
+        "text": {{{{ event.content | tojson }}}}
+      }}
+    retry:
+      attempts: 3
+      backoff_secs: [1, 5, 30]
+"#
+        ),
+    )?;
+
+    // -- agents/assistant.yml --
+    // The "draft" agent in our two-step chat pipeline. Has tools; runs a
+    // ReAct loop bounded by max_iterations. Web tools default to a shell
+    // placeholder that says "not configured" — the agent reads this and
+    // falls back to its own knowledge without crashing the run.
+    write_file(
+        &root.join("agents/assistant.yml"),
+        r#"name: assistant
+description: "Friendly Telegram chat assistant — drafts the first reply."
+system_prompt: |
+  You are a helpful assistant answering questions in a Telegram chat.
+
+  Style:
+  - Keep replies concise and friendly.
+  - Do not use markdown — Telegram's default view renders plain text cleanest.
+  - If you cannot help with something, say so briefly.
+
+  Tools:
+  - `web_search` for questions that need current or specific external information.
+  - `web_scrape` to read a specific URL the user mentions.
+  - If a tool returns "not configured", proceed using your own knowledge —
+    don't mention the tool's failure to the user.
+tools:
+  - web_search
+  - web_scrape
+max_iterations: 4
+"#,
+    )?;
+
+    // -- agents/reviewer.yml --
+    // Lightweight verifier on top of the draft. No tools, short prompt:
+    // either let the draft through verbatim or rewrite it. This is the
+    // "verifier" half of a draft-then-verify pipeline (Anthropic's
+    // recommended pattern for chat over multi-agent orchestration).
+    write_file(
+        &root.join("agents/reviewer.yml"),
+        r#"name: reviewer
+description: "Brutally lazy reviewer — only intervenes when the draft is bad."
+system_prompt: |
+  You are reviewing a draft answer that will be sent verbatim to a user
+  in a Telegram chat. Your only job is to decide between two options:
+
+    1. The draft already answers the question well → return it verbatim,
+       byte-for-byte. No prefix, no commentary, no formatting changes.
+    2. The draft is wrong, hallucinating, off-topic, or confusingly long →
+       write a better short version yourself.
+
+  Be brutally lazy: option 1 is the right call most of the time. Only
+  rewrite when the draft is actually broken.
+
+  Output rules:
+  - Output ONLY the final answer text, nothing else.
+  - Never say "Reviewed:" or "Here is the corrected answer:" or anything
+    similar — the user must not see that this step exists.
+  - Plain text only. No markdown.
+tools: []
+max_iterations: 1
+"#,
+    )?;
+
+    // -- pipelines/chat.yml --
+    // Two-step DAG: assistant drafts, reviewer checks. One stream per
+    // Telegram `chat_id`; every inbound message starts one pipeline run,
+    // and the reviewer's output flows back through `http_post`.
+    write_file(
+        &root.join("pipelines/chat.yml"),
+        r#"name: chat
+description: "Two-step chat loop: assistant drafts, reviewer polishes."
+
+steps:
+  - id: respond
+    agent: assistant
+    task: "${inputs.message}"
+
+  - id: polish
+    agent: reviewer
+    task: |
+      User asked:
+      ${inputs.message}
+
+      Draft answer from the assistant:
+      ${steps.respond.output}
+
+      Decide whether to keep the draft verbatim or write a better version.
+      Output ONLY the final answer the user will see.
+    depends_on: [respond]
+
+input:
+  type: text
+
+output:
+  step: polish
+"#,
+    )?;
+
+    // -- tools/web_search.yml + tools/web_scrape.yml --
+    write_file(&root.join("tools/web_search.yml"), WEB_SEARCH_TOOL)?;
+    write_file(&root.join("tools/web_scrape.yml"), WEB_SCRAPE_TOOL)?;
+
+    // -- .env.example --
+    write_file(
+        &root.join(".env.example"),
+        r#"# Rename this file to `.env` and fill in the values. `.env` is gitignored
+# by default.
+
+# Create a bot via @BotFather in Telegram; it will hand you a token.
+TELEGRAM_BOT_TOKEN=
+
+# Any Chat-Completions-compatible OpenAI account works. Swap the provider
+# in project.yml if you prefer Anthropic / Gemini / a local server.
+OPENAI_API_KEY=
+"#,
+    )?;
+
+    // Ensure `.env` never gets committed by accident.
+    let gitignore_path = root.join(".gitignore");
+    let current = std::fs::read_to_string(&gitignore_path).unwrap_or_default();
+    let mut updated = current.clone();
+    for line in [".env", ".zymi/"] {
+        if !updated.lines().any(|l| l.trim() == line) {
+            if !updated.is_empty() && !updated.ends_with('\n') {
+                updated.push('\n');
+            }
+            updated.push_str(line);
+            updated.push('\n');
+        }
+    }
+    if updated != current {
+        write_file(&gitignore_path, &updated)?;
+    }
+
+    println!("Initialized zymi project '{project_name}' with telegram example");
+    println!();
+    println!("  project.yml              — Telegram http_poll + http_post wiring");
+    println!("  agents/assistant.yml     — drafts the reply (uses web_search / web_scrape)");
+    println!("  agents/reviewer.yml      — verifies the draft, polishes if needed");
+    println!("  pipelines/chat.yml       — DAG: respond → polish");
+    println!("  tools/web_search.yml     — declarative search tool (configure a provider)");
+    println!("  tools/web_scrape.yml     — declarative scrape tool (configure a provider)");
+    println!("  .env.example             — token placeholders");
+    println!("  .zymi/                   — runtime data (events.db, connectors.db)");
+    println!();
+    println!("Next:");
+    println!("  1. Message @BotFather in Telegram and create a bot; copy the token.");
+    println!("  2. cp .env.example .env  &&  fill TELEGRAM_BOT_TOKEN + OPENAI_API_KEY");
+    println!("  3. Edit project.yml → connectors[0].filter: replace 'your_username_here'");
+    println!("     with your actual Telegram username (no @). This is what keeps");
+    println!("     strangers who somehow found your token out of the bot.");
+    println!("  4. (optional) Open tools/web_search.yml and uncomment a provider block");
+    println!("     (Brave / Tavily / SerpAPI / Google) + set its API key in .env.");
+    println!("     Without this the bot still works — it just answers from its own");
+    println!("     knowledge instead of searching the web.");
+    println!("  5. set -a; source .env; set +a   # export vars to child processes");
+    println!("     ~/.../target/release/zymi serve chat   # or your installed `zymi`");
+    println!();
+    println!("Tip: once running, message the bot on Telegram — you should see an agent");
+    println!("     reply within a couple of seconds. The DAG (respond → polish) is");
+    println!("     visible live in `zymi observe`; outbound POSTs to Telegram show as");
+    println!("     `outbound_dispatched` events in `zymi events`.");
 
     Ok(())
 }

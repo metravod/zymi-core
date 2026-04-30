@@ -1,6 +1,7 @@
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use uuid::Uuid;
 
 use super::store::EventStore;
@@ -10,6 +11,22 @@ use super::{Event, EventStoreError};
 /// if a subscriber falls behind by this many events, new sends will fail
 /// (the event is still persisted in the store — subscriber can replay later).
 const DEFAULT_CHANNEL_CAPACITY: usize = 256;
+
+/// Capacity of the bounded ring tracking event ids fanned out by this
+/// process via [`EventBus::publish`]. The cross-process
+/// [`StoreTailWatcher`](super::store::StoreTailWatcher) consults the ring
+/// before [`EventBus::redeliver`] to drop redeliveries of our own writes —
+/// otherwise every locally-published event arrives twice (once from
+/// `publish`'s direct fan-out, once from the watcher polling its own row).
+///
+/// The ring is large enough to cover a full burst window
+/// (`max_catchup_batches × batch_size = 16 × 256 = 4096` by default) plus
+/// a comfortable cushion: by the time an id falls off, the watcher has
+/// already advanced its cursor past it and won't ask again. If it does
+/// (because of a misconfigured very-aggressive policy), the worst case is
+/// a single duplicate per affected event — the same failure mode we had
+/// before the ring existed, not a regression.
+const RECENT_LOCAL_CAPACITY: usize = 8192;
 
 /// A subscriber with an optional server-side filter.
 /// When `correlation_filter` is set, only events with a matching correlation_id
@@ -40,6 +57,33 @@ impl Subscriber {
 pub struct EventBus {
     store: Arc<dyn EventStore>,
     subscribers: RwLock<Vec<Subscriber>>,
+    /// Bounded ring of event ids this process has fanned out via
+    /// [`Self::publish`]. Consulted by [`Self::redeliver`] to skip
+    /// redeliveries of our own writes (see [`RECENT_LOCAL_CAPACITY`]).
+    recent_local: Mutex<RecentLocal>,
+}
+
+#[derive(Default)]
+struct RecentLocal {
+    set: HashSet<Uuid>,
+    queue: VecDeque<Uuid>,
+}
+
+impl RecentLocal {
+    fn record(&mut self, id: Uuid) {
+        if self.set.insert(id) {
+            self.queue.push_back(id);
+            if self.queue.len() > RECENT_LOCAL_CAPACITY {
+                if let Some(evicted) = self.queue.pop_front() {
+                    self.set.remove(&evicted);
+                }
+            }
+        }
+    }
+
+    fn contains(&self, id: &Uuid) -> bool {
+        self.set.contains(id)
+    }
 }
 
 impl EventBus {
@@ -47,6 +91,7 @@ impl EventBus {
         Self {
             store,
             subscribers: RwLock::new(Vec::new()),
+            recent_local: Mutex::new(RecentLocal::default()),
         }
     }
 
@@ -58,6 +103,10 @@ impl EventBus {
     pub async fn publish(&self, mut event: Event) -> Result<(), EventStoreError> {
         let tag = event.kind_tag();
         self.store.append(&mut event).await?;
+
+        // Record the id *before* fan-out so a near-instantaneous watcher
+        // poll can never observe the row before we've marked it as ours.
+        self.recent_local.lock().await.record(event.id);
 
         let subs = self.subscribers.read().await;
         if subs.is_empty() {
@@ -91,7 +140,18 @@ impl EventBus {
     ///
     /// Calling `publish` here would re-append the event, breaking the hash chain
     /// and producing a duplicate global cursor entry — `redeliver` is the safe path.
+    ///
+    /// **Same-process dedup.** The watcher polls *all* events past its
+    /// cursor, including the ones we just published locally via
+    /// [`Self::publish`]. Without dedup, every same-process event would
+    /// be delivered to subscribers twice (once direct, once via the
+    /// watcher's redelivery). [`Self::publish`] records every fanned-out
+    /// id in a bounded ring; `redeliver` checks the ring and drops local
+    /// echoes silently.
     pub async fn redeliver(&self, event: Arc<Event>) {
+        if self.recent_local.lock().await.contains(&event.id) {
+            return;
+        }
         let subs = self.subscribers.read().await;
         if subs.is_empty() {
             return;
@@ -271,6 +331,60 @@ mod tests {
             }
             assert_eq!(received.sequence, (i + 1) as u64);
         }
+    }
+
+    #[tokio::test]
+    async fn redeliver_skips_locally_published_events() {
+        // Regression for `zymi serve` double-delivery: the in-process tail
+        // watcher polls the store and calls `redeliver` on rows it sees,
+        // including the ones this process just appended via `publish`.
+        // Subscribers must not see those events twice.
+        let (_dir, bus) = setup().await;
+        let mut rx = bus.subscribe().await;
+
+        let event = Event::new(
+            "s1".into(),
+            EventKind::ResponseReady {
+                conversation_id: "s1".into(),
+                content: "hi".into(),
+            },
+            "agent".into(),
+        );
+        bus.publish(event.clone()).await.unwrap();
+        let first = rx.try_recv().expect("publish delivers locally");
+
+        // Now imitate the watcher seeing the row it just polled. With the
+        // dedup ring this must be a no-op.
+        bus.redeliver(first.clone()).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "redeliver of a locally-published event must be silently dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn redeliver_still_fires_for_external_events() {
+        // Counterpart: events that did NOT originate from this process's
+        // `publish` (i.e. were appended by a different process) must still
+        // be redelivered — the dedup ring is keyed by id, and a foreign
+        // id is not in the ring.
+        let (_dir, bus) = setup().await;
+        let mut rx = bus.subscribe().await;
+
+        let foreign = Event::new(
+            "s1".into(),
+            EventKind::ResponseReady {
+                conversation_id: "s1".into(),
+                content: "from-elsewhere".into(),
+            },
+            "external".into(),
+        );
+        // Note: not `bus.publish`, so the ring stays empty for this id.
+        bus.redeliver(Arc::new(foreign)).await;
+        assert!(
+            rx.try_recv().is_ok(),
+            "redeliver of a foreign event must reach subscribers"
+        );
     }
 
     #[tokio::test]

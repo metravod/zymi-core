@@ -122,6 +122,7 @@ async fn serve_loop(
     }
 
     watcher.stop().await;
+    runtime.shutdown_connectors().await;
     runtime.shutdown_mcp().await;
     Ok(())
 }

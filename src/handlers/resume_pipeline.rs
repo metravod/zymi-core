@@ -656,6 +656,7 @@ mod tests {
         WorkspaceConfig {
             project: ProjectConfig {
                 name: "t".into(),
+                schema_version: None,
                 version: None,
                 variables: HashMap::new(),
                 llm: None,
@@ -668,6 +669,8 @@ mod tests {
                     context: Default::default(),
                 }),
                 mcp_servers: Vec::new(),
+                connectors: Vec::new(),
+                outputs: Vec::new(),
             },
             agents,
             pipelines,

@@ -10,10 +10,24 @@ use crate::policy::PolicyConfig;
 use super::error::{parse_error, ConfigError};
 use super::template;
 
+/// Current YAML schema version. Bumped per the semver contract in ADR-0020:
+/// adding a new `type:` or optional field bumps the minor segment; removing
+/// or renaming a `type:` or required field bumps the major segment. `"1"` is
+/// the initial stable contract cut at P2 (v0.3).
+pub const SCHEMA_VERSION: &str = "1";
+
 /// Top-level project configuration (`project.yml`).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ProjectConfig {
     pub name: String,
+    /// YAML-schema version this project targets. See [`SCHEMA_VERSION`] and
+    /// ADR-0020 for the compatibility contract. Omitting the field is
+    /// equivalent to "pinned to whatever the running zymi-core supports" —
+    /// tolerated for backwards compatibility but warned about in CLI
+    /// validation (future slice). New projects scaffolded by `zymi init`
+    /// set this field explicitly.
+    #[serde(default, rename = "schema_version")]
+    pub schema_version: Option<String>,
     #[serde(default)]
     pub version: Option<String>,
     #[serde(default)]
@@ -35,6 +49,19 @@ pub struct ProjectConfig {
     /// `ToolCatalog` under `mcp__<name>__<tool>` ids.
     #[serde(default)]
     pub mcp_servers: Vec<McpServerConfig>,
+    /// Inbound connectors — event sources (http_inbound, http_poll, ...).
+    /// Dispatched at runtime by the `InboundConnector` plugin registry
+    /// (ADR-0020 / ADR-0021). Stored as raw YAML so this crate can parse
+    /// projects without pulling in connector dependencies.
+    #[serde(default)]
+    #[schemars(skip)]
+    pub connectors: Vec<serde_yml::Value>,
+    /// Outbound sinks — event consumers (http_post, ...). Dispatched via
+    /// the `OutboundSink` plugin registry. Stored as raw YAML for the
+    /// same reason as `connectors`.
+    #[serde(default)]
+    #[schemars(skip)]
+    pub outputs: Vec<serde_yml::Value>,
 }
 
 /// One entry in the top-level `mcp_servers:` list (ADR-0023).
@@ -663,6 +690,65 @@ mcp_servers:
             backoff_secs: None,
         };
         assert_eq!(r.effective_max_restarts(), 0);
+    }
+
+    #[test]
+    fn project_with_connectors_and_outputs_parses_raw() {
+        let dir = TempDir::new().unwrap();
+        let yaml = r#"
+name: telegram-bot
+connectors:
+  - type: http_poll
+    name: telegram_updates
+    url: "https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getUpdates"
+    interval_secs: 2
+    extract:
+      items:    "$.result[*]"
+      stream_id: "$.message.chat.id"
+      content:   "$.message.text"
+    publishes: UserMessageReceived
+outputs:
+  - type: http_post
+    name: telegram_reply
+    on: [ResponseReady]
+    url: "https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage"
+    body_template: '{"chat_id":"{{ event.stream_id }}","text":"{{ event.content }}"}'
+"#;
+        // Stub the env var so template resolution doesn't fail the first pass.
+        unsafe { std::env::set_var("TELEGRAM_BOT_TOKEN", "123:abc") };
+        let path = write_file(&dir, "project.yml", yaml);
+        let config = load_project(&path).unwrap();
+        unsafe { std::env::remove_var("TELEGRAM_BOT_TOKEN") };
+
+        assert_eq!(config.connectors.len(), 1);
+        assert_eq!(config.outputs.len(), 1);
+
+        let inbound = &config.connectors[0];
+        let as_map = inbound.as_mapping().expect("connector entry is mapping");
+        assert_eq!(
+            as_map
+                .get(serde_yml::Value::String("type".into()))
+                .and_then(|v| v.as_str()),
+            Some("http_poll")
+        );
+
+        let outbound = &config.outputs[0];
+        let as_map = outbound.as_mapping().expect("output entry is mapping");
+        assert_eq!(
+            as_map
+                .get(serde_yml::Value::String("name".into()))
+                .and_then(|v| v.as_str()),
+            Some("telegram_reply")
+        );
+    }
+
+    #[test]
+    fn project_without_connectors_is_empty_vec() {
+        let dir = TempDir::new().unwrap();
+        let path = write_file(&dir, "project.yml", "name: test\n");
+        let config = load_project(&path).unwrap();
+        assert!(config.connectors.is_empty());
+        assert!(config.outputs.is_empty());
     }
 
     #[test]

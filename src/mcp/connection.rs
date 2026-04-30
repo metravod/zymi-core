@@ -17,7 +17,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, ChildStderr, Command};
 use tokio::sync::Mutex;
 
-use crate::mcp::transport::{Transport, TransportError};
+use crate::plugin::transport::{Transport, TransportError};
 
 /// MCP protocol version this client speaks. Servers that negotiate a different
 /// version still answer; we record but don't reject — wire compatibility for

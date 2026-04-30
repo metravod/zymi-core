@@ -12,8 +12,11 @@ use super::error::ConfigError;
 /// - `${project.name}`, `${project.version}` — project fields
 /// - `${var}` — lookup in the provided `vars` map (project-level `variables`)
 /// - `${inputs.X}` — pipeline runtime variables, **left unresolved** for later substitution
+/// - `${args.X}` — declarative-tool call arguments, **left unresolved** for runtime
+/// - `${steps.<id>.output}` — output of a previous pipeline step, **left unresolved**
+///   for runtime substitution by `run_pipeline::handle`
 ///
-/// Returns the resolved string or an error for any unresolved non-`inputs.*` variable.
+/// Returns the resolved string or an error for any unresolved non-runtime variable.
 pub fn resolve_templates(
     raw: &str,
     vars: &HashMap<String, String>,
@@ -43,8 +46,12 @@ pub fn resolve_templates(
                 result.replace_range(full_match.range(), &val);
             }
             None => {
-                // ${inputs.*} and ${args.*} are kept as-is for runtime resolution.
-                if !key.starts_with("inputs.") && !key.starts_with("args.") {
+                // Runtime-resolved namespaces are kept as-is. The
+                // run_pipeline / tool-dispatch paths fill them in later.
+                if !key.starts_with("inputs.")
+                    && !key.starts_with("args.")
+                    && !key.starts_with("steps.")
+                {
                     unresolved = Some(key.to_owned());
                 }
             }
@@ -80,8 +87,9 @@ fn resolve_key(key: &str, vars: &HashMap<String, String>) -> Option<String> {
         return vars.get(&format!("project.{field}")).cloned();
     }
 
-    // Pipeline inputs and tool args are left as-is for runtime resolution.
-    if key.starts_with("inputs.") || key.starts_with("args.") {
+    // Pipeline inputs, tool args, and step-output references are left
+    // as-is for runtime resolution.
+    if key.starts_with("inputs.") || key.starts_with("args.") || key.starts_with("steps.") {
         return None;
     }
 
@@ -143,6 +151,16 @@ mod tests {
         let input = "task: ${inputs.query}";
         let result = resolve_templates(input, &vars, Path::new("test.yml")).unwrap();
         assert_eq!(result, "task: ${inputs.query}");
+    }
+
+    #[test]
+    fn leaves_step_output_refs_unresolved() {
+        // run_pipeline::handle substitutes `${steps.<id>.output}` at
+        // runtime; the parser must not error on it.
+        let vars = HashMap::new();
+        let input = "task: |\n  draft: ${steps.respond.output}\n";
+        let result = resolve_templates(input, &vars, Path::new("test.yml")).unwrap();
+        assert_eq!(result, input);
     }
 
     #[test]

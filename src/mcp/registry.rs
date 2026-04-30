@@ -25,7 +25,7 @@ use crate::events::{Event, EventKind};
 use crate::mcp::connection::{
     McpCallResult, McpError, McpServerConnection, McpServerSpec,
 };
-use crate::mcp::transport::TransportError;
+use crate::plugin::transport::TransportError;
 
 /// Catalog-id prefix that marks a tool as MCP-backed. See ADR-0023.
 pub const MCP_PREFIX: &str = "mcp__";

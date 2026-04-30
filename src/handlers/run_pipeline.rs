@@ -293,6 +293,27 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
     )
     .await;
 
+    // ADR-0021: declarative `outputs:` (e.g. http_post) subscribe to
+    // `ResponseReady`. Translate a successful pipeline's final output into
+    // that shape so connector-driven chat loops (Telegram, Slack, …) round-
+    // trip without extra glue. Internal state tracking uses
+    // `PipelineCompleted` / `WorkflowCompleted`; `ResponseReady` is purely
+    // the external contract.
+    if overall_success {
+        if let Some(content) = final_output.as_deref() {
+            emit_event(
+                rt.bus(),
+                &stream_id,
+                correlation_id,
+                EventKind::ResponseReady {
+                    conversation_id: stream_id.clone(),
+                    content: content.to_string(),
+                },
+            )
+            .await;
+        }
+    }
+
     // Matching PipelineCompleted for the local CLI marker above. The serve
     // path publishes its own PipelineCompleted at the event router level, so
     // we skip it here to avoid duplicate completions on the same stream.

@@ -2,6 +2,17 @@
 
 Date: 2026-04-19
 
+## Implementation status (2026-04-25)
+
+- **Slice 1 — `http_inbound`**: shipped. axum-based webhook receiver with bearer / HMAC-SHA256 auth (header + optional prefix, constant-time compare), `serde_json_path`-based JSONPath extract into a flat context, synthesises `UserMessageReceived`, and (when `pipeline:` is set) additionally publishes `PipelineRequested { inputs: {pipeline_input: content} }` so `zymi serve <pipeline>` picks it up without extra glue.
+- **Slice 2 — `http_post`**: shipped. Subscribes to the bus, filters on `on: [EventKind]` (accepts both `ResponseReady` and `response_ready`), renders URL / headers / `body_template` with `minijinja` over a flat `event.*` context, retries with a `backoff_secs: [...]` list, gives up without retry on 4xx.
+- **Slice 3 — `http_poll`**: shipped. Tokio-timer loop with per-connector cursor persisted to `.zymi/connectors.db` (sibling SQLite file, not the event store — cursors aren't part of the event stream). Optional `filter:` block with JSONPath → `one_of` / `equals` rules (gates the Telegram bot to a known username list). Same `pipeline:` / `pipeline_input` semantics as `http_inbound`.
+- **Slices 4-7 — cron / file / stdin / stdout / external-process plugin protocol**: still deferred; tracked as P4 in the 0.4 roadmap.
+- **Contract bridge**: `run_pipeline::handle` now publishes `ResponseReady { conversation_id, content }` on every successful pipeline with a `final_output`, so declarative `outputs:` see a stable public event regardless of internal step shape.
+- **Wiring**: `RuntimeBuilder::build_async` spawns every `connectors:` / `outputs:` entry alongside MCP; handles live on `Runtime.plugin_handles` and are drained by `Runtime::shutdown_connectors()`, called from both `zymi run` and `zymi serve` on exit. Shutdown cancels each task's token, then awaits its `JoinHandle` with a 5 s per-handle deadline — inside that budget axum (`http_inbound`) drains accepted requests, `http_post` finishes the current attempt, `http_poll` completes the current tick and persists its cursor. A handle that blows past the deadline is logged and left detached rather than wedging process exit.
+- **Rate-limit handling**: `http_post` now retries 429 separately from other 4xx, honours `Retry-After` (header and Telegram's `parameters.retry_after` body field), and clamps server hints to 300 s so a pathological `Retry-After: 86400` can't park a sink for a day.
+- **Scaffold**: `zymi init --example telegram` produces a ready-to-run Telegram chat agent (long-polling, username filter, reply via http_post) — primary demo for the declarative-extension narrative.
+
 ## Context
 
 ADR 0020 introduces `connectors:` and `outputs:` as top-level YAML sections and commits the project to declarative-first, "batteries with plugin escape hatches" philosophy. This ADR decides *how* to ship those batteries without hand-writing a Rust implementation for every conceivable integration (Telegram, Slack, Discord, Twilio, GitHub webhooks, MQTT, IMAP, Kafka, WebSocket…).

@@ -1,6 +1,6 @@
 [package]
 name = "zymi-core"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2021"
 description = "Event-sourced agent engine with boundary contracts, hash-chain audit, and declarative pipelines"
 repository = "https://github.com/metravod/zymi-core"
@@ -30,14 +30,31 @@ axum = { version = "0.7", optional = true }
 ratatui = { version = "0.29", optional = true }
 crossterm = { version = "0.28", features = ["event-stream"], optional = true }
 futures = { version = "0.3", optional = true }
+serde_json_path = { version = "0.7", optional = true }
+minijinja = { version = "2", features = ["json"], optional = true }
+hmac = { version = "0.12", optional = true }
+hex = { version = "0.4", optional = true }
+subtle = { version = "2", optional = true }
+tokio-util = { version = "0.7", features = ["rt"], optional = true }
 
 [features]
 default = []
 python = ["pyo3"]
-cli = ["clap", "runtime", "ratatui", "crossterm", "futures"]
+cli = ["clap", "runtime", "ratatui", "crossterm", "futures", "connectors"]
 runtime = ["reqwest"]
 webhook = ["axum", "runtime"]
 services = ["runtime"]
+connectors = [
+    "axum",
+    "runtime",
+    "serde_json_path",
+    "minijinja",
+    "hmac",
+    "hex",
+    "subtle",
+    "tokio-util",
+    "futures",
+]
 
 [lib]
 name = "zymi_core"

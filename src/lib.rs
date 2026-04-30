@@ -4,6 +4,8 @@ pub mod cli;
 #[cfg(feature = "runtime")]
 pub mod commands;
 pub mod config;
+#[cfg(feature = "connectors")]
+pub mod connectors;
 #[cfg(feature = "runtime")]
 pub mod engine;
 pub mod esaa;
@@ -13,6 +15,7 @@ pub mod handlers;
 pub mod mcp;
 #[cfg(feature = "runtime")]
 pub mod llm;
+pub mod plugin;
 pub mod policy;
 #[cfg(feature = "python")]
 #[allow(clippy::useless_conversion)]
@@ -47,8 +50,9 @@ pub use policy::{PolicyConfig, PolicyDecision, PolicyEngine};
 pub use config::{
     build_execution_plan, load_project_dir, AgentConfig, ConfigError, ContractsConfig,
     DefaultsConfig, ExecutionPlan, LangfuseConfig, LlmConfig, PipelineConfig, PipelineInput,
-    PipelineOutput, PipelineStep, ProjectConfig, ServicesConfig, WorkspaceConfig,
+    PipelineOutput, PipelineStep, ProjectConfig, ServicesConfig, WorkspaceConfig, SCHEMA_VERSION,
 };
+pub use plugin::{PluginBuildError, PluginBuilder, PluginRegistry};
 #[cfg(feature = "services")]
 pub use services::{
     langfuse::LangfuseService, start_configured_services, EventService, ServiceError,

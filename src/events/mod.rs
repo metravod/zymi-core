@@ -67,8 +67,14 @@ impl Event {
 }
 
 /// Domain events covering the full lifecycle of agent processing.
+///
+/// `#[non_exhaustive]`: new variants land in every plugin-expanding slice
+/// (connectors in P3, approvals in P5). External Rust consumers get the
+/// stability contract via `schema_version` in `project.yml` (ADR-0020) and
+/// must handle unknown variants at the Rust level.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
+#[non_exhaustive]
 pub enum EventKind {
     // -- Inbound --
     UserMessageReceived {
@@ -249,6 +255,31 @@ pub enum EventKind {
         parent_correlation_id: Uuid,
         fork_at_step: String,
     },
+
+    /// A declarative outbound sink (`http_post`, …) successfully delivered
+    /// an event downstream. History-only — projections don't replay
+    /// network calls, but the audit trail shows what was sent.
+    OutboundDispatched {
+        /// `name:` of the output entry in `project.yml`.
+        sink: String,
+        /// `type:` discriminator (`"http_post"`, …).
+        sink_type: String,
+        /// HTTP status (or analogous result code) the sink reported.
+        status: u16,
+        /// `kind` of the source event that triggered this dispatch.
+        triggered_by: String,
+    },
+    /// A declarative outbound sink failed to deliver. Surfaced into the
+    /// event store so users see *something* in `zymi events` / `observe`
+    /// when their bot stops talking — without this, `log::warn` lines
+    /// were the only signal and easy to miss.
+    OutboundFailed {
+        sink: String,
+        sink_type: String,
+        /// Free-form cause: render error, network, gave-up-after-N, …
+        reason: String,
+        triggered_by: String,
+    },
 }
 
 impl EventKind {
@@ -282,11 +313,14 @@ impl EventKind {
             EventKind::McpServerConnected { .. } => "mcp_server_connected",
             EventKind::McpServerDisconnected { .. } => "mcp_server_disconnected",
             EventKind::ResumeForked { .. } => "resume_forked",
+            EventKind::OutboundDispatched { .. } => "outbound_dispatched",
+            EventKind::OutboundFailed { .. } => "outbound_failed",
         }
     }
 }
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum EventStoreError {
     #[error("connection error: {0}")]
     Connection(String),
