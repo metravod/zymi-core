@@ -28,7 +28,7 @@ use std::sync::Arc;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
-use crate::approval::{ChannelHandle, TerminalApprovalChannel};
+use crate::approval::{ApprovalChannel, ChannelHandle, TerminalApprovalChannel};
 use crate::commands::RunPipeline;
 use crate::config::load_project_dir;
 use crate::handlers::run_pipeline as handler;
