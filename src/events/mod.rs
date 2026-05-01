@@ -115,13 +115,39 @@ pub enum EventKind {
         arguments: String,
         call_id: String,
     },
+    /// Human-in-the-loop approval requested. Published by the orchestrator
+    /// when an intention's verdict is `RequiresHumanApproval`. An
+    /// [`ApprovalChannel`] keyed by `channel` consumes this event and
+    /// surfaces it to a human (terminal prompt, HTTP endpoint, Telegram
+    /// message, …). The orchestrator awaits a matching
+    /// [`EventKind::ApprovalGranted`] / [`EventKind::ApprovalDenied`] on
+    /// the bus before continuing. ADR-0022.
     ApprovalRequested {
+        approval_id: String,
+        stream_id: String,
         description: String,
-        approval_id: String,
+        explanation: Option<String>,
+        /// `name:` of the `approvals:` entry expected to handle this
+        /// request. Resolved from per-pipeline → project default → fail-closed.
+        channel: String,
     },
-    ApprovalDecided {
+    /// Human approved the request. `decided_by` is a free-form channel-
+    /// supplied identifier (e.g. `"terminal"`, `"http:api-key-fp-9c2f"`,
+    /// `"telegram:@alice"`). ADR-0022.
+    ApprovalGranted {
         approval_id: String,
-        approved: bool,
+        stream_id: String,
+        decided_by: String,
+        reason: Option<String>,
+    },
+    /// Human denied the request, or the request was synthesised-denied
+    /// by the runtime (timeout, restart-timeout, misconfigured channel).
+    /// ADR-0022.
+    ApprovalDenied {
+        approval_id: String,
+        stream_id: String,
+        decided_by: String,
+        reason: Option<String>,
     },
     ToolCallCompleted {
         call_id: String,
@@ -294,7 +320,8 @@ impl EventKind {
             EventKind::LlmCallCompleted { .. } => "llm_call_completed",
             EventKind::ToolCallRequested { .. } => "tool_call_requested",
             EventKind::ApprovalRequested { .. } => "approval_requested",
-            EventKind::ApprovalDecided { .. } => "approval_decided",
+            EventKind::ApprovalGranted { .. } => "approval_granted",
+            EventKind::ApprovalDenied { .. } => "approval_denied",
             EventKind::ToolCallCompleted { .. } => "tool_call_completed",
             EventKind::IntentionEmitted { .. } => "intention_emitted",
             EventKind::IntentionEvaluated { .. } => "intention_evaluated",
@@ -609,6 +636,61 @@ mod tests {
         if let EventKind::McpServerDisconnected { server, reason } = back {
             assert_eq!(server, "github");
             assert_eq!(reason, "shutdown");
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn approval_events_serialization_roundtrip() {
+        let req = EventKind::ApprovalRequested {
+            approval_id: "appr-1".into(),
+            stream_id: "stream-1".into(),
+            description: "rm -rf /tmp/cache".into(),
+            explanation: Some("clears stale build cache".into()),
+            channel: "ops_channel".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: EventKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.tag(), "approval_requested");
+        if let EventKind::ApprovalRequested {
+            approval_id,
+            stream_id,
+            description,
+            explanation,
+            channel,
+        } = back
+        {
+            assert_eq!(approval_id, "appr-1");
+            assert_eq!(stream_id, "stream-1");
+            assert_eq!(description, "rm -rf /tmp/cache");
+            assert_eq!(explanation.as_deref(), Some("clears stale build cache"));
+            assert_eq!(channel, "ops_channel");
+        } else {
+            panic!("wrong variant");
+        }
+
+        let granted = EventKind::ApprovalGranted {
+            approval_id: "appr-1".into(),
+            stream_id: "stream-1".into(),
+            decided_by: "slack:@alice".into(),
+            reason: None,
+        };
+        let json = serde_json::to_string(&granted).unwrap();
+        let back: EventKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.tag(), "approval_granted");
+
+        let denied = EventKind::ApprovalDenied {
+            approval_id: "appr-1".into(),
+            stream_id: "stream-1".into(),
+            decided_by: "orchestrator".into(),
+            reason: Some("restart_timeout".into()),
+        };
+        let json = serde_json::to_string(&denied).unwrap();
+        let back: EventKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.tag(), "approval_denied");
+        if let EventKind::ApprovalDenied { reason, .. } = back {
+            assert_eq!(reason.as_deref(), Some("restart_timeout"));
         } else {
             panic!("wrong variant");
         }

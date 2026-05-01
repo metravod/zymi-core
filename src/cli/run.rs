@@ -53,13 +53,19 @@ pub fn exec(
 
     let rt = super::runtime();
     let _guard = rt.enter();
-    let approval_handler = rt.block_on(super::build_approval_handler(approval_mode, callback_url))?;
+    let approval = super::prepare_approval(approval_mode)?;
 
-    let runtime = rt.block_on(
-        Runtime::builder(workspace, root.to_path_buf())
-            .with_approval_handler(approval_handler)
-            .build_async(),
-    )?;
+    let mut builder = Runtime::builder(workspace, root.to_path_buf());
+    if let Some(name) = approval.channel.as_deref() {
+        builder = builder.with_approval_channel(name);
+    }
+    let runtime = rt.block_on(builder.build_async())?;
+
+    let approval_channels = rt.block_on(super::start_approval_channels(
+        approval_mode,
+        std::sync::Arc::clone(runtime.bus()),
+        callback_url,
+    ))?;
 
     let cmd = RunPipeline::new(pipeline.to_string(), inputs);
 
@@ -71,6 +77,9 @@ pub fn exec(
     // best-effort cancellation.
     rt.block_on(runtime.shutdown_connectors());
     rt.block_on(runtime.shutdown_mcp());
+    for handle in approval_channels {
+        rt.block_on(handle.shutdown());
+    }
 
     let result = result?;
 

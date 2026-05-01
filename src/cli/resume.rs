@@ -54,12 +54,19 @@ pub fn exec(
         return Ok(());
     }
 
-    let approval_handler =
-        rt.block_on(super::build_approval_handler(approval_mode, callback_url))?;
+    let approval = super::prepare_approval(approval_mode)?;
 
-    let runtime = Runtime::builder(workspace, root.to_path_buf())
-        .with_approval_handler(approval_handler)
-        .build()?;
+    let mut builder = Runtime::builder(workspace, root.to_path_buf());
+    if let Some(name) = approval.channel.as_deref() {
+        builder = builder.with_approval_channel(name);
+    }
+    let runtime = builder.build()?;
+
+    let approval_channels = rt.block_on(super::start_approval_channels(
+        approval_mode,
+        std::sync::Arc::clone(runtime.bus()),
+        callback_url,
+    ))?;
 
     let cmd = ResumePipeline {
         parent_stream_id: parent_stream.to_string(),
@@ -72,6 +79,10 @@ pub fn exec(
     print_plan(&plan, false);
 
     let outcome = rt.block_on(resume_pipeline::handle(&runtime, cmd))?;
+
+    for handle in approval_channels {
+        rt.block_on(handle.shutdown());
+    }
 
     println!("---");
     println!("New stream: {}", outcome.new_stream_id);

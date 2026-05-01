@@ -1,13 +1,39 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use uuid::Uuid;
 
-use crate::approval::ApprovalHandler;
+use crate::approval::request_approval_via_bus;
 use crate::events::bus::EventBus;
 use crate::events::{Event, EventKind};
 
 use super::contracts::ContractEngine;
 use super::{Intention, IntentionVerdict};
+
+/// Per-request configuration for human approval routing (ADR-0022).
+///
+/// Constructed by callers (`run_pipeline.rs`) from runtime config and
+/// passed through to [`Orchestrator::process_intention`]. When
+/// `channel` is `None`, a `RequiresHumanApproval` verdict resolves to
+/// [`OrchestratorResult::NoApprovalHandler`] (fail-closed).
+pub struct ApprovalContext<'a> {
+    /// Channel name to route this approval to. The orchestrator
+    /// publishes `ApprovalRequested { channel }` and awaits a matching
+    /// `ApprovalGranted` / `ApprovalDenied` from a channel plugin.
+    pub channel: Option<&'a str>,
+    /// Per-request timeout for the bus path. Used as the default
+    /// "denied on timeout" budget.
+    pub timeout: Duration,
+}
+
+impl<'a> ApprovalContext<'a> {
+    pub fn none() -> Self {
+        Self {
+            channel: None,
+            timeout: crate::approval::DEFAULT_APPROVAL_TIMEOUT,
+        }
+    }
+}
 
 /// Deterministic orchestrator for ESAA. Validates intentions through boundary
 /// contracts, handles human approval when required, emits events at each step,
@@ -43,14 +69,17 @@ impl Orchestrator {
     /// 1. Emit IntentionEmitted event
     /// 2. Evaluate against boundary contracts
     /// 3. Emit IntentionEvaluated event
-    /// 4. If RequiresHumanApproval: request approval, emit ApprovalDecided
+    /// 4. If RequiresHumanApproval: route through the configured
+    ///    [`ApprovalContext`] — either bus channel (publish-and-wait) or
+    ///    the legacy in-process handler — and emit the matching
+    ///    Approval{Requested, Granted, Denied} events.
     /// 5. Return result
     pub async fn process_intention(
         &self,
         intention: &Intention,
         stream_id: &str,
         correlation_id: Uuid,
-        approval_handler: Option<&dyn ApprovalHandler>,
+        approval: ApprovalContext<'_>,
     ) -> OrchestratorResult {
         // 1. Emit IntentionEmitted
         let intention_data = serde_json::to_string(intention).unwrap_or_default();
@@ -90,44 +119,51 @@ impl Orchestrator {
             IntentionVerdict::Approved => OrchestratorResult::Approved,
             IntentionVerdict::Denied { reason } => OrchestratorResult::Denied { reason },
             IntentionVerdict::RequiresHumanApproval { reason } => {
-                let approval_id = Uuid::new_v4().to_string();
-
-                self.emit(
-                    stream_id,
-                    correlation_id,
-                    EventKind::ApprovalRequested {
-                        description: reason.clone(),
-                        approval_id: approval_id.clone(),
-                    },
-                )
-                .await;
-
-                let approved = match approval_handler {
-                    Some(handler) => handler
-                        .request_approval(&reason, None)
-                        .await
-                        .unwrap_or(false),
-                    None => {
-                        self.emit(
-                            stream_id,
-                            correlation_id,
-                            EventKind::ApprovalDecided {
-                                approval_id,
-                                approved: false,
-                            },
-                        )
-                        .await;
-                        return OrchestratorResult::NoApprovalHandler;
-                    }
+                // ADR-0022: orchestrator publishes ApprovalRequested
+                // with the configured channel and awaits a matching
+                // ApprovalGranted / ApprovalDenied from a channel
+                // plugin. The bus helper owns publish + await + synth
+                // ApprovalDenied{timeout} on deadline; this branch
+                // emits no approval events directly.
+                let Some(channel) = approval.channel else {
+                    // Fail-closed: no channel configured. Record an
+                    // audit-trail Requested + Denied so observers see
+                    // the failure mode rather than a silent skip.
+                    let approval_id = Uuid::new_v4().to_string();
+                    self.emit(
+                        stream_id,
+                        correlation_id,
+                        EventKind::ApprovalRequested {
+                            approval_id: approval_id.clone(),
+                            stream_id: stream_id.to_string(),
+                            description: reason.clone(),
+                            explanation: None,
+                            channel: "<none>".into(),
+                        },
+                    )
+                    .await;
+                    self.emit(
+                        stream_id,
+                        correlation_id,
+                        EventKind::ApprovalDenied {
+                            approval_id,
+                            stream_id: stream_id.to_string(),
+                            decided_by: "orchestrator".into(),
+                            reason: Some("no_approval_channel".into()),
+                        },
+                    )
+                    .await;
+                    return OrchestratorResult::NoApprovalHandler;
                 };
 
-                self.emit(
+                let approved = request_approval_via_bus(
+                    self.bus.as_ref(),
                     stream_id,
                     correlation_id,
-                    EventKind::ApprovalDecided {
-                        approval_id,
-                        approved,
-                    },
+                    channel,
+                    &reason,
+                    None,
+                    approval.timeout,
                 )
                 .await;
 
@@ -196,7 +232,7 @@ mod tests {
                 },
                 "test-stream",
                 Uuid::new_v4(),
-                None,
+                ApprovalContext::none(),
             )
             .await;
 
@@ -223,7 +259,7 @@ mod tests {
                 },
                 "test-stream",
                 Uuid::new_v4(),
-                None,
+                ApprovalContext::none(),
             )
             .await;
 
@@ -250,7 +286,7 @@ mod tests {
                 },
                 "test-stream",
                 Uuid::new_v4(),
-                None,
+                ApprovalContext::none(),
             )
             .await;
 
@@ -266,7 +302,7 @@ mod tests {
         assert_eq!(e3.kind_tag(), "approval_requested");
 
         let e4 = rx.recv().await.unwrap();
-        assert_eq!(e4.kind_tag(), "approval_decided");
+        assert_eq!(e4.kind_tag(), "approval_denied");
     }
 
     #[tokio::test]
@@ -282,11 +318,129 @@ mod tests {
                 },
                 "test-stream",
                 Uuid::new_v4(),
-                None,
+                ApprovalContext::none(),
             )
             .await;
 
         assert!(matches!(result, OrchestratorResult::Denied { .. }));
+    }
+
+    /// Bus-path approval (ADR-0022): orchestrator publishes
+    /// ApprovalRequested with a channel name; a fake channel listener
+    /// publishes ApprovalGranted; orchestrator returns Approved.
+    #[tokio::test]
+    async fn requires_approval_bus_channel_grants() {
+        let (_dir, bus, contracts) = setup().await;
+        let orch = Orchestrator::new(contracts, bus.clone());
+
+        // Fake channel: subscribe, watch for ApprovalRequested with our
+        // channel name, publish a Granted decision keyed off the same
+        // approval_id.
+        let bus_for_channel = Arc::clone(&bus);
+        let channel_task = tokio::spawn(async move {
+            let mut rx = bus_for_channel.subscribe().await;
+            while let Some(ev) = rx.recv().await {
+                if let EventKind::ApprovalRequested {
+                    approval_id,
+                    stream_id,
+                    channel,
+                    ..
+                } = &ev.kind
+                {
+                    if channel == "test-channel" {
+                        let mut grant = Event::new(
+                            stream_id.clone(),
+                            EventKind::ApprovalGranted {
+                                approval_id: approval_id.clone(),
+                                stream_id: stream_id.clone(),
+                                decided_by: "test".into(),
+                                reason: None,
+                            },
+                            "approval_channel".into(),
+                        );
+                        if let Some(corr) = ev.correlation_id {
+                            grant = grant.with_correlation(corr);
+                        }
+                        bus_for_channel.publish(grant).await.unwrap();
+                        break;
+                    }
+                }
+            }
+        });
+
+        let result = orch
+            .process_intention(
+                &Intention::ExecuteShellCommand {
+                    command: "sudo reboot".into(),
+                    timeout_secs: None,
+                },
+                "test-stream",
+                Uuid::new_v4(),
+                ApprovalContext {
+                    channel: Some("test-channel"),
+                    timeout: Duration::from_secs(2),
+                },
+            )
+            .await;
+
+        assert!(matches!(result, OrchestratorResult::Approved));
+        channel_task.await.unwrap();
+    }
+
+    /// Bus-path timeout: no channel listener responds within the
+    /// timeout, helper synthesises an ApprovalDenied{reason: timeout}.
+    #[tokio::test]
+    async fn requires_approval_bus_channel_times_out() {
+        let (_dir, bus, contracts) = setup().await;
+        let orch = Orchestrator::new(contracts, bus.clone());
+        let mut rx = bus.subscribe().await;
+
+        let result = orch
+            .process_intention(
+                &Intention::ExecuteShellCommand {
+                    command: "sudo reboot".into(),
+                    timeout_secs: None,
+                },
+                "test-stream",
+                Uuid::new_v4(),
+                ApprovalContext {
+                    channel: Some("nobody-home"),
+                    timeout: Duration::from_millis(80),
+                },
+            )
+            .await;
+
+        assert!(matches!(result, OrchestratorResult::HumanRejected));
+
+        // Walk the stream looking for the synthesised denial.
+        let mut saw_requested = false;
+        let mut saw_denied_with_timeout = false;
+        for _ in 0..6 {
+            let Ok(Some(ev)) =
+                tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
+            else {
+                break;
+            };
+            match &ev.kind {
+                EventKind::ApprovalRequested { channel, .. } if channel == "nobody-home" => {
+                    saw_requested = true;
+                }
+                EventKind::ApprovalDenied { reason, .. }
+                    if reason.as_deref() == Some("timeout") =>
+                {
+                    saw_denied_with_timeout = true;
+                }
+                _ => {}
+            }
+            if saw_requested && saw_denied_with_timeout {
+                break;
+            }
+        }
+        assert!(saw_requested, "ApprovalRequested not observed");
+        assert!(
+            saw_denied_with_timeout,
+            "synthesised ApprovalDenied{{timeout}} not observed"
+        );
     }
 
     #[tokio::test]
@@ -302,7 +456,7 @@ mod tests {
                 },
                 "test-stream",
                 Uuid::new_v4(),
-                None,
+                ApprovalContext::none(),
             )
             .await;
 

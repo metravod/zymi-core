@@ -77,11 +77,7 @@ async fn serve_loop(
     approval_mode: String,
     callback_url: Option<String>,
 ) -> Result<(), String> {
-    let approval_handler = super::build_approval_handler(
-        &approval_mode,
-        callback_url.as_deref(),
-    )
-    .await?;
+    let approval = super::prepare_approval(&approval_mode)?;
 
     // Operator can override poll interval from the CLI; the rest of the
     // tail policy (batch size, catch-up cap, lag warn threshold) takes the
@@ -91,13 +87,18 @@ async fn serve_loop(
         ..TailWatcherPolicy::default()
     };
 
-    let runtime = Arc::new(
-        Runtime::builder(workspace, root.clone())
-            .with_approval_handler(Arc::clone(&approval_handler))
-            .with_tail_policy(tail_policy)
-            .build_async()
-            .await?,
-    );
+    let mut builder = Runtime::builder(workspace, root.clone()).with_tail_policy(tail_policy);
+    if let Some(name) = approval.channel.as_deref() {
+        builder = builder.with_approval_channel(name);
+    }
+    let runtime = Arc::new(builder.build_async().await?);
+
+    let approval_channels = super::start_approval_channels(
+        &approval_mode,
+        Arc::clone(runtime.bus()),
+        callback_url.as_deref(),
+    )
+    .await?;
 
     let watcher = StoreTailWatcher::new(Arc::clone(runtime.store()), Arc::clone(runtime.bus()))
         .with_policy(runtime.tail_policy().clone())
@@ -124,5 +125,8 @@ async fn serve_loop(
     watcher.stop().await;
     runtime.shutdown_connectors().await;
     runtime.shutdown_mcp().await;
+    for handle in approval_channels {
+        handle.shutdown().await;
+    }
     Ok(())
 }

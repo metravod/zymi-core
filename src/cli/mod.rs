@@ -346,32 +346,28 @@ pub(crate) fn store_path(root: &Path) -> PathBuf {
     root.join(".zymi").join("events.db")
 }
 
-/// Build an approval handler from CLI flags.
+/// Resolved approval routing for one CLI invocation (ADR-0022).
+/// Carries the configured channel name only — the channel plugin
+/// itself is started by [`start_approval_channels`] once the runtime
+/// (and therefore the bus) exists.
+pub(crate) struct ApprovalSetup {
+    pub channel: Option<String>,
+}
+
+/// Translate a `--approval=…` flag into the runtime config knobs.
 ///
-/// `--approval=terminal` (default): interactive stdin prompt.
-/// `--approval=webhook`: HTTP webhook server (requires `webhook` feature).
-pub(crate) async fn build_approval_handler(
-    mode: &str,
-    #[cfg_attr(not(feature = "webhook"), allow(unused_variables))] callback_url: Option<&str>,
-) -> Result<Arc<dyn crate::approval::ApprovalHandler>, String> {
+/// `--approval=terminal` (default) → bus channel `"terminal"`.
+/// `--approval=webhook` → bus channel `"http"` (the
+/// [`crate::webhook::HttpApprovalChannel`]).
+pub(crate) fn prepare_approval(mode: &str) -> Result<ApprovalSetup, String> {
     match mode {
-        "terminal" => Ok(Arc::new(
-            crate::approval::TerminalApprovalHandler::new(),
-        )),
+        "terminal" => Ok(ApprovalSetup {
+            channel: Some("terminal".into()),
+        }),
         #[cfg(feature = "webhook")]
-        "webhook" => {
-            let addr: std::net::SocketAddr = "127.0.0.1:0"
-                .parse()
-                .map_err(|e| format!("invalid webhook addr: {e}"))?;
-            let handler = crate::webhook::WebhookApprovalHandler::start(
-                addr,
-                std::time::Duration::from_secs(300),
-                callback_url.map(|s| s.to_string()),
-            )
-            .await
-            .map_err(|e| format!("failed to start webhook server: {e}"))?;
-            Ok(handler)
-        }
+        "webhook" => Ok(ApprovalSetup {
+            channel: Some("http".into()),
+        }),
         #[cfg(not(feature = "webhook"))]
         "webhook" => Err(
             "webhook approval requires the 'webhook' feature. \
@@ -381,6 +377,40 @@ pub(crate) async fn build_approval_handler(
         other => Err(format!(
             "unknown approval mode '{other}'. Expected 'terminal' or 'webhook'"
         )),
+    }
+}
+
+/// Spawn approval channel plugins implied by the CLI mode against the
+/// runtime bus. The returned handles must be drained with
+/// [`crate::approval::ChannelHandle::shutdown`] before process exit so
+/// `JoinHandle::abort` runs and the bus subscriber drops cleanly.
+pub(crate) async fn start_approval_channels(
+    mode: &str,
+    bus: Arc<crate::events::bus::EventBus>,
+    #[cfg_attr(not(feature = "webhook"), allow(unused_variables))] callback_url: Option<&str>,
+) -> Result<Vec<crate::approval::ChannelHandle>, String> {
+    use crate::approval::ApprovalChannel;
+    match mode {
+        "terminal" => {
+            let channel = Arc::new(crate::approval::TerminalApprovalChannel::new("terminal"));
+            let handle = channel.start(bus).await?;
+            Ok(vec![handle])
+        }
+        #[cfg(feature = "webhook")]
+        "webhook" => {
+            let bind: std::net::SocketAddr = "127.0.0.1:0"
+                .parse()
+                .map_err(|e| format!("invalid webhook addr: {e}"))?;
+            let mut config =
+                crate::webhook::HttpApprovalChannelConfig::new("http", bind);
+            if let Some(url) = callback_url {
+                config = config.with_callback_url(url);
+            }
+            let channel = Arc::new(crate::webhook::HttpApprovalChannel::new(config));
+            let handle = channel.start(bus).await?;
+            Ok(vec![handle])
+        }
+        _ => Ok(Vec::new()),
     }
 }
 

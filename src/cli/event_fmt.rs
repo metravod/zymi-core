@@ -91,7 +91,8 @@ pub fn indent_level(kind: &EventKind) -> u8 {
         | EventKind::ToolCallRequested { .. }
         | EventKind::ToolCallCompleted { .. }
         | EventKind::ApprovalRequested { .. }
-        | EventKind::ApprovalDecided { .. }
+        | EventKind::ApprovalGranted { .. }
+        | EventKind::ApprovalDenied { .. }
         | EventKind::IntentionEmitted { .. }
         | EventKind::IntentionEvaluated { .. } => 2,
     }
@@ -275,22 +276,68 @@ pub fn format_event(event: &Event) -> FormattedEvent {
             indent,
         },
 
-        EventKind::ApprovalRequested { description, approval_id } => FormattedEvent {
-            icon: "?",
-            label: "Approval".into(),
-            short_detail: truncate(description, 80).to_string(),
-            full_detail: format!("id: {approval_id}\n{description}"),
-            color: EventColor::Warning,
-            indent,
-        },
-        EventKind::ApprovalDecided { approved, approval_id } => FormattedEvent {
-            icon: if *approved { "✓" } else { "✗" },
-            label: "Decision".into(),
-            short_detail: if *approved { "approved".into() } else { "rejected".into() },
-            full_detail: format!("id: {approval_id}\napproved: {approved}"),
-            color: if *approved { EventColor::Success } else { EventColor::Failure },
-            indent,
-        },
+        EventKind::ApprovalRequested {
+            description,
+            approval_id,
+            channel,
+            explanation,
+            ..
+        } => {
+            let mut full = format!("id: {approval_id}\nchannel: {channel}\n{description}");
+            if let Some(why) = explanation {
+                full.push_str(&format!("\nexplanation: {why}"));
+            }
+            FormattedEvent {
+                icon: "?",
+                label: "Approval".into(),
+                short_detail: format!("{}: {}", channel, truncate(description, 70)),
+                full_detail: full,
+                color: EventColor::Warning,
+                indent,
+            }
+        }
+        EventKind::ApprovalGranted {
+            approval_id,
+            decided_by,
+            reason,
+            ..
+        } => {
+            let mut full = format!("id: {approval_id}\ndecided_by: {decided_by}");
+            if let Some(r) = reason {
+                full.push_str(&format!("\nreason: {r}"));
+            }
+            FormattedEvent {
+                icon: "✓",
+                label: "Approved".into(),
+                short_detail: format!("by {decided_by}"),
+                full_detail: full,
+                color: EventColor::Success,
+                indent,
+            }
+        }
+        EventKind::ApprovalDenied {
+            approval_id,
+            decided_by,
+            reason,
+            ..
+        } => {
+            let mut full = format!("id: {approval_id}\ndecided_by: {decided_by}");
+            if let Some(r) = reason {
+                full.push_str(&format!("\nreason: {r}"));
+            }
+            let short = match reason {
+                Some(r) => format!("by {decided_by}: {}", truncate(r, 60)),
+                None => format!("by {decided_by}"),
+            };
+            FormattedEvent {
+                icon: "✗",
+                label: "Denied".into(),
+                short_detail: short,
+                full_detail: full,
+                color: EventColor::Failure,
+                indent,
+            }
+        }
 
         EventKind::IntentionEmitted { intention_tag, intention_data } => FormattedEvent {
             icon: "!",

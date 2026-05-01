@@ -1,133 +1,275 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
+use uuid::Uuid;
 
+use crate::events::bus::EventBus;
+use crate::events::{Event, EventKind};
+
+/// Default per-request timeout when no explicit value is configured.
+/// Five minutes is a deliberate pessimism: enough for an operator to
+/// switch terminals or read a Telegram message, short enough that a
+/// forgotten approval doesn't pin a stream forever.
+pub const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// An approval channel plugin (ADR-0022). Channels subscribe to the
+/// event bus, filter [`EventKind::ApprovalRequested`] by their `name`,
+/// surface the request to a human (terminal prompt, HTTP endpoint,
+/// Telegram message, …), and publish [`EventKind::ApprovalGranted`] /
+/// [`EventKind::ApprovalDenied`] back onto the bus with the same
+/// `approval_id`. The orchestrator never talks to a channel directly —
+/// its only contract is the bus.
 #[async_trait]
-pub trait ApprovalHandler: Send + Sync {
-    async fn request_approval(
-        &self,
-        tool_description: &str,
-        explanation: Option<&str>,
-    ) -> Result<bool, String>;
+pub trait ApprovalChannel: Send + Sync {
+    /// Channel name, matched against [`EventKind::ApprovalRequested::channel`].
+    fn name(&self) -> &str;
+    /// Spawn the channel's bus listener. Implementations must subscribe
+    /// before returning so a request published immediately after start
+    /// is not missed. Returns a [`ChannelHandle`] used for shutdown.
+    async fn start(self: Arc<Self>, bus: Arc<EventBus>) -> Result<ChannelHandle, String>;
 }
 
-/// A shared slot for the current approval handler.
-/// Connectors set it before calling agent.process_stream() and clear it after.
-/// Sub-agents read from this slot to get shell approval capability.
-pub type SharedApprovalHandler = Arc<tokio::sync::RwLock<Option<Arc<dyn ApprovalHandler>>>>;
-
-pub fn new_shared_approval_handler() -> SharedApprovalHandler {
-    Arc::new(tokio::sync::RwLock::new(None))
-}
-
-/// RAII guard that sets a handler into the shared slot on creation
-/// and clears it on drop — even if the owner panics.
-pub struct ApprovalSlotGuard {
-    slot: SharedApprovalHandler,
-}
-
-impl ApprovalSlotGuard {
-    pub async fn set(slot: SharedApprovalHandler, handler: Arc<dyn ApprovalHandler>) -> Self {
-        {
-            let mut s = slot.write().await;
-            *s = Some(handler);
-        }
-        Self { slot }
-    }
-}
-
-impl Drop for ApprovalSlotGuard {
-    fn drop(&mut self) {
-        if let Ok(mut s) = self.slot.try_write() {
-            *s = None;
-        } else {
-            let slot = self.slot.clone();
-            tokio::spawn(async move {
-                let mut s = slot.write().await;
-                *s = None;
-            });
-        }
-    }
-}
-
-/// Wraps an inner `ApprovalHandler`, prepending context (e.g. sub-agent name)
-/// to the tool description shown to the user.
-pub struct ContextualApprovalHandler {
-    inner: Arc<dyn ApprovalHandler>,
-    context: String,
-}
-
-impl ContextualApprovalHandler {
-    pub fn new(inner: Arc<dyn ApprovalHandler>, context: String) -> Self {
-        Self { inner, context }
-    }
-}
-
-#[async_trait]
-impl ApprovalHandler for ContextualApprovalHandler {
-    async fn request_approval(
-        &self,
-        tool_description: &str,
-        explanation: Option<&str>,
-    ) -> Result<bool, String> {
-        let prefixed = format!("[{}] {}", self.context, tool_description);
-        self.inner.request_approval(&prefixed, explanation).await
-    }
-}
-
-/// Terminal-based [`ApprovalHandler`] for interactive operators.
+/// Handle to a running [`ApprovalChannel`]. Holds every tokio task the
+/// channel spawned (bus listener, optional axum server, etc.) so
+/// [`ChannelHandle::shutdown`] can abort all of them in one call.
 ///
-/// Prompts on stdout / reads y/N from stdin. Used by `zymi run`,
-/// `zymi serve`, and the Python `Runtime` binding when
-/// `approval="terminal"` (the default). Lives at the root of the
-/// approval module so it is available to any caller that enables the
-/// `runtime` feature, not just the `cli` feature.
-///
-/// The blocking IO runs inside [`tokio::task::spawn_blocking`] so the
-/// runtime is not stalled, and a [`tokio::sync::Mutex`] serialises
-/// prompts across parallel agent steps so concurrent loops do not
-/// interleave on the terminal.
-///
-/// Default policy on EOF / non-tty / IO error: **deny**. If we cannot
-/// ask the human, we do not approve — that is the whole point of
-/// having a handler in the first place.
-pub struct TerminalApprovalHandler {
-    /// Serialises prompts so parallel agent steps don't interleave
-    /// their questions on the terminal.
-    lock: tokio::sync::Mutex<()>,
+/// Shutdown is implemented via [`tokio::task::JoinHandle::abort`] —
+/// approval channels are I/O-bounded loops with no cleanup beyond
+/// dropping their bus subscriber, so abort is safe and avoids pulling
+/// `tokio-util` (which is gated behind the `connectors` feature) into
+/// the approval surface.
+pub struct ChannelHandle {
+    pub name: String,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
-impl TerminalApprovalHandler {
-    pub fn new() -> Self {
+impl ChannelHandle {
+    pub fn from_task(name: impl Into<String>, task: tokio::task::JoinHandle<()>) -> Self {
         Self {
-            lock: tokio::sync::Mutex::new(()),
+            name: name.into(),
+            tasks: vec![task],
+        }
+    }
+
+    pub fn from_tasks(
+        name: impl Into<String>,
+        tasks: Vec<tokio::task::JoinHandle<()>>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            tasks,
+        }
+    }
+
+    /// Abort every task without awaiting. Suitable for synchronous
+    /// drop paths (see [`crate::python::py_runtime::PyRuntime::drop`]).
+    pub fn abort_all(&self) {
+        for t in &self.tasks {
+            t.abort();
+        }
+    }
+
+    /// Abort every task and await all join handles. Use this from
+    /// `async` shutdown paths (CLI entrypoints) so the bus subscriber
+    /// drops cleanly before process exit.
+    pub async fn shutdown(self) {
+        for t in &self.tasks {
+            t.abort();
+        }
+        for t in self.tasks {
+            let _ = t.await;
         }
     }
 }
 
-impl Default for TerminalApprovalHandler {
-    fn default() -> Self {
-        Self::new()
+/// Publish [`EventKind::ApprovalRequested`] on `bus` with the given
+/// channel routing, then await a matching
+/// [`EventKind::ApprovalGranted`] / [`EventKind::ApprovalDenied`]
+/// (filtered by `correlation_id`) until `timeout` elapses.
+///
+/// On timeout (or bus closure), synthesises an
+/// `ApprovalDenied { reason: "timeout" }` so the audit trail records
+/// the fail-closed decision and returns `false`. The caller is the
+/// orchestrator — channel plugins on the bus are what actually drive
+/// the human surface.
+pub async fn request_approval_via_bus(
+    bus: &EventBus,
+    stream_id: &str,
+    correlation_id: Uuid,
+    channel: &str,
+    description: &str,
+    explanation: Option<&str>,
+    timeout: Duration,
+) -> bool {
+    let approval_id = Uuid::new_v4().to_string();
+
+    // Subscribe BEFORE publishing — otherwise a synchronous channel
+    // could publish the decision before we attach.
+    let mut rx = bus.subscribe_correlation(correlation_id).await;
+
+    let request = Event::new(
+        stream_id.to_string(),
+        EventKind::ApprovalRequested {
+            approval_id: approval_id.clone(),
+            stream_id: stream_id.to_string(),
+            description: description.to_string(),
+            explanation: explanation.map(|s| s.to_string()),
+            channel: channel.to_string(),
+        },
+        "orchestrator".into(),
+    )
+    .with_correlation(correlation_id);
+
+    if let Err(e) = bus.publish(request).await {
+        log::warn!("approval request publish failed: {e}");
+        return false;
+    }
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Some(ev)) => match &ev.kind {
+                EventKind::ApprovalGranted { approval_id: aid, .. } if aid == &approval_id => {
+                    return true;
+                }
+                EventKind::ApprovalDenied { approval_id: aid, .. } if aid == &approval_id => {
+                    return false;
+                }
+                _ => continue,
+            },
+            // bus subscription closed
+            Ok(None) => break,
+            // outer timeout fired
+            Err(_) => break,
+        }
+    }
+
+    // Timed out or bus closed. Synthesise a denial so observers see
+    // *something* in the audit trail and the orchestrator's
+    // OrchestratorResult line up with the published decision.
+    let denied = Event::new(
+        stream_id.to_string(),
+        EventKind::ApprovalDenied {
+            approval_id,
+            stream_id: stream_id.to_string(),
+            decided_by: "orchestrator".into(),
+            reason: Some("timeout".into()),
+        },
+        "orchestrator".into(),
+    )
+    .with_correlation(correlation_id);
+    if let Err(e) = bus.publish(denied).await {
+        log::warn!("approval timeout publish failed: {e}");
+    }
+    false
+}
+
+/// Terminal-driven [`ApprovalChannel`] (ADR-0022). Subscribes to the
+/// event bus, picks up [`EventKind::ApprovalRequested`] addressed to
+/// this channel, prompts on stdin (serialised across requests so
+/// concurrent agents don't garble the prompt), and publishes
+/// [`EventKind::ApprovalGranted`] / [`EventKind::ApprovalDenied`] back
+/// onto the bus.
+///
+/// Default channel when `approvals:` is absent from `project.yml` and
+/// stdin is attached — preserves the zero-config UX of the previous
+/// `TerminalApprovalHandler`.
+pub struct TerminalApprovalChannel {
+    name: String,
+    /// Serialises blocking prompts so two concurrent requests don't
+    /// interleave their output on the terminal.
+    lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl TerminalApprovalChannel {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+        }
     }
 }
 
 #[async_trait]
-impl ApprovalHandler for TerminalApprovalHandler {
-    async fn request_approval(
-        &self,
-        tool_description: &str,
-        explanation: Option<&str>,
-    ) -> Result<bool, String> {
-        let _guard = self.lock.lock().await;
+impl ApprovalChannel for TerminalApprovalChannel {
+    fn name(&self) -> &str {
+        &self.name
+    }
 
-        let description = tool_description.to_string();
-        let explanation = explanation.map(|s| s.to_string());
+    async fn start(self: Arc<Self>, bus: Arc<EventBus>) -> Result<ChannelHandle, String> {
+        let mut rx = bus.subscribe().await;
+        let channel_name = self.name.clone();
+        let lock = Arc::clone(&self.lock);
 
-        tokio::task::spawn_blocking(move || {
-            terminal_prompt_blocking(&description, explanation.as_deref())
-        })
-        .await
-        .map_err(|e| format!("approval prompt task failed: {e}"))?
+        let join = tokio::spawn(async move {
+            while let Some(ev) = rx.recv().await {
+                let EventKind::ApprovalRequested {
+                    approval_id,
+                    stream_id,
+                    description,
+                    explanation,
+                    channel,
+                } = &ev.kind
+                else {
+                    continue;
+                };
+                if channel != &channel_name {
+                    continue;
+                }
+
+                let description = description.clone();
+                let explanation = explanation.clone();
+                let approval_id = approval_id.clone();
+                let stream_id_owned = stream_id.clone();
+                let correlation_id = ev.correlation_id;
+                let lock = Arc::clone(&lock);
+                let bus = Arc::clone(&bus);
+                let channel_name_owned = channel_name.clone();
+
+                // Each request runs on its own task so a slow human
+                // typing at the prompt can't pin the bus subscriber.
+                tokio::spawn(async move {
+                    let _guard = lock.lock().await;
+                    let approved = tokio::task::spawn_blocking(move || {
+                        terminal_prompt_blocking(&description, explanation.as_deref())
+                            .unwrap_or(false)
+                    })
+                    .await
+                    .unwrap_or(false);
+
+                    let decision = if approved {
+                        EventKind::ApprovalGranted {
+                            approval_id,
+                            stream_id: stream_id_owned.clone(),
+                            decided_by: format!("terminal:{channel_name_owned}"),
+                            reason: None,
+                        }
+                    } else {
+                        EventKind::ApprovalDenied {
+                            approval_id,
+                            stream_id: stream_id_owned.clone(),
+                            decided_by: format!("terminal:{channel_name_owned}"),
+                            reason: None,
+                        }
+                    };
+                    let mut decision_event =
+                        Event::new(stream_id_owned, decision, "approval_channel".into());
+                    if let Some(corr) = correlation_id {
+                        decision_event = decision_event.with_correlation(corr);
+                    }
+                    if let Err(e) = bus.publish(decision_event).await {
+                        log::warn!("terminal approval decision publish failed: {e}");
+                    }
+                });
+            }
+        });
+
+        Ok(ChannelHandle::from_task(self.name.clone(), join))
     }
 }
 
@@ -165,85 +307,61 @@ fn terminal_prompt_blocking(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use crate::events::store::SqliteEventStore;
+    use tempfile::TempDir;
 
-    struct MockApprovalHandler {
-        approved: bool,
-        last_description: tokio::sync::Mutex<String>,
-    }
+    /// `request_approval_via_bus` returns `true` when a Granted event
+    /// matching the approval_id arrives, even when other unrelated
+    /// events show up in between.
+    #[tokio::test]
+    async fn request_via_bus_returns_true_on_grant() {
+        let dir = TempDir::new().unwrap();
+        let store =
+            Arc::new(SqliteEventStore::new(&dir.path().join("approval_bus.db")).unwrap());
+        let bus = Arc::new(EventBus::new(store));
 
-    impl MockApprovalHandler {
-        fn new(approved: bool) -> Self {
-            Self {
-                approved,
-                last_description: tokio::sync::Mutex::new(String::new()),
+        let stream_id = "stream-1".to_string();
+        let correlation_id = Uuid::new_v4();
+        let bus_for_listener = Arc::clone(&bus);
+        let listener = tokio::spawn(async move {
+            let mut rx = bus_for_listener.subscribe().await;
+            while let Some(ev) = rx.recv().await {
+                if let EventKind::ApprovalRequested {
+                    approval_id,
+                    stream_id,
+                    ..
+                } = &ev.kind
+                {
+                    let mut grant = Event::new(
+                        stream_id.clone(),
+                        EventKind::ApprovalGranted {
+                            approval_id: approval_id.clone(),
+                            stream_id: stream_id.clone(),
+                            decided_by: "test".into(),
+                            reason: None,
+                        },
+                        "approval_channel".into(),
+                    );
+                    if let Some(corr) = ev.correlation_id {
+                        grant = grant.with_correlation(corr);
+                    }
+                    bus_for_listener.publish(grant).await.unwrap();
+                    break;
+                }
             }
-        }
-    }
-
-    #[async_trait]
-    impl ApprovalHandler for MockApprovalHandler {
-        async fn request_approval(
-            &self,
-            tool_description: &str,
-            _explanation: Option<&str>,
-        ) -> Result<bool, String> {
-            *self.last_description.lock().await = tool_description.to_string();
-            Ok(self.approved)
-        }
-    }
-
-    #[tokio::test]
-    async fn guard_sets_and_clears_slot() {
-        let slot = new_shared_approval_handler();
-        assert!(slot.read().await.is_none());
-
-        let handler: Arc<dyn ApprovalHandler> = Arc::new(MockApprovalHandler::new(true));
-        {
-            let _guard = ApprovalSlotGuard::set(slot.clone(), handler).await;
-            assert!(slot.read().await.is_some());
-        }
-        // guard dropped — slot should be cleared
-        assert!(slot.read().await.is_none());
-    }
-
-    #[tokio::test]
-    async fn guard_clears_on_panic() {
-        let slot = new_shared_approval_handler();
-        let handler: Arc<dyn ApprovalHandler> = Arc::new(MockApprovalHandler::new(true));
-        let cleared = Arc::new(AtomicBool::new(false));
-
-        let slot_clone = slot.clone();
-        let cleared_clone = cleared.clone();
-        let result = std::panic::AssertUnwindSafe(async {
-            let _guard = ApprovalSlotGuard::set(slot_clone, handler).await;
-            panic!("test panic");
         });
 
-        let _ = tokio::task::spawn(async move {
-            let _ = futures::FutureExt::catch_unwind(result).await;
-            cleared_clone.store(true, Ordering::SeqCst);
-        })
+        let approved = request_approval_via_bus(
+            bus.as_ref(),
+            &stream_id,
+            correlation_id,
+            "test-channel",
+            "do the thing",
+            None,
+            Duration::from_secs(2),
+        )
         .await;
-
-        assert!(cleared.load(Ordering::SeqCst));
-        // After panic + drop, slot should be cleared
-        assert!(slot.read().await.is_none());
-    }
-
-    #[tokio::test]
-    async fn contextual_handler_prepends_context() {
-        let inner = Arc::new(MockApprovalHandler::new(true));
-        let handler = ContextualApprovalHandler::new(inner.clone(), "my-agent".to_string());
-
-        let result = handler
-            .request_approval("run shell command", None)
-            .await
-            .unwrap();
-        assert!(result);
-        assert_eq!(
-            *inner.last_description.lock().await,
-            "[my-agent] run shell command"
-        );
+        assert!(approved);
+        listener.await.unwrap();
     }
 }

@@ -28,7 +28,7 @@ use std::sync::Arc;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
-use crate::approval::{ApprovalHandler, TerminalApprovalHandler};
+use crate::approval::{ChannelHandle, TerminalApprovalChannel};
 use crate::commands::RunPipeline;
 use crate::config::load_project_dir;
 use crate::handlers::run_pipeline as handler;
@@ -102,6 +102,18 @@ impl PyRunPipelineResult {
 #[pyclass(name = "Runtime")]
 pub struct PyRuntime {
     inner: Arc<Runtime>,
+    /// Approval channel listener tasks bound to this runtime's bus
+    /// (ADR-0022). Aborted when the [`PyRuntime`] is dropped so
+    /// long-lived Python sessions don't leak terminal-prompt loops.
+    approval_channels: Vec<ChannelHandle>,
+}
+
+impl Drop for PyRuntime {
+    fn drop(&mut self) {
+        for handle in self.approval_channels.drain(..) {
+            handle.abort_all();
+        }
+    }
 }
 
 #[pymethods]
@@ -137,10 +149,11 @@ impl PyRuntime {
 
         let _guard = shared_tokio().enter();
         let mut builder = Runtime::builder(workspace, root);
+        let mut want_terminal_channel = false;
         match approval {
             "terminal" => {
-                let handler: Arc<dyn ApprovalHandler> = Arc::new(TerminalApprovalHandler::new());
-                builder = builder.with_approval_handler(handler);
+                builder = builder.with_approval_channel("terminal");
+                want_terminal_channel = true;
             }
             "none" => {}
             other => {
@@ -154,8 +167,19 @@ impl PyRuntime {
             .build()
             .map_err(|e| PyRuntimeError::new_err(format!("failed to build runtime: {e}")))?;
 
+        let mut approval_channels: Vec<ChannelHandle> = Vec::new();
+        if want_terminal_channel {
+            let bus = Arc::clone(runtime.bus());
+            let channel = Arc::new(TerminalApprovalChannel::new("terminal"));
+            let handle = shared_tokio()
+                .block_on(channel.start(bus))
+                .map_err(|e| PyRuntimeError::new_err(format!("failed to start terminal approval channel: {e}")))?;
+            approval_channels.push(handle);
+        }
+
         Ok(Self {
             inner: Arc::new(runtime),
+            approval_channels,
         })
     }
 
