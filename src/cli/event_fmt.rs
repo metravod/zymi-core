@@ -91,7 +91,8 @@ pub fn indent_level(kind: &EventKind) -> u8 {
         | EventKind::ToolCallRequested { .. }
         | EventKind::ToolCallCompleted { .. }
         | EventKind::ApprovalRequested { .. }
-        | EventKind::ApprovalDecided { .. }
+        | EventKind::ApprovalGranted { .. }
+        | EventKind::ApprovalDenied { .. }
         | EventKind::IntentionEmitted { .. }
         | EventKind::IntentionEvaluated { .. } => 2,
     }
@@ -275,22 +276,68 @@ pub fn format_event(event: &Event) -> FormattedEvent {
             indent,
         },
 
-        EventKind::ApprovalRequested { description, approval_id } => FormattedEvent {
-            icon: "?",
-            label: "Approval".into(),
-            short_detail: truncate(description, 80).to_string(),
-            full_detail: format!("id: {approval_id}\n{description}"),
-            color: EventColor::Warning,
-            indent,
-        },
-        EventKind::ApprovalDecided { approved, approval_id } => FormattedEvent {
-            icon: if *approved { "✓" } else { "✗" },
-            label: "Decision".into(),
-            short_detail: if *approved { "approved".into() } else { "rejected".into() },
-            full_detail: format!("id: {approval_id}\napproved: {approved}"),
-            color: if *approved { EventColor::Success } else { EventColor::Failure },
-            indent,
-        },
+        EventKind::ApprovalRequested {
+            description,
+            approval_id,
+            channel,
+            explanation,
+            ..
+        } => {
+            let mut full = format!("id: {approval_id}\nchannel: {channel}\n{description}");
+            if let Some(why) = explanation {
+                full.push_str(&format!("\nexplanation: {why}"));
+            }
+            FormattedEvent {
+                icon: "?",
+                label: "Approval".into(),
+                short_detail: format!("{}: {}", channel, truncate(description, 70)),
+                full_detail: full,
+                color: EventColor::Warning,
+                indent,
+            }
+        }
+        EventKind::ApprovalGranted {
+            approval_id,
+            decided_by,
+            reason,
+            ..
+        } => {
+            let mut full = format!("id: {approval_id}\ndecided_by: {decided_by}");
+            if let Some(r) = reason {
+                full.push_str(&format!("\nreason: {r}"));
+            }
+            FormattedEvent {
+                icon: "✓",
+                label: "Approved".into(),
+                short_detail: format!("by {decided_by}"),
+                full_detail: full,
+                color: EventColor::Success,
+                indent,
+            }
+        }
+        EventKind::ApprovalDenied {
+            approval_id,
+            decided_by,
+            reason,
+            ..
+        } => {
+            let mut full = format!("id: {approval_id}\ndecided_by: {decided_by}");
+            if let Some(r) = reason {
+                full.push_str(&format!("\nreason: {r}"));
+            }
+            let short = match reason {
+                Some(r) => format!("by {decided_by}: {}", truncate(r, 60)),
+                None => format!("by {decided_by}"),
+            };
+            FormattedEvent {
+                icon: "✗",
+                label: "Denied".into(),
+                short_detail: short,
+                full_detail: full,
+                color: EventColor::Failure,
+                indent,
+            }
+        }
 
         EventKind::IntentionEmitted { intention_tag, intention_data } => FormattedEvent {
             icon: "!",
@@ -458,5 +505,85 @@ pub fn truncate(s: &str, max: usize) -> &str {
     } else {
         let end = s.floor_char_boundary(max);
         &s[..end]
+    }
+}
+
+#[cfg(test)]
+mod approval_render_tests {
+    //! Lock down the operator-facing rendering of approval events
+    //! (ADR-0022 sub-8). `zymi runs` and the observe TUI both call
+    //! [`format_event`], so testing it covers both surfaces.
+    use super::*;
+    use crate::events::{Event, EventKind};
+
+    fn req(channel: &str) -> Event {
+        Event::new(
+            "stream-1".into(),
+            EventKind::ApprovalRequested {
+                approval_id: "a-1".into(),
+                stream_id: "stream-1".into(),
+                description: "delete /etc/passwd".into(),
+                explanation: Some("matches deny pattern".into()),
+                channel: channel.into(),
+            },
+            "orchestrator".into(),
+        )
+    }
+
+    #[test]
+    fn approval_requested_renders_as_warning_with_channel() {
+        let f = format_event(&req("ops_tg"));
+        assert_eq!(f.label, "Approval");
+        assert!(matches!(f.color, EventColor::Warning));
+        assert!(f.short_detail.starts_with("ops_tg:"));
+        assert!(f.full_detail.contains("id: a-1"));
+        assert!(f.full_detail.contains("channel: ops_tg"));
+        assert!(f.full_detail.contains("explanation: matches deny pattern"));
+    }
+
+    #[test]
+    fn approval_granted_renders_as_success_with_decided_by() {
+        let ev = Event::new(
+            "stream-1".into(),
+            EventKind::ApprovalGranted {
+                approval_id: "a-1".into(),
+                stream_id: "stream-1".into(),
+                decided_by: "telegram:alice".into(),
+                reason: None,
+            },
+            "channel".into(),
+        );
+        let f = format_event(&ev);
+        assert_eq!(f.label, "Approved");
+        assert!(matches!(f.color, EventColor::Success));
+        assert_eq!(f.short_detail, "by telegram:alice");
+    }
+
+    /// Surface the `restart_timeout` reason produced by replay sub-7
+    /// so operators see why an approval was sealed across a crash.
+    #[test]
+    fn approval_denied_restart_timeout_surfaced_in_short_detail() {
+        let ev = Event::new(
+            "stream-1".into(),
+            EventKind::ApprovalDenied {
+                approval_id: "a-1".into(),
+                stream_id: "stream-1".into(),
+                decided_by: "orchestrator".into(),
+                reason: Some("restart_timeout".into()),
+            },
+            "orchestrator".into(),
+        );
+        let f = format_event(&ev);
+        assert_eq!(f.label, "Denied");
+        assert!(matches!(f.color, EventColor::Failure));
+        assert!(f.short_detail.contains("restart_timeout"));
+        assert!(f.full_detail.contains("reason: restart_timeout"));
+    }
+
+    /// Approval events must indent under the parent intention/tool so the
+    /// TUI tree shows the human-decision sub-flow.
+    #[test]
+    fn approval_events_indented_for_tui_tree() {
+        assert_eq!(format_event(&req("terminal")).indent, 2);
     }
 }

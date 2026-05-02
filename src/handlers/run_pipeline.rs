@@ -26,7 +26,6 @@ use std::time::Instant;
 
 use uuid::Uuid;
 
-use crate::approval::ApprovalHandler;
 use crate::commands::RunPipeline;
 use crate::config::AgentConfig;
 use crate::engine::tools::{new_memory_store, MemoryStore};
@@ -213,7 +212,14 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
             let stream_id = stream_id.clone();
             let project_root = rt.project_root().to_path_buf();
             let defaults = workspace.project.defaults.clone();
-            let approval_handler = rt.approval_handler().cloned();
+            // ADR-0022 §"Resolution order": pipeline override beats the
+            // runtime-wide default, which itself is the project default
+            // resolved at CLI startup.
+            let approval_channel = crate::approval::resolve_channel(
+                pipeline.approval_channel.as_deref(),
+                rt.approval_channel(),
+            );
+            let approval_timeout = rt.approval_timeout();
             let context_config: ContextConfig = workspace
                 .project
                 .runtime
@@ -238,7 +244,8 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
                     correlation_id,
                     &project_root,
                     defaults.max_iterations,
-                    approval_handler,
+                    approval_channel,
+                    approval_timeout,
                     context_config,
                 )
                 .await
@@ -369,7 +376,8 @@ async fn run_agent_step(
     correlation_id: Uuid,
     project_root: &std::path::Path,
     default_max_iterations: usize,
-    approval_handler: Option<Arc<dyn ApprovalHandler>>,
+    approval_channel: Option<String>,
+    approval_timeout: std::time::Duration,
     context_config: ContextConfig,
 ) -> Result<StepResult, String> {
     let max_iterations = agent.max_iterations.unwrap_or(default_max_iterations);
@@ -539,7 +547,10 @@ async fn run_agent_step(
                             &intention,
                             stream_id,
                             correlation_id,
-                            approval_handler.as_deref(),
+                            crate::esaa::orchestrator::ApprovalContext {
+                                channel: approval_channel.as_deref(),
+                                timeout: approval_timeout,
+                            },
                         )
                         .await;
 

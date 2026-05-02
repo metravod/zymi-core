@@ -62,6 +62,21 @@ pub struct ProjectConfig {
     #[serde(default)]
     #[schemars(skip)]
     pub outputs: Vec<serde_yml::Value>,
+    /// Approval channels (ADR-0022). Each entry is dispatched at runtime
+    /// by the `ApprovalChannel` plugin registry: terminal prompt, HTTP
+    /// endpoint, Telegram bot, etc. Stored as raw YAML so this crate
+    /// can parse projects without pulling in webhook/connectors deps.
+    #[serde(default)]
+    #[schemars(skip)]
+    pub approvals: Vec<serde_yml::Value>,
+    /// Project-wide default approval channel name (ADR-0022 §"Resolution
+    /// order"). Used when a pipeline does not declare its own
+    /// `approval_channel:`. `None` means: if `--approval=` is also
+    /// unset and no `approvals:` section is configured, the runtime
+    /// auto-spawns a terminal channel when stdin is attached
+    /// (zero-config UX); otherwise the orchestrator fail-closes.
+    #[serde(default)]
+    pub default_approval_channel: Option<String>,
 }
 
 /// One entry in the top-level `mcp_servers:` list (ADR-0023).
@@ -749,6 +764,43 @@ outputs:
         let config = load_project(&path).unwrap();
         assert!(config.connectors.is_empty());
         assert!(config.outputs.is_empty());
+    }
+
+    #[test]
+    fn project_with_approvals_section_parses_raw() {
+        let dir = TempDir::new().unwrap();
+        let yaml = r#"
+name: ops
+default_approval_channel: ops_slack
+approvals:
+  - type: terminal
+    name: local
+  - type: http
+    name: ops_api
+    bind: "127.0.0.1:8081"
+    bearer_token: "${env.APPROVAL_TOKEN}"
+"#;
+        unsafe { std::env::set_var("APPROVAL_TOKEN", "tok-1") };
+        let path = write_file(&dir, "project.yml", yaml);
+        let config = load_project(&path).unwrap();
+        unsafe { std::env::remove_var("APPROVAL_TOKEN") };
+
+        assert_eq!(config.default_approval_channel.as_deref(), Some("ops_slack"));
+        assert_eq!(config.approvals.len(), 2);
+        let first = config.approvals[0].as_mapping().unwrap();
+        assert_eq!(
+            first.get(serde_yml::Value::String("name".into())).and_then(|v| v.as_str()),
+            Some("local")
+        );
+    }
+
+    #[test]
+    fn project_without_approvals_defaults_empty_and_no_default_channel() {
+        let dir = TempDir::new().unwrap();
+        let path = write_file(&dir, "project.yml", "name: t\n");
+        let config = load_project(&path).unwrap();
+        assert!(config.approvals.is_empty());
+        assert!(config.default_approval_channel.is_none());
     }
 
     #[test]

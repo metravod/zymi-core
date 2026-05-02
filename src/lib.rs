@@ -29,7 +29,7 @@ pub mod services;
 pub mod webhook;
 
 // Re-export core types at crate root for convenience
-pub use approval::{ApprovalHandler, SharedApprovalHandler};
+pub use approval::{ApprovalChannel, ChannelHandle, TerminalApprovalChannel};
 pub use esaa::{
     contracts::{ContractEngine, FileWriteContract, RateLimitConfig},
     orchestrator::{Orchestrator, OrchestratorResult},

@@ -9,7 +9,7 @@ use crate::runtime::Runtime;
 pub fn exec(
     pipeline: &str,
     raw_inputs: &[String],
-    approval_mode: &str,
+    approval_mode: Option<&str>,
     callback_url: Option<&str>,
     root: impl AsRef<Path>,
 ) -> Result<(), String> {
@@ -53,13 +53,22 @@ pub fn exec(
 
     let rt = super::runtime();
     let _guard = rt.enter();
-    let approval_handler = rt.block_on(super::build_approval_handler(approval_mode, callback_url))?;
 
-    let runtime = rt.block_on(
-        Runtime::builder(workspace, root.to_path_buf())
-            .with_approval_handler(approval_handler)
-            .build_async(),
-    )?;
+    let default_channel = super::pre_resolve_approval(approval_mode, &workspace.project);
+    let project_for_spawn = workspace.project.clone();
+
+    let mut builder = Runtime::builder(workspace, root.to_path_buf());
+    if let Some(name) = default_channel.as_deref() {
+        builder = builder.with_approval_channel(name);
+    }
+    let runtime = rt.block_on(builder.build_async())?;
+
+    let approval_channels = rt.block_on(super::start_approval_channels(
+        approval_mode,
+        &project_for_spawn,
+        std::sync::Arc::clone(runtime.bus()),
+        callback_url,
+    ))?;
 
     let cmd = RunPipeline::new(pipeline.to_string(), inputs);
 
@@ -71,6 +80,9 @@ pub fn exec(
     // best-effort cancellation.
     rt.block_on(runtime.shutdown_connectors());
     rt.block_on(runtime.shutdown_mcp());
+    for handle in approval_channels {
+        rt.block_on(handle.shutdown());
+    }
 
     let result = result?;
 

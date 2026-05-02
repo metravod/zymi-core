@@ -1,184 +1,296 @@
-use std::collections::HashMap;
+//! HTTP approval channel (`type: http`) — ADR-0022.
+//!
+//! Replaces the v0.3 `WebhookApprovalHandler`: instead of a
+//! [`crate::approval::ApprovalHandler`] trait impl with an in-memory
+//! `pending: HashMap`, this module exposes [`HttpApprovalChannel`],
+//! which subscribes to the bus, queries the event store for pending
+//! requests on demand, and publishes
+//! [`crate::events::EventKind::ApprovalGranted`] /
+//! [`crate::events::EventKind::ApprovalDenied`] back onto the bus when
+//! the operator decides via HTTP.
+//!
+//! The single source of truth for "who is waiting on what" is now the
+//! event store — [`HttpApprovalChannel`] holds no per-request state.
+//! That fixes the three defects ADR-0022 calls out for the old
+//! handler: not restart-safe (HashMap died with the process), TUI
+//! blind spot (decisions never flowed onto the bus), audit gap
+//! (decisions weren't hash-chained).
+//!
+//! ### Routes
+//!
+//! - `GET /health` → `"ok"` plaintext.
+//! - `GET /approvals` → JSON array of currently-pending requests for
+//!   this channel: every `ApprovalRequested` whose matching
+//!   `ApprovalGranted` / `ApprovalDenied` is not yet in the store.
+//! - `POST /approvals/{id}` (body: `{"approved": bool, "reason"?: string}`)
+//!   → publishes `ApprovalGranted` or `ApprovalDenied` on the bus.
+//!   Returns 404 if no matching open request exists.
+//!
+//! Optional bearer-token auth gates `GET /approvals` and
+//! `POST /approvals/{id}`. `GET /health` is always public.
+
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{oneshot, Mutex};
 
-use crate::approval::ApprovalHandler;
+use crate::approval::{ApprovalChannel, ChannelHandle};
+use crate::events::bus::EventBus;
+use crate::events::store::EventStore;
+use crate::events::{Event, EventKind};
+use crate::plugin::PluginBuilder;
+use serde_yml::Value as YamlValue;
 
-/// A pending approval request waiting for an external decision via HTTP.
-struct PendingApproval {
-    description: String,
-    explanation: Option<String>,
-    created_at: DateTime<Utc>,
-    sender: oneshot::Sender<bool>,
+/// Configuration for [`HttpApprovalChannel`].
+#[derive(Clone, Debug)]
+pub struct HttpApprovalChannelConfig {
+    /// Channel name — must match `ApprovalRequested.channel` set by
+    /// the orchestrator.
+    pub name: String,
+    /// Address the axum server binds to. Use `127.0.0.1:0` to let the
+    /// OS pick an ephemeral port (the bound address is logged at
+    /// startup).
+    pub bind: SocketAddr,
+    /// Optional bearer token enforced on `GET /approvals` and
+    /// `POST /approvals/{id}`. `None` means open access (only
+    /// appropriate for localhost binds).
+    pub bearer_token: Option<String>,
+    /// Optional URL the channel POSTs to whenever an
+    /// `ApprovalRequested` lands for this channel. Lets external
+    /// dashboards / Slack bots react immediately without polling.
+    pub callback_url: Option<String>,
 }
 
-/// Shared state for the webhook HTTP server.
-struct WebhookState {
-    pending: Mutex<HashMap<String, PendingApproval>>,
+impl HttpApprovalChannelConfig {
+    pub fn new(name: impl Into<String>, bind: SocketAddr) -> Self {
+        Self {
+            name: name.into(),
+            bind,
+            bearer_token: None,
+            callback_url: None,
+        }
+    }
+
+    pub fn with_bearer_token(mut self, token: impl Into<String>) -> Self {
+        self.bearer_token = Some(token.into());
+        self
+    }
+
+    pub fn with_callback_url(mut self, url: impl Into<String>) -> Self {
+        self.callback_url = Some(url.into());
+        self
+    }
 }
 
-/// Info about a pending approval, returned by GET /approvals.
+/// HTTP approval channel plugin (ADR-0022 `type: http`).
+pub struct HttpApprovalChannel {
+    config: HttpApprovalChannelConfig,
+}
+
+impl HttpApprovalChannel {
+    pub fn new(config: HttpApprovalChannelConfig) -> Self {
+        Self { config }
+    }
+}
+
+#[async_trait]
+impl ApprovalChannel for HttpApprovalChannel {
+    fn name(&self) -> &str {
+        &self.config.name
+    }
+
+    async fn start(&self, bus: Arc<EventBus>) -> Result<ChannelHandle, String> {
+        let store = Arc::clone(bus.store());
+        let state = Arc::new(HttpChannelState {
+            channel_name: self.config.name.clone(),
+            bus: Arc::clone(&bus),
+            store,
+            bearer_token: self.config.bearer_token.clone(),
+        });
+
+        let listener = tokio::net::TcpListener::bind(self.config.bind)
+            .await
+            .map_err(|e| format!("failed to bind {}: {e}", self.config.bind))?;
+        let actual_addr = listener
+            .local_addr()
+            .map_err(|e| format!("failed to read bound addr: {e}"))?;
+        log::info!(
+            "http approval channel '{}' listening on {actual_addr}",
+            self.config.name
+        );
+
+        let app = build_router(Arc::clone(&state));
+        let server_join = tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, app).await {
+                log::error!("http approval server error: {e}");
+            }
+        });
+
+        // Callback notifier: subscribe to the bus and POST callback_url
+        // for every ApprovalRequested addressed to this channel. Only
+        // spawned if a callback URL is configured.
+        let callback_join = self.config.callback_url.clone().map(|url| {
+            let bus = Arc::clone(&bus);
+            let channel_name = self.config.name.clone();
+            tokio::spawn(async move {
+                let client = reqwest::Client::new();
+                let mut rx = bus.subscribe().await;
+                while let Some(ev) = rx.recv().await {
+                    let EventKind::ApprovalRequested {
+                        approval_id,
+                        stream_id,
+                        description,
+                        explanation,
+                        channel,
+                    } = &ev.kind
+                    else {
+                        continue;
+                    };
+                    if channel != &channel_name {
+                        continue;
+                    }
+                    let info = ApprovalInfo {
+                        id: approval_id.clone(),
+                        stream_id: stream_id.clone(),
+                        description: description.clone(),
+                        explanation: explanation.clone(),
+                        channel: channel.clone(),
+                        created_at: ev.timestamp.to_rfc3339(),
+                    };
+                    if let Err(e) = client.post(&url).json(&info).send().await {
+                        log::warn!("http approval callback {url} failed: {e}");
+                    }
+                }
+            })
+        });
+
+        let mut tasks = vec![server_join];
+        if let Some(j) = callback_join {
+            tasks.push(j);
+        }
+        Ok(ChannelHandle::from_tasks(self.config.name.clone(), tasks))
+    }
+}
+
+/// `type: http` builder for the YAML approval-channel registry.
+///
+/// Config shape:
+/// ```yaml
+/// approvals:
+///   - type: http
+///     name: ops_api
+///     bind: "127.0.0.1:8081"
+///     bearer_token: ${env.APPROVAL_TOKEN}    # optional
+///     callback_url: ${env.APPROVAL_CALLBACK} # optional
+/// ```
+pub struct HttpApprovalBuilder;
+
+#[derive(Debug, Deserialize)]
+struct HttpApprovalYamlConfig {
+    #[serde(default)]
+    #[allow(dead_code)]
+    name: Option<String>,
+    bind: String,
+    #[serde(default)]
+    bearer_token: Option<String>,
+    #[serde(default)]
+    callback_url: Option<String>,
+}
+
+impl PluginBuilder<dyn ApprovalChannel> for HttpApprovalBuilder {
+    fn type_name(&self) -> &'static str {
+        "http"
+    }
+
+    fn build(
+        &self,
+        name: String,
+        entry: YamlValue,
+    ) -> Result<Box<dyn ApprovalChannel>, Box<dyn std::error::Error + Send + Sync>> {
+        let cfg: HttpApprovalYamlConfig = serde_yml::from_value(entry)?;
+        let bind: SocketAddr = cfg
+            .bind
+            .parse()
+            .map_err(|e| format!("invalid bind '{}': {e}", cfg.bind))?;
+        let mut config = HttpApprovalChannelConfig::new(name, bind);
+        if let Some(token) = cfg.bearer_token {
+            config = config.with_bearer_token(token);
+        }
+        if let Some(url) = cfg.callback_url {
+            config = config.with_callback_url(url);
+        }
+        Ok(Box::new(HttpApprovalChannel::new(config)))
+    }
+}
+
+/// Public DTO for `GET /approvals`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalInfo {
     pub id: String,
+    pub stream_id: String,
     pub description: String,
     pub explanation: Option<String>,
+    pub channel: String,
     pub created_at: String,
 }
 
-/// Request body for POST /approvals/{id}.
+/// Body of `POST /approvals/{id}`.
 #[derive(Debug, Deserialize)]
 pub struct DecideRequest {
     pub approved: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// Optional free-form attribution recorded in the
+    /// `ApprovalGranted.decided_by` / `ApprovalDenied.decided_by`
+    /// field. Defaults to `"http"`.
+    #[serde(default)]
+    pub decided_by: Option<String>,
 }
 
-/// Response for POST /approvals/{id}.
+/// Response of `POST /approvals/{id}`.
 #[derive(Debug, Serialize)]
 struct DecideResponse {
     id: String,
     approved: bool,
 }
 
-/// HTTP webhook approval handler.
-///
-/// Implements [`ApprovalHandler`] by blocking on a oneshot channel until an
-/// external system POSTs a decision to the HTTP endpoint.
-///
-/// Endpoints:
-/// - `GET /health` — returns "ok"
-/// - `GET /approvals` — list pending approval requests
-/// - `POST /approvals/{id}` — approve or deny: `{"approved": true/false}`
-///
-/// Optionally POSTs a notification to `callback_url` when a new approval is needed,
-/// so external systems (Slack bots, dashboards) can react immediately.
-pub struct WebhookApprovalHandler {
-    state: Arc<WebhookState>,
-    timeout: Duration,
-    callback_url: Option<String>,
-    http_client: reqwest::Client,
+struct HttpChannelState {
+    channel_name: String,
+    bus: Arc<EventBus>,
+    store: Arc<dyn EventStore>,
+    bearer_token: Option<String>,
 }
 
-impl WebhookApprovalHandler {
-    /// Create a new handler with the given approval timeout.
-    ///
-    /// If `callback_url` is set, a POST notification will be sent to it
-    /// whenever a new approval is required.
-    pub fn new(timeout: Duration, callback_url: Option<String>) -> Self {
-        Self {
-            state: Arc::new(WebhookState {
-                pending: Mutex::new(HashMap::new()),
-            }),
-            timeout,
-            callback_url,
-            http_client: reqwest::Client::new(),
-        }
-    }
-
-    /// Start the HTTP server and return the handler.
-    ///
-    /// The server runs in a background tokio task. The returned `Arc` can be
-    /// used as an `ApprovalHandler` with the orchestrator.
-    pub async fn start(
-        addr: SocketAddr,
-        timeout: Duration,
-        callback_url: Option<String>,
-    ) -> Result<Arc<Self>, std::io::Error> {
-        let handler = Arc::new(Self::new(timeout, callback_url));
-
-        let app = build_router(handler.state.clone());
-
-        let listener = tokio::net::TcpListener::bind(addr).await?;
-        let actual_addr = listener.local_addr()?;
-        log::info!("Webhook approval server listening on {actual_addr}");
-
-        tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, app).await {
-                log::error!("Webhook server error: {e}");
-            }
-        });
-
-        Ok(handler)
-    }
-
-}
-
-#[async_trait]
-impl ApprovalHandler for WebhookApprovalHandler {
-    async fn request_approval(
-        &self,
-        tool_description: &str,
-        explanation: Option<&str>,
-    ) -> Result<bool, String> {
-        let id = uuid::Uuid::new_v4().to_string();
-        let (tx, rx) = oneshot::channel();
-        let now = Utc::now();
-
-        let info = ApprovalInfo {
-            id: id.clone(),
-            description: tool_description.to_string(),
-            explanation: explanation.map(|s| s.to_string()),
-            created_at: now.to_rfc3339(),
+impl HttpChannelState {
+    fn check_auth(&self, headers: &HeaderMap) -> Result<(), StatusCode> {
+        let Some(expected) = self.bearer_token.as_deref() else {
+            return Ok(());
         };
-
-        // Register pending approval
+        let Some(value) = headers.get("authorization").and_then(|v| v.to_str().ok()) else {
+            return Err(StatusCode::UNAUTHORIZED);
+        };
+        let presented = value.strip_prefix("Bearer ").unwrap_or(value);
+        // Constant-time compare to keep token-length leakage bounded.
+        if presented.len() == expected.len()
+            && presented
+                .bytes()
+                .zip(expected.bytes())
+                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                == 0
         {
-            let mut pending = self.state.pending.lock().await;
-            pending.insert(
-                id.clone(),
-                PendingApproval {
-                    description: tool_description.to_string(),
-                    explanation: explanation.map(|s| s.to_string()),
-                    created_at: now,
-                    sender: tx,
-                },
-            );
-        }
-
-        // Fire-and-forget notification to callback URL (spawned so it doesn't eat timeout budget)
-        {
-            let client = self.http_client.clone();
-            let callback_url = self.callback_url.clone();
-            let info_clone = info;
-            tokio::spawn(async move {
-                if let Some(url) = callback_url {
-                    let _ = client
-                        .post(&url)
-                        .json(&info_clone)
-                        .send()
-                        .await
-                        .map_err(|e| log::warn!("Failed to notify callback {url}: {e}"));
-                }
-            });
-        }
-
-        // Block until decision or timeout
-        match tokio::time::timeout(self.timeout, rx).await {
-            Ok(Ok(approved)) => Ok(approved),
-            Ok(Err(_)) => {
-                // Channel closed without sending — treat as denied
-                self.state.pending.lock().await.remove(&id);
-                Ok(false)
-            }
-            Err(_) => {
-                // Timeout — remove pending and deny
-                self.state.pending.lock().await.remove(&id);
-                Ok(false)
-            }
+            Ok(())
+        } else {
+            Err(StatusCode::UNAUTHORIZED)
         }
     }
 }
 
-fn build_router(state: Arc<WebhookState>) -> Router {
+fn build_router(state: Arc<HttpChannelState>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/approvals", get(list_approvals))
@@ -190,176 +302,307 @@ async fn health() -> &'static str {
     "ok"
 }
 
-async fn list_approvals(State(state): State<Arc<WebhookState>>) -> Json<Vec<ApprovalInfo>> {
-    let pending = state.pending.lock().await;
-    let infos: Vec<ApprovalInfo> = pending
-        .iter()
-        .map(|(id, p)| ApprovalInfo {
-            id: id.clone(),
-            description: p.description.clone(),
-            explanation: p.explanation.clone(),
-            created_at: p.created_at.to_rfc3339(),
-        })
-        .collect();
-    Json(infos)
+async fn list_approvals(
+    State(state): State<Arc<HttpChannelState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<ApprovalInfo>>, StatusCode> {
+    state.check_auth(&headers)?;
+    let pending = pending_approvals(state.as_ref())
+        .await
+        .map_err(|e| {
+            log::error!("http approval list failed: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(Json(pending))
 }
 
 async fn decide_approval(
-    State(state): State<Arc<WebhookState>>,
+    State(state): State<Arc<HttpChannelState>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(body): Json<DecideRequest>,
 ) -> Result<Json<DecideResponse>, StatusCode> {
-    let mut pending = state.pending.lock().await;
+    state.check_auth(&headers)?;
 
-    match pending.remove(&id) {
-        Some(approval) => {
-            // Send decision; if receiver is dropped, that's fine
-            let _ = approval.sender.send(body.approved);
-            Ok(Json(DecideResponse {
-                id,
-                approved: body.approved,
-            }))
+    // Look up the original ApprovalRequested for this id so we can
+    // mirror its stream_id / correlation_id in the decision event.
+    let pending = pending_approvals(state.as_ref()).await.map_err(|e| {
+        log::error!("http approval lookup failed: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let request = pending
+        .into_iter()
+        .find(|p| p.id == id && p.channel == state.channel_name)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    // Re-walk to recover the originating Event (we need correlation_id;
+    // pending_approvals stripped it). Lightweight: only does a second
+    // scan when the token check + body parse succeeded.
+    let originating_correlation = correlation_id_for(state.as_ref(), &id)
+        .await
+        .map_err(|e| {
+            log::error!("http approval correlation lookup failed: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let decided_by = body.decided_by.clone().unwrap_or_else(|| "http".into());
+    let decision_kind = if body.approved {
+        EventKind::ApprovalGranted {
+            approval_id: id.clone(),
+            stream_id: request.stream_id.clone(),
+            decided_by,
+            reason: body.reason,
         }
-        None => Err(StatusCode::NOT_FOUND),
+    } else {
+        EventKind::ApprovalDenied {
+            approval_id: id.clone(),
+            stream_id: request.stream_id.clone(),
+            decided_by,
+            reason: body.reason,
+        }
+    };
+
+    let mut event = Event::new(request.stream_id, decision_kind, "approval_channel".into());
+    if let Some(corr) = originating_correlation {
+        event = event.with_correlation(corr);
+    }
+
+    if let Err(e) = state.bus.publish(event).await {
+        log::error!("http approval publish failed: {e}");
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    Ok(Json(DecideResponse {
+        id,
+        approved: body.approved,
+    }))
+}
+
+/// Walk the event store and collect every `ApprovalRequested` whose
+/// matching `ApprovalGranted` / `ApprovalDenied` (keyed by
+/// `approval_id`) is not yet present. Filtered to the channel this
+/// state belongs to. The store itself is the single source of truth
+/// for restart-safety (ADR-0022) — there's no in-memory pending map
+/// to keep in sync.
+async fn pending_approvals(
+    state: &HttpChannelState,
+) -> Result<Vec<ApprovalInfo>, String> {
+    let mut requested: Vec<ApprovalInfo> = Vec::new();
+    let mut decided: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    let mut from = 0u64;
+    let batch = 1024usize;
+    loop {
+        let events = state
+            .store
+            .read_all(from, batch)
+            .await
+            .map_err(|e| format!("read_all: {e}"))?;
+        if events.is_empty() {
+            break;
+        }
+        for ev in &events {
+            match &ev.kind {
+                EventKind::ApprovalRequested {
+                    approval_id,
+                    stream_id,
+                    description,
+                    explanation,
+                    channel,
+                } if channel == &state.channel_name => {
+                    requested.push(ApprovalInfo {
+                        id: approval_id.clone(),
+                        stream_id: stream_id.clone(),
+                        description: description.clone(),
+                        explanation: explanation.clone(),
+                        channel: channel.clone(),
+                        created_at: ev.timestamp.to_rfc3339(),
+                    });
+                }
+                EventKind::ApprovalGranted { approval_id, .. } => {
+                    decided.insert(approval_id.clone());
+                }
+                EventKind::ApprovalDenied { approval_id, .. } => {
+                    decided.insert(approval_id.clone());
+                }
+                _ => {}
+            }
+        }
+        // `read_all`'s `from_global_seq` is exclusive, so advance past
+        // the highest-seq event in this batch via Event.sequence works
+        // only within a stream — instead use the batch-size convention:
+        // ask for the next page by querying with limit and breaking
+        // when fewer than `batch` come back.
+        if events.len() < batch {
+            break;
+        }
+        // Safe-ish increment: use the highest sequence we saw plus 1
+        // is wrong (sequence is per-stream, not global). The store
+        // maps `read_all`'s `from_global_seq` to its internal id. The
+        // canonical way to paginate is to use `tail()`, which returns
+        // `TailedEvent.global_seq`. Switch to that for correctness.
+        let tailed = state
+            .store
+            .tail(from, batch)
+            .await
+            .map_err(|e| format!("tail: {e}"))?;
+        if let Some(last) = tailed.last() {
+            from = last.global_seq;
+        } else {
+            break;
+        }
+    }
+
+    requested.retain(|a| !decided.contains(&a.id));
+    Ok(requested)
+}
+
+/// Find the correlation_id of the originating `ApprovalRequested` for
+/// a given approval_id so the published decision can join the same
+/// correlated subscription the orchestrator is listening on.
+async fn correlation_id_for(
+    state: &HttpChannelState,
+    approval_id: &str,
+) -> Result<Option<uuid::Uuid>, String> {
+    let mut from = 0u64;
+    let batch = 1024usize;
+    loop {
+        let tailed = state
+            .store
+            .tail(from, batch)
+            .await
+            .map_err(|e| format!("tail: {e}"))?;
+        if tailed.is_empty() {
+            return Ok(None);
+        }
+        for t in &tailed {
+            if let EventKind::ApprovalRequested {
+                approval_id: aid, ..
+            } = &t.event.kind
+            {
+                if aid == approval_id {
+                    return Ok(t.event.correlation_id);
+                }
+            }
+        }
+        if tailed.len() < batch {
+            return Ok(None);
+        }
+        from = tailed.last().map(|t| t.global_seq).unwrap_or(from);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::store::SqliteEventStore;
     use axum::body::Body;
     use axum::http::Request;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tempfile::TempDir;
     use tower::ServiceExt;
+    use uuid::Uuid;
+
+    async fn setup() -> (TempDir, Arc<EventBus>) {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test_http_approvals.db");
+        let store = Arc::new(SqliteEventStore::new(&db_path).unwrap());
+        let bus = Arc::new(EventBus::new(store));
+        (dir, bus)
+    }
+
+    fn approval_request_event(channel: &str, approval_id: &str, stream: &str) -> Event {
+        let corr = Uuid::new_v4();
+        Event::new(
+            stream.to_string(),
+            EventKind::ApprovalRequested {
+                approval_id: approval_id.to_string(),
+                stream_id: stream.to_string(),
+                description: "rm -rf /tmp/cache".into(),
+                explanation: Some("clears stale build cache".into()),
+                channel: channel.to_string(),
+            },
+            "orchestrator".into(),
+        )
+        .with_correlation(corr)
+    }
 
     #[tokio::test]
-    async fn handler_approves_via_state() {
-        let handler = WebhookApprovalHandler::new(Duration::from_secs(5), None);
+    async fn list_approvals_returns_only_pending_for_channel() {
+        let (_dir, bus) = setup().await;
+        // Two pending requests on our channel + one already granted +
+        // one on a different channel that should not leak through.
+        bus.publish(approval_request_event("ops", "a-1", "s1"))
+            .await
+            .unwrap();
+        bus.publish(approval_request_event("ops", "a-2", "s2"))
+            .await
+            .unwrap();
+        bus.publish(approval_request_event("other", "a-3", "s3"))
+            .await
+            .unwrap();
+        bus.publish(Event::new(
+            "s1".into(),
+            EventKind::ApprovalGranted {
+                approval_id: "a-1".into(),
+                stream_id: "s1".into(),
+                decided_by: "test".into(),
+                reason: None,
+            },
+            "approval_channel".into(),
+        ))
+        .await
+        .unwrap();
 
-        // Spawn approval request in background
-        let state = handler.state.clone();
-        let handle = tokio::spawn(async move {
-            // Wait for pending approval to appear
-            loop {
-                let pending = state.pending.lock().await;
-                if let Some((id, _)) = pending.iter().next() {
-                    let id = id.clone();
-                    drop(pending);
-
-                    // Simulate external POST: approve
-                    let mut p = state.pending.lock().await;
-                    if let Some(approval) = p.remove(&id) {
-                        let _ = approval.sender.send(true);
-                    }
-                    break;
-                }
-                drop(pending);
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+        let state = Arc::new(HttpChannelState {
+            channel_name: "ops".into(),
+            bus: Arc::clone(&bus),
+            store: Arc::clone(bus.store()),
+            bearer_token: None,
         });
+        let app = build_router(state);
 
-        let result = handler
-            .request_approval("run dangerous command", Some("sudo reboot"))
-            .await
-            .unwrap();
-
-        handle.await.unwrap();
-        assert!(result);
-    }
-
-    #[tokio::test]
-    async fn handler_denies_via_state() {
-        let handler = WebhookApprovalHandler::new(Duration::from_secs(5), None);
-
-        let state = handler.state.clone();
-        let handle = tokio::spawn(async move {
-            loop {
-                let pending = state.pending.lock().await;
-                if let Some((id, _)) = pending.iter().next() {
-                    let id = id.clone();
-                    drop(pending);
-
-                    let mut p = state.pending.lock().await;
-                    if let Some(approval) = p.remove(&id) {
-                        let _ = approval.sender.send(false);
-                    }
-                    break;
-                }
-                drop(pending);
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        });
-
-        let result = handler
-            .request_approval("delete everything", None)
-            .await
-            .unwrap();
-
-        handle.await.unwrap();
-        assert!(!result);
-    }
-
-    #[tokio::test]
-    async fn handler_timeout_denies() {
-        let handler = WebhookApprovalHandler::new(Duration::from_millis(50), None);
-
-        let result = handler
-            .request_approval("will timeout", None)
-            .await
-            .unwrap();
-
-        // Timeout should result in denial
-        assert!(!result);
-
-        // Pending should be cleaned up
-        assert!(handler.state.pending.lock().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn http_approve_flow() {
-        let handler = WebhookApprovalHandler::new(Duration::from_secs(5), None);
-        let app = build_router(handler.state.clone());
-
-        // Health check
         let resp = app
-            .clone()
-            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/approvals")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
-        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
-        assert_eq!(&body[..], b"ok");
-
-        // Start an approval request in background
-        let state = handler.state.clone();
-        let approval_task = tokio::spawn(async move {
-            handler
-                .request_approval("test action", None)
-                .await
-                .unwrap()
-        });
-
-        // Wait for it to register
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // List approvals
-        let resp = app
-            .clone()
-            .oneshot(Request::builder().uri("/approvals").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
         let approvals: Vec<ApprovalInfo> = serde_json::from_slice(&body).unwrap();
-        assert_eq!(approvals.len(), 1);
-        assert_eq!(approvals[0].description, "test action");
+        assert_eq!(approvals.len(), 1, "got {approvals:?}");
+        assert_eq!(approvals[0].id, "a-2");
+        assert_eq!(approvals[0].channel, "ops");
+    }
 
-        let approval_id = approvals[0].id.clone();
+    #[tokio::test]
+    async fn post_decide_publishes_granted_with_correlation() {
+        let (_dir, bus) = setup().await;
+        let req = approval_request_event("ops", "a-77", "stream-x");
+        let original_corr = req.correlation_id.expect("test event has correlation");
+        bus.publish(req).await.unwrap();
 
-        // Approve it
+        let state = Arc::new(HttpChannelState {
+            channel_name: "ops".into(),
+            bus: Arc::clone(&bus),
+            store: Arc::clone(bus.store()),
+            bearer_token: None,
+        });
+
+        // Subscribe filtered by correlation_id BEFORE the POST so we
+        // catch the published decision deterministically.
+        let mut rx = bus.subscribe_correlation(original_corr).await;
+
+        let app = build_router(Arc::clone(&state));
         let resp = app
-            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri(format!("/approvals/{approval_id}"))
+                    .uri("/approvals/a-77")
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"approved": true}"#))
                     .unwrap(),
@@ -368,30 +611,106 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        // The approval request should resolve to true
-        let result = approval_task.await.unwrap();
-        assert!(result);
-
-        // Pending should be empty now
-        assert!(state.pending.lock().await.is_empty());
+        // Fish out the granted event (skip the original request which
+        // is already in the store; subscribe_correlation only fires on
+        // future publishes, so the very next event should be ours).
+        let ev = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("decision event timeout")
+            .expect("bus closed");
+        match &ev.kind {
+            EventKind::ApprovalGranted {
+                approval_id,
+                decided_by,
+                ..
+            } => {
+                assert_eq!(approval_id, "a-77");
+                assert_eq!(decided_by, "http");
+            }
+            other => panic!("expected ApprovalGranted, got {other:?}"),
+        }
+        assert_eq!(ev.correlation_id, Some(original_corr));
     }
 
     #[tokio::test]
-    async fn http_decide_unknown_id_returns_404() {
-        let handler = WebhookApprovalHandler::new(Duration::from_secs(5), None);
-        let app = build_router(handler.state.clone());
+    async fn post_decide_unknown_id_404() {
+        let (_dir, bus) = setup().await;
+        let state = Arc::new(HttpChannelState {
+            channel_name: "ops".into(),
+            bus: Arc::clone(&bus),
+            store: Arc::clone(bus.store()),
+            bearer_token: None,
+        });
+        let app = build_router(state);
 
         let resp = app
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/approvals/nonexistent-id")
+                    .uri("/approvals/does-not-exist")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"approved": true}"#))
+                    .body(Body::from(r#"{"approved": false}"#))
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn bearer_token_gates_listing() {
+        let (_dir, bus) = setup().await;
+        bus.publish(approval_request_event("ops", "a-1", "s1"))
+            .await
+            .unwrap();
+
+        let state = Arc::new(HttpChannelState {
+            channel_name: "ops".into(),
+            bus: Arc::clone(&bus),
+            store: Arc::clone(bus.store()),
+            bearer_token: Some("s3cret".into()),
+        });
+        let app = build_router(state);
+
+        // Missing token → 401.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/approvals")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Wrong token → 401.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/approvals")
+                    .header("authorization", "Bearer wrong")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Right token → 200.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/approvals")
+                    .header("authorization", "Bearer s3cret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

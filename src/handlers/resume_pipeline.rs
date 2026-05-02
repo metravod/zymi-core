@@ -466,6 +466,7 @@ mod tests {
                 })
                 .collect(),
             output: None,
+            approval_channel: None,
         }
     }
 
@@ -671,6 +672,8 @@ mod tests {
                 mcp_servers: Vec::new(),
                 connectors: Vec::new(),
                 outputs: Vec::new(),
+                approvals: Vec::new(),
+                default_approval_channel: None,
             },
             agents,
             pipelines,

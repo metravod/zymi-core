@@ -43,7 +43,6 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use crate::approval::ApprovalHandler;
 use crate::config::{McpServerConfig, WorkspaceConfig};
 use crate::esaa::contracts::ContractEngine;
 use crate::esaa::orchestrator::Orchestrator;
@@ -72,7 +71,14 @@ pub struct Runtime {
     provider: Arc<dyn LlmProvider>,
     contracts: Arc<ContractEngine>,
     orchestrator: Arc<Orchestrator>,
-    approval: Option<Arc<dyn ApprovalHandler>>,
+    /// Default approval channel name (ADR-0022). When set, intentions
+    /// tagged `RequiresHumanApproval` are routed via the bus to a
+    /// channel plugin matching this name. `None` = fail-closed.
+    approval_channel: Option<String>,
+    /// Per-request timeout for bus-path approvals. Resolved from
+    /// `project.yml`-level config in the future; today this is the
+    /// crate default.
+    approval_timeout: std::time::Duration,
     action_executor: Arc<dyn ActionExecutor>,
     tool_catalog: Arc<ToolCatalog>,
     shell_pool: Arc<ShellSessionPool>,
@@ -100,7 +106,8 @@ impl Runtime {
             project_root: project_root.into(),
             store: None,
             bus: None,
-            approval: None,
+            approval_channel: None,
+            approval_timeout: None,
             action_executor: None,
             tail_policy: None,
             provider: None,
@@ -135,8 +142,19 @@ impl Runtime {
         &self.orchestrator
     }
 
-    pub fn approval_handler(&self) -> Option<&Arc<dyn ApprovalHandler>> {
-        self.approval.as_ref()
+    /// Configured default approval channel name (ADR-0022). When `Some`,
+    /// the orchestrator publishes `ApprovalRequested { channel }` and
+    /// awaits a channel plugin to publish a decision back on the bus.
+    /// `None` resolves any `RequiresHumanApproval` intention to
+    /// [`crate::esaa::orchestrator::OrchestratorResult::NoApprovalHandler`]
+    /// (fail-closed).
+    pub fn approval_channel(&self) -> Option<&str> {
+        self.approval_channel.as_deref()
+    }
+
+    /// Per-request timeout for bus-path approvals.
+    pub fn approval_timeout(&self) -> std::time::Duration {
+        self.approval_timeout
     }
 
     pub fn action_executor(&self) -> &Arc<dyn ActionExecutor> {
@@ -247,7 +265,8 @@ pub struct RuntimeBuilder {
     project_root: PathBuf,
     store: Option<Arc<dyn EventStore>>,
     bus: Option<Arc<EventBus>>,
-    approval: Option<Arc<dyn ApprovalHandler>>,
+    approval_channel: Option<String>,
+    approval_timeout: Option<std::time::Duration>,
     action_executor: Option<Arc<dyn ActionExecutor>>,
     tail_policy: Option<TailWatcherPolicy>,
     provider: Option<Arc<dyn LlmProvider>>,
@@ -271,11 +290,21 @@ impl RuntimeBuilder {
         self
     }
 
-    /// Attach an approval handler. Without one, intentions tagged
-    /// `RequiresHumanApproval` resolve to [`crate::esaa::orchestrator::OrchestratorResult::NoApprovalHandler`]
-    /// — the safety contract is fail-closed by design.
-    pub fn with_approval_handler(mut self, handler: Arc<dyn ApprovalHandler>) -> Self {
-        self.approval = Some(handler);
+    /// Configure a default approval channel name (ADR-0022). The
+    /// orchestrator publishes `ApprovalRequested { channel: name }` on
+    /// the bus and awaits a matching `ApprovalGranted` /
+    /// `ApprovalDenied` from a channel plugin (e.g.
+    /// `TerminalApprovalChannel`). The plugin must be started
+    /// separately; the runtime only stores the routing name.
+    pub fn with_approval_channel(mut self, name: impl Into<String>) -> Self {
+        self.approval_channel = Some(name.into());
+        self
+    }
+
+    /// Override the per-request timeout for bus-path approvals.
+    /// Defaults to [`crate::approval::DEFAULT_APPROVAL_TIMEOUT`].
+    pub fn with_approval_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.approval_timeout = Some(timeout);
         self
     }
 
@@ -463,7 +492,8 @@ impl RuntimeBuilder {
             project_root,
             store,
             bus,
-            approval,
+            approval_channel,
+            approval_timeout,
             action_executor,
             tail_policy,
             provider: provider_override,
@@ -563,7 +593,9 @@ impl RuntimeBuilder {
             provider,
             contracts,
             orchestrator,
-            approval,
+            approval_channel,
+            approval_timeout: approval_timeout
+                .unwrap_or(crate::approval::DEFAULT_APPROVAL_TIMEOUT),
             action_executor,
             tool_catalog,
             shell_pool,

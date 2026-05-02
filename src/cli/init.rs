@@ -593,9 +593,8 @@ defaults:
 policy:
   enabled: true
   # `web_search` / `web_scrape` ship with a `kind: shell` placeholder that
-  # echoes "not configured" when no provider is wired. We allow `echo` so
-  # the placeholder can run; once you uncomment a real HTTP provider in
-  # `tools/*.yml`, neither tool touches the shell at all.
+  # echoes "not configured" when no provider is wired. `broadcast` is a
+  # `kind: shell` tool too; we allow `echo` so all three placeholders run.
   allow: ["echo *"]
   deny: ["*"]
 
@@ -646,6 +645,39 @@ outputs:
     retry:
       attempts: 3
       backoff_secs: [1, 5, 30]
+
+# ── Human approvals (ADR-0022) ──────────────────────────────────────────────
+#
+# When `tools/broadcast.yml` is invoked the agent publishes
+# `ApprovalRequested`. The `ops_tg` channel below picks it up, DMs the
+# admin chat with an inline ✅ / ❌ keyboard, and the click flows back as
+# `ApprovalGranted` / `ApprovalDenied` on the bus.
+#
+# Telegram needs a public URL to reach `bind:` for the callback. Two
+# common ways to get one on a laptop:
+#   ngrok http 8088            →  https://abc123.ngrok-free.app
+#   cloudflared tunnel --url http://localhost:8088
+# Then point the bot at it once:
+#   curl "https://api.telegram.org/bot${{TELEGRAM_BOT_TOKEN}}/setWebhook" \
+#        -d "url=<public-url>/telegram/approval" \
+#        -d "secret_token=${{TELEGRAM_WEBHOOK_SECRET}}"
+
+default_approval_channel: ops_tg
+
+approvals:
+  - type: telegram
+    name: ops_tg
+    bot_token: "${{env.TELEGRAM_BOT_TOKEN}}"
+    # The admin chat that receives approval prompts. Often the same chat
+    # the user is in, so they see "approve?" land in their DMs as the
+    # agent thinks. Set in .env (see TELEGRAM_ADMIN_CHAT_ID).
+    chat_id: ${{env.TELEGRAM_ADMIN_CHAT_ID}}
+    bind: "127.0.0.1:8088"
+    callback_path: /telegram/approval
+    # `secret_token` is enforced via Telegram's
+    # `X-Telegram-Bot-Api-Secret-Token` header. Without it, anyone who
+    # guesses your public URL can forge approvals.
+    secret_token: "${{env.TELEGRAM_WEBHOOK_SECRET}}"
 "#
         ),
     )?;
@@ -670,11 +702,17 @@ system_prompt: |
   Tools:
   - `web_search` for questions that need current or specific external information.
   - `web_scrape` to read a specific URL the user mentions.
+  - `broadcast` sends an announcement to a public channel. Always
+    requires human approval — the operator gets a Telegram DM with
+    ✅ / ❌ buttons before the message goes out. Use this only when the
+    user explicitly asks you to "announce", "broadcast", or "post" a
+    message; otherwise stay in normal chat.
   - If a tool returns "not configured", proceed using your own knowledge —
     don't mention the tool's failure to the user.
 tools:
   - web_search
   - web_scrape
+  - broadcast
 max_iterations: 4
 "#,
     )?;
@@ -745,9 +783,40 @@ output:
 "#,
     )?;
 
-    // -- tools/web_search.yml + tools/web_scrape.yml --
+    // -- tools/web_search.yml + tools/web_scrape.yml + tools/broadcast.yml --
     write_file(&root.join("tools/web_search.yml"), WEB_SEARCH_TOOL)?;
     write_file(&root.join("tools/web_scrape.yml"), WEB_SCRAPE_TOOL)?;
+    write_file(
+        &root.join("tools/broadcast.yml"),
+        r#"# broadcast — gated tool that triggers the ADR-0022 approval flow.
+#
+# When the agent calls this tool, the orchestrator publishes
+# `ApprovalRequested`. The `ops_tg` approval channel in project.yml
+# DMs the admin chat with ✅ / ❌ buttons and waits for the click.
+# On approve, the shell command below runs and the result is fed back
+# to the agent. On deny (or timeout), the tool reports a refusal to the
+# agent and no shell ever executes.
+name: broadcast
+description: |
+  Send an announcement to the team channel. Sensitive — the human
+  operator must approve every call before it goes out.
+parameters:
+  type: object
+  properties:
+    message:
+      type: string
+      description: "The announcement text. Plain text, ≤ 280 chars."
+  required: [message]
+
+# Default for `kind: shell` is already `requires_approval: true`, but
+# spell it out so a future reader sees the gate without grepping ADRs.
+requires_approval: true
+
+implementation:
+  kind: shell
+  command_template: "echo 'BROADCAST_DISABLED: would have sent → ${args.message}'"
+"#,
+    )?;
 
     // -- .env.example --
     write_file(
@@ -761,6 +830,19 @@ TELEGRAM_BOT_TOKEN=
 # Any Chat-Completions-compatible OpenAI account works. Swap the provider
 # in project.yml if you prefer Anthropic / Gemini / a local server.
 OPENAI_API_KEY=
+
+# --- Approval flow (ADR-0022) ----------------------------------------------
+# Chat id that receives ✅ / ❌ approval prompts when the agent calls a
+# `requires_approval: true` tool (e.g. `broadcast`). To find your own
+# numeric id, message @userinfobot in Telegram. For a group, send any
+# message in the group, then GET
+# https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/getUpdates and copy
+# `result[*].message.chat.id` (groups are negative numbers).
+TELEGRAM_ADMIN_CHAT_ID=
+
+# Random shared secret enforced via the `X-Telegram-Bot-Api-Secret-Token`
+# header. Anything unguessable works:  openssl rand -hex 16
+TELEGRAM_WEBHOOK_SECRET=
 "#,
     )?;
 
@@ -783,32 +865,45 @@ OPENAI_API_KEY=
 
     println!("Initialized zymi project '{project_name}' with telegram example");
     println!();
-    println!("  project.yml              — Telegram http_poll + http_post wiring");
-    println!("  agents/assistant.yml     — drafts the reply (uses web_search / web_scrape)");
+    println!("  project.yml              — Telegram chat I/O + ops_tg approval channel");
+    println!("  agents/assistant.yml     — drafts the reply (web_search / web_scrape / broadcast)");
     println!("  agents/reviewer.yml      — verifies the draft, polishes if needed");
     println!("  pipelines/chat.yml       — DAG: respond → polish");
     println!("  tools/web_search.yml     — declarative search tool (configure a provider)");
     println!("  tools/web_scrape.yml     — declarative scrape tool (configure a provider)");
+    println!("  tools/broadcast.yml      — gated `requires_approval: true` tool (ADR-0022)");
     println!("  .env.example             — token placeholders");
     println!("  .zymi/                   — runtime data (events.db, connectors.db)");
     println!();
     println!("Next:");
     println!("  1. Message @BotFather in Telegram and create a bot; copy the token.");
     println!("  2. cp .env.example .env  &&  fill TELEGRAM_BOT_TOKEN + OPENAI_API_KEY");
+    println!("     + TELEGRAM_ADMIN_CHAT_ID + TELEGRAM_WEBHOOK_SECRET (see comments).");
     println!("  3. Edit project.yml → connectors[0].filter: replace 'your_username_here'");
     println!("     with your actual Telegram username (no @). This is what keeps");
     println!("     strangers who somehow found your token out of the bot.");
-    println!("  4. (optional) Open tools/web_search.yml and uncomment a provider block");
+    println!("  4. Expose the approval callback so Telegram can reach it:");
+    println!("       ngrok http 8088    # or `cloudflared tunnel --url http://localhost:8088`");
+    println!("     Then point the bot at it (one-shot setup, persists on Telegram's side):");
+    println!("       curl \"https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook\" \\");
+    println!("            -d \"url=https://<your-tunnel>/telegram/approval\" \\");
+    println!("            -d \"secret_token=$TELEGRAM_WEBHOOK_SECRET\"");
+    println!("  5. (optional) Open tools/web_search.yml and uncomment a provider block");
     println!("     (Brave / Tavily / SerpAPI / Google) + set its API key in .env.");
     println!("     Without this the bot still works — it just answers from its own");
     println!("     knowledge instead of searching the web.");
-    println!("  5. set -a; source .env; set +a   # export vars to child processes");
+    println!("  6. set -a; source .env; set +a   # export vars to child processes");
     println!("     ~/.../target/release/zymi serve chat   # or your installed `zymi`");
     println!();
     println!("Tip: once running, message the bot on Telegram — you should see an agent");
     println!("     reply within a couple of seconds. The DAG (respond → polish) is");
     println!("     visible live in `zymi observe`; outbound POSTs to Telegram show as");
     println!("     `outbound_dispatched` events in `zymi events`.");
+    println!();
+    println!("Try the approval flow: ask the bot to \"announce that we're closing at 5pm\".");
+    println!("     The agent calls `broadcast`, which DMs the admin chat with ✅ / ❌");
+    println!("     buttons. Click one and watch `Approval`/`Approved`/`Denied` events");
+    println!("     stream into `zymi observe` and `zymi events`.");
 
     Ok(())
 }
