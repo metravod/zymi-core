@@ -284,6 +284,7 @@ impl App {
             inputs: Vec::new(),
             steps,
             output: None,
+            approval_channel: None,
         };
 
         Graph::build(&cfg, &self.events)

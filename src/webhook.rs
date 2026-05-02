@@ -43,6 +43,8 @@ use crate::approval::{ApprovalChannel, ChannelHandle};
 use crate::events::bus::EventBus;
 use crate::events::store::EventStore;
 use crate::events::{Event, EventKind};
+use crate::plugin::PluginBuilder;
+use serde_yml::Value as YamlValue;
 
 /// Configuration for [`HttpApprovalChannel`].
 #[derive(Clone, Debug)]
@@ -102,7 +104,7 @@ impl ApprovalChannel for HttpApprovalChannel {
         &self.config.name
     }
 
-    async fn start(self: Arc<Self>, bus: Arc<EventBus>) -> Result<ChannelHandle, String> {
+    async fn start(&self, bus: Arc<EventBus>) -> Result<ChannelHandle, String> {
         let store = Arc::clone(bus.store());
         let state = Arc::new(HttpChannelState {
             channel_name: self.config.name.clone(),
@@ -172,6 +174,57 @@ impl ApprovalChannel for HttpApprovalChannel {
             tasks.push(j);
         }
         Ok(ChannelHandle::from_tasks(self.config.name.clone(), tasks))
+    }
+}
+
+/// `type: http` builder for the YAML approval-channel registry.
+///
+/// Config shape:
+/// ```yaml
+/// approvals:
+///   - type: http
+///     name: ops_api
+///     bind: "127.0.0.1:8081"
+///     bearer_token: ${env.APPROVAL_TOKEN}    # optional
+///     callback_url: ${env.APPROVAL_CALLBACK} # optional
+/// ```
+pub struct HttpApprovalBuilder;
+
+#[derive(Debug, Deserialize)]
+struct HttpApprovalYamlConfig {
+    #[serde(default)]
+    #[allow(dead_code)]
+    name: Option<String>,
+    bind: String,
+    #[serde(default)]
+    bearer_token: Option<String>,
+    #[serde(default)]
+    callback_url: Option<String>,
+}
+
+impl PluginBuilder<dyn ApprovalChannel> for HttpApprovalBuilder {
+    fn type_name(&self) -> &'static str {
+        "http"
+    }
+
+    fn build(
+        &self,
+        name: String,
+        entry: YamlValue,
+    ) -> Result<Box<dyn ApprovalChannel>, Box<dyn std::error::Error + Send + Sync>> {
+        let cfg: HttpApprovalYamlConfig = serde_yml::from_value(entry)?;
+        let bind: SocketAddr = cfg
+            .bind
+            .parse()
+            .map_err(|e| format!("invalid bind '{}': {e}", cfg.bind))?;
+        let mut config = HttpApprovalChannelConfig::new(name, bind);
+        if let Some(token) = cfg.bearer_token {
+            config = config.with_bearer_token(token);
+        }
+        if let Some(url) = cfg.callback_url {
+            config = config.with_callback_url(url);
+        }
+        Ok(Box::new(HttpApprovalChannel::new(config)))
     }
 }
 

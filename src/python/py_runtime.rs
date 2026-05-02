@@ -170,7 +170,7 @@ impl PyRuntime {
         let mut approval_channels: Vec<ChannelHandle> = Vec::new();
         if want_terminal_channel {
             let bus = Arc::clone(runtime.bus());
-            let channel = Arc::new(TerminalApprovalChannel::new("terminal"));
+            let channel = TerminalApprovalChannel::new("terminal");
             let handle = shared_tokio()
                 .block_on(channel.start(bus))
                 .map_err(|e| PyRuntimeError::new_err(format!("failed to start terminal approval channel: {e}")))?;

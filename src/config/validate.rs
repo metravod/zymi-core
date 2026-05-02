@@ -270,6 +270,7 @@ mod tests {
                 })
                 .collect(),
             output: None,
+            approval_channel: None,
         }
     }
 

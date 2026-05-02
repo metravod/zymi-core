@@ -212,7 +212,13 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
             let stream_id = stream_id.clone();
             let project_root = rt.project_root().to_path_buf();
             let defaults = workspace.project.defaults.clone();
-            let approval_channel = rt.approval_channel().map(|s| s.to_string());
+            // ADR-0022 §"Resolution order": pipeline override beats the
+            // runtime-wide default, which itself is the project default
+            // resolved at CLI startup.
+            let approval_channel = crate::approval::resolve_channel(
+                pipeline.approval_channel.as_deref(),
+                rt.approval_channel(),
+            );
             let approval_timeout = rt.approval_timeout();
             let context_config: ContextConfig = workspace
                 .project

@@ -82,9 +82,12 @@ enum Command {
         #[arg(short = 'i', long = "input", value_name = "KEY=VALUE")]
         inputs: Vec<String>,
 
-        /// Approval mode: "terminal" (interactive, default) or "webhook"
-        #[arg(long, default_value = "terminal")]
-        approval: String,
+        /// Override approval routing. Accepts "terminal" or "webhook"
+        /// (legacy escape hatch). When omitted, the runtime uses the
+        /// `approvals:` section in `project.yml` (or falls back to a
+        /// terminal prompt when that section is absent).
+        #[arg(long)]
+        approval: Option<String>,
 
         /// Webhook callback URL for approval notifications (requires --approval=webhook)
         #[arg(long)]
@@ -142,9 +145,12 @@ enum Command {
         #[arg(long, default_value = "100")]
         poll_interval_ms: u64,
 
-        /// Approval mode: "terminal" (interactive, default) or "webhook"
-        #[arg(long, default_value = "terminal")]
-        approval: String,
+        /// Override approval routing. Accepts "terminal" or "webhook"
+        /// (legacy escape hatch). When omitted, the runtime uses the
+        /// `approvals:` section in `project.yml` (or falls back to a
+        /// terminal prompt when that section is absent).
+        #[arg(long)]
+        approval: Option<String>,
 
         /// Webhook callback URL for approval notifications (requires --approval=webhook)
         #[arg(long)]
@@ -211,9 +217,12 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
 
-        /// Approval mode: "terminal" (interactive, default) or "webhook"
-        #[arg(long, default_value = "terminal")]
-        approval: String,
+        /// Override approval routing. Accepts "terminal" or "webhook"
+        /// (legacy escape hatch). When omitted, the runtime uses the
+        /// `approvals:` section in `project.yml` (or falls back to a
+        /// terminal prompt when that section is absent).
+        #[arg(long)]
+        approval: Option<String>,
 
         /// Webhook callback URL for approval notifications
         #[arg(long)]
@@ -261,7 +270,7 @@ fn dispatch(cli: Cli) {
             approval,
             callback_url,
             dir,
-        } => run::exec(&pipeline, &inputs, &approval, callback_url.as_deref(), resolve_root(dir.as_deref())),
+        } => run::exec(&pipeline, &inputs, approval.as_deref(), callback_url.as_deref(), resolve_root(dir.as_deref())),
         Command::Events {
             stream,
             kind,
@@ -301,7 +310,7 @@ fn dispatch(cli: Cli) {
             approval,
             callback_url,
             dir,
-        } => serve::exec(&pipeline, poll_interval_ms, &approval, callback_url.as_deref(), resolve_root(dir.as_deref())),
+        } => serve::exec(&pipeline, poll_interval_ms, approval.as_deref(), callback_url.as_deref(), resolve_root(dir.as_deref())),
         Command::Resume {
             stream,
             from_step,
@@ -313,7 +322,7 @@ fn dispatch(cli: Cli) {
             &stream,
             &from_step,
             dry_run,
-            &approval,
+            approval.as_deref(),
             callback_url.as_deref(),
             resolve_root(dir.as_deref()),
         ),
@@ -346,72 +355,99 @@ pub(crate) fn store_path(root: &Path) -> PathBuf {
     root.join(".zymi").join("events.db")
 }
 
-/// Resolved approval routing for one CLI invocation (ADR-0022).
-/// Carries the configured channel name only — the channel plugin
-/// itself is started by [`start_approval_channels`] once the runtime
-/// (and therefore the bus) exists.
-pub(crate) struct ApprovalSetup {
-    pub channel: Option<String>,
-}
-
-/// Translate a `--approval=…` flag into the runtime config knobs.
+/// Pure resolution of the project-wide default approval channel name
+/// (ADR-0022). Mirrors the layered logic in [`start_approval_channels`]
+/// but does no I/O — the channel name flows into
+/// [`crate::runtime::RuntimeBuilder::with_approval_channel`] *before*
+/// the runtime is built (the bus doesn't exist yet at that point).
 ///
-/// `--approval=terminal` (default) → bus channel `"terminal"`.
-/// `--approval=webhook` → bus channel `"http"` (the
-/// [`crate::webhook::HttpApprovalChannel`]).
-pub(crate) fn prepare_approval(mode: &str) -> Result<ApprovalSetup, String> {
-    match mode {
-        "terminal" => Ok(ApprovalSetup {
-            channel: Some("terminal".into()),
-        }),
+/// 1. `--approval=terminal` → `"terminal"`.
+/// 2. `--approval=webhook`  → `"http"` (when the `webhook` feature is on).
+/// 3. No flag, project declared `default_approval_channel:` → that name.
+/// 4. No flag, project declared `approvals:` without a default → `None`
+///    (orchestrator fail-closes unless a pipeline overrides).
+/// 5. No flag, no `approvals:` → `"terminal"` (zero-config fallback).
+pub(crate) fn pre_resolve_approval(
+    flag_mode: Option<&str>,
+    project: &crate::config::ProjectConfig,
+) -> Option<String> {
+    match flag_mode {
+        Some("terminal") => Some("terminal".into()),
         #[cfg(feature = "webhook")]
-        "webhook" => Ok(ApprovalSetup {
-            channel: Some("http".into()),
-        }),
-        #[cfg(not(feature = "webhook"))]
-        "webhook" => Err(
-            "webhook approval requires the 'webhook' feature. \
-             Rebuild with --features webhook"
-                .into(),
-        ),
-        other => Err(format!(
-            "unknown approval mode '{other}'. Expected 'terminal' or 'webhook'"
-        )),
+        Some("webhook") => Some("http".into()),
+        Some(_) => None,
+        None if !project.approvals.is_empty() => project.default_approval_channel.clone(),
+        None => Some("terminal".into()),
     }
 }
 
-/// Spawn approval channel plugins implied by the CLI mode against the
-/// runtime bus. The returned handles must be drained with
-/// [`crate::approval::ChannelHandle::shutdown`] before process exit so
-/// `JoinHandle::abort` runs and the bus subscriber drops cleanly.
+/// Wire approval channels into the runtime bus.
+///
+/// Resolution logic (ADR-0022):
+///
+/// 1. **Explicit `--approval=` flag** wins (legacy escape hatch — the
+///    same shape as v0.3). `terminal` spawns a [`TerminalApprovalChannel`]
+///    named `"terminal"`; `webhook` spawns an [`HttpApprovalChannel`]
+///    named `"http"` (behind the `webhook` feature). The flag overrides
+///    any YAML-declared channels.
+/// 2. **`approvals:` section in `project.yml`** when the flag is unset.
+///    Every entry is dispatched via the [`build_core_approval_channels`]
+///    plugin registry. The default channel is whatever the project
+///    declared in `default_approval_channel:` (may be `None`, which
+///    triggers fail-closed unless a pipeline overrides).
+/// 3. **Zero-config fallback**: no flag, no `approvals:` → spawn a
+///    terminal channel named `"terminal"`. Preserves the v0.3 UX where
+///    `zymi run <pipeline>` from an interactive shell just prompts.
 pub(crate) async fn start_approval_channels(
-    mode: &str,
+    flag_mode: Option<&str>,
+    project: &crate::config::ProjectConfig,
     bus: Arc<crate::events::bus::EventBus>,
-    #[cfg_attr(not(feature = "webhook"), allow(unused_variables))] callback_url: Option<&str>,
+    #[cfg_attr(not(feature = "webhook"), allow(unused_variables))] flag_callback_url: Option<&str>,
 ) -> Result<Vec<crate::approval::ChannelHandle>, String> {
     use crate::approval::ApprovalChannel;
-    match mode {
-        "terminal" => {
-            let channel = Arc::new(crate::approval::TerminalApprovalChannel::new("terminal"));
-            let handle = channel.start(bus).await?;
-            Ok(vec![handle])
-        }
-        #[cfg(feature = "webhook")]
-        "webhook" => {
-            let bind: std::net::SocketAddr = "127.0.0.1:0"
-                .parse()
-                .map_err(|e| format!("invalid webhook addr: {e}"))?;
-            let mut config =
-                crate::webhook::HttpApprovalChannelConfig::new("http", bind);
-            if let Some(url) = callback_url {
-                config = config.with_callback_url(url);
+
+    if let Some(mode) = flag_mode {
+        return match mode {
+            "terminal" => {
+                let channel = crate::approval::TerminalApprovalChannel::new("terminal");
+                Ok(vec![channel.start(bus).await?])
             }
-            let channel = Arc::new(crate::webhook::HttpApprovalChannel::new(config));
-            let handle = channel.start(bus).await?;
-            Ok(vec![handle])
-        }
-        _ => Ok(Vec::new()),
+            #[cfg(feature = "webhook")]
+            "webhook" => {
+                let bind: std::net::SocketAddr = "127.0.0.1:0"
+                    .parse()
+                    .map_err(|e| format!("invalid webhook addr: {e}"))?;
+                let mut config =
+                    crate::webhook::HttpApprovalChannelConfig::new("http", bind);
+                if let Some(url) = flag_callback_url {
+                    config = config.with_callback_url(url);
+                }
+                let channel = crate::webhook::HttpApprovalChannel::new(config);
+                Ok(vec![channel.start(bus).await?])
+            }
+            #[cfg(not(feature = "webhook"))]
+            "webhook" => Err(
+                "webhook approval requires the 'webhook' feature. \
+                 Rebuild with --features webhook"
+                    .into(),
+            ),
+            other => Err(format!(
+                "unknown approval mode '{other}'. Expected 'terminal' or 'webhook' (or remove --approval to use project.yml::approvals)"
+            )),
+        };
     }
+
+    if !project.approvals.is_empty() {
+        let started = crate::approval::spawn_approval_channels(&project.approvals, bus).await?;
+        for (name, err) in &started.failures {
+            eprintln!("approval channel '{name}' failed to start: {err}");
+        }
+        return Ok(started.handles);
+    }
+
+    // Zero-config fallback: no flag, no approvals: section.
+    let channel = crate::approval::TerminalApprovalChannel::new("terminal");
+    Ok(vec![channel.start(bus).await?])
 }
 
 /// Create a tokio runtime for async operations.

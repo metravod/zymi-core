@@ -9,7 +9,7 @@ use crate::runtime::Runtime;
 pub fn exec(
     pipeline: &str,
     raw_inputs: &[String],
-    approval_mode: &str,
+    approval_mode: Option<&str>,
     callback_url: Option<&str>,
     root: impl AsRef<Path>,
 ) -> Result<(), String> {
@@ -53,16 +53,19 @@ pub fn exec(
 
     let rt = super::runtime();
     let _guard = rt.enter();
-    let approval = super::prepare_approval(approval_mode)?;
+
+    let default_channel = super::pre_resolve_approval(approval_mode, &workspace.project);
+    let project_for_spawn = workspace.project.clone();
 
     let mut builder = Runtime::builder(workspace, root.to_path_buf());
-    if let Some(name) = approval.channel.as_deref() {
+    if let Some(name) = default_channel.as_deref() {
         builder = builder.with_approval_channel(name);
     }
     let runtime = rt.block_on(builder.build_async())?;
 
     let approval_channels = rt.block_on(super::start_approval_channels(
         approval_mode,
+        &project_for_spawn,
         std::sync::Arc::clone(runtime.bus()),
         callback_url,
     ))?;

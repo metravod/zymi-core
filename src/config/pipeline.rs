@@ -18,6 +18,12 @@ pub struct PipelineConfig {
     pub steps: Vec<PipelineStep>,
     #[serde(default)]
     pub output: Option<PipelineOutput>,
+    /// Per-pipeline approval channel override (ADR-0022 §"Resolution
+    /// order"). When set, takes precedence over the project's
+    /// `default_approval_channel:`. The value must match the `name:` of
+    /// an entry under `project.yml::approvals:`.
+    #[serde(default)]
+    pub approval_channel: Option<String>,
 }
 
 /// A declared input parameter for the pipeline.
@@ -150,6 +156,37 @@ steps:
         let path = write_file(&dir, "pipeline.yml", yaml);
         let config = load_pipeline(&path, &HashMap::new()).unwrap();
         assert!(config.steps[0].task.contains("${inputs.q}"));
+    }
+
+    #[test]
+    fn pipeline_approval_channel_parses() {
+        let dir = TempDir::new().unwrap();
+        let yaml = r#"
+name: deploy
+approval_channel: ops_slack
+steps:
+  - id: ship
+    agent: deployer
+    task: "release"
+"#;
+        let path = write_file(&dir, "pipeline.yml", yaml);
+        let config = load_pipeline(&path, &HashMap::new()).unwrap();
+        assert_eq!(config.approval_channel.as_deref(), Some("ops_slack"));
+    }
+
+    #[test]
+    fn pipeline_without_approval_channel_is_none() {
+        let dir = TempDir::new().unwrap();
+        let yaml = r#"
+name: noop
+steps:
+  - id: s
+    agent: a
+    task: t
+"#;
+        let path = write_file(&dir, "pipeline.yml", yaml);
+        let config = load_pipeline(&path, &HashMap::new()).unwrap();
+        assert!(config.approval_channel.is_none());
     }
 
     #[test]
