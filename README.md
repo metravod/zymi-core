@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/zymi-badge.png" alt="zymi" width="220" />
+  <img src="https://raw.githubusercontent.com/metravod/zymi-core/main/assets/zymi-badge.png" alt="zymi" width="220" />
 </p>
 
 <h1 align="center">zymi-core</h1>
@@ -84,6 +84,8 @@ outputs:
 ```
 
 That's it. No Rust. No Python. The scaffold ships with a small two-step DAG — `respond` (assistant with `web_search` / `web_scrape` tools) → `polish` (a brutally lazy reviewer that keeps the draft verbatim unless it's actually broken). Both steps are visible live in `zymi observe`.
+
+Ask the bot to "announce that we're closing at 5pm" and the agent reaches for `tools/broadcast.yml` (`requires_approval: true`). The `approvals:` section in `project.yml` DMs you with ✅ / ❌ buttons; nothing goes out until you click. See [Approvals on the bus](#approvals-on-the-bus) below.
 
 Want a real search backend? Open `tools/web_search.yml`, uncomment a provider block (Brave, Tavily, SerpAPI, Google), set its key in `.env`. Out of the box the bot still works — the assistant just answers from its own knowledge.
 
@@ -233,9 +235,39 @@ Agents don't take actions directly — they emit intentions (`ExecuteShellComman
 
 1. **Policy engine** — shell command allow/deny patterns.
 2. **Contracts** — file-write boundaries, rate limits, tool-specific rules.
-3. **Approval** — terminal prompt, webhook, or fail-closed on deny.
+3. **Approval** — declarative `approvals:` channels (terminal / http / telegram), or fail-closed when no channel is configured.
 
-Nothing with side effects runs until the intention is approved. `zymi run --approval=webhook --callback-url=...` wires an HTTP-backed handler; `--approval=none` runs fail-closed.
+Nothing with side effects runs until the intention is approved.
+
+### Approvals on the bus
+
+Approvals are declarative in `project.yml` ([ADR-0022](adr/0022-event-sourced-approvals.md)). Pick a channel — terminal prompt, HTTP endpoint, or Telegram DM with inline ✅/❌ keyboard — and any tool flagged `requires_approval: true` routes through it.
+
+```yaml
+default_approval_channel: ops_tg
+
+approvals:
+  - type: telegram
+    name: ops_tg
+    bot_token:    "${env.TELEGRAM_BOT_TOKEN}"
+    chat_id:      "${env.TELEGRAM_ADMIN_CHAT_ID}"
+    bind:         "127.0.0.1:8088"
+    callback_path: /telegram/approval
+    secret_token: "${env.TELEGRAM_WEBHOOK_SECRET}"
+```
+
+```yaml
+# tools/broadcast.yml — gated tool
+name: broadcast
+description: "Send an announcement to the team channel."
+parameters: { type: object, properties: { message: { type: string } }, required: [message] }
+requires_approval: true
+implementation:
+  kind: shell
+  command_template: "post-to-slack ${args.message}"
+```
+
+When the agent calls `broadcast`, the bot DMs the admin chat with approve/deny buttons; the click flows back as `ApprovalGranted` / `ApprovalDenied` events. Resolution order is **pipeline override → project default → fail-closed**. Every step is on the event bus, so the audit trail is uniform with the rest of the run, and a hard crash mid-approval is repaired on next start: in-flight requests are redelivered to live channels, expired ones are sealed with `ApprovalDenied{reason: restart_timeout}`. End-to-end demo: `zymi init --example telegram`.
 
 ### JSON Schemas for configs
 
@@ -303,7 +335,7 @@ Inside `zymi serve` the `PipelineRequested → RunPipeline` translation is done 
 
 ```toml
 [dependencies]
-zymi-core = "0.2"
+zymi-core = "0.4"
 ```
 
 ```rust
