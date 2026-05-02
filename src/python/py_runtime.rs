@@ -172,9 +172,18 @@ impl PyRuntime {
             let bus = Arc::clone(runtime.bus());
             let channel = TerminalApprovalChannel::new("terminal");
             let handle = shared_tokio()
-                .block_on(channel.start(bus))
+                .block_on(channel.start(Arc::clone(&bus)))
                 .map_err(|e| PyRuntimeError::new_err(format!("failed to start terminal approval channel: {e}")))?;
             approval_channels.push(handle);
+            // ADR-0022: replay approvals left dangling by a previous crash.
+            if let Err(e) = shared_tokio().block_on(
+                crate::approval::replay_unfulfilled_approvals(
+                    bus,
+                    crate::approval::DEFAULT_APPROVAL_TIMEOUT,
+                ),
+            ) {
+                log::warn!("approval replay skipped: {e}");
+            }
         }
 
         Ok(Self {

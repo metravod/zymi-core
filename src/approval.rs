@@ -393,6 +393,138 @@ pub fn resolve_channel(
         .or_else(|| project_default.map(str::to_string))
 }
 
+/// Outcome of [`replay_unfulfilled_approvals`]. Caller usually only logs
+/// these — the bus already carries the audit-trail events.
+#[derive(Default, Debug)]
+pub struct ApprovalReplayReport {
+    /// Approvals whose age exceeded `timeout`; sealed with a synthesised
+    /// `ApprovalDenied { reason: "restart_timeout" }`.
+    pub expired: Vec<String>,
+    /// Approvals still within their timeout window; redelivered on the
+    /// bus so live channel listeners can re-prompt.
+    pub redelivered: Vec<String>,
+}
+
+/// Walk the event store and reconcile any `ApprovalRequested` whose
+/// matching `ApprovalGranted` / `ApprovalDenied` is missing — the
+/// "startup replay" path of ADR-0022.
+///
+/// On a clean shutdown the orchestrator's await loop synthesises an
+/// `ApprovalDenied { reason: "timeout" }` after the deadline, so the
+/// store self-heals. After a hard crash the await loop is gone but the
+/// `ApprovalRequested` row persists; without this replay, the audit
+/// trail leaves the request open forever and live channel listeners
+/// (which subscribe on the *current* bus) never see it.
+///
+/// For each unfulfilled request:
+/// - If `Utc::now() - timestamp >= timeout` → publish a synthetic
+///   `ApprovalDenied { reason: "restart_timeout" }` so the audit trail
+///   closes.
+/// - Otherwise → [`EventBus::redeliver`] the original event so freshly
+///   started channels can re-prompt. Redeliver does *not* re-append, so
+///   the store is unchanged.
+///
+/// `timeout` should match the runtime's configured approval timeout
+/// (defaults to [`DEFAULT_APPROVAL_TIMEOUT`]). The store doesn't capture
+/// the per-request timeout, so we apply a single project-wide bound.
+///
+/// Channels must already be subscribed before calling this — otherwise
+/// the redelivered events are dropped on the floor. Call after
+/// [`spawn_approval_channels`] returns.
+pub async fn replay_unfulfilled_approvals(
+    bus: Arc<EventBus>,
+    timeout: Duration,
+) -> Result<ApprovalReplayReport, String> {
+    use chrono::Utc;
+    use std::collections::HashMap;
+
+    let store = Arc::clone(bus.store());
+
+    // Pass 1: scan the entire store, collecting outstanding
+    // ApprovalRequested events and the set of decided approval_ids.
+    // We need *both* the original event (for redeliver) and its
+    // timestamp/correlation_id (for the synthetic denial) — keep the
+    // full Event handy.
+    let mut pending: HashMap<String, Event> = HashMap::new();
+    let mut decided: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    let batch = 1024usize;
+    let mut from = 0u64;
+    loop {
+        let tailed = store
+            .tail(from, batch)
+            .await
+            .map_err(|e| format!("approval replay: tail: {e}"))?;
+        if tailed.is_empty() {
+            break;
+        }
+        for t in &tailed {
+            match &t.event.kind {
+                EventKind::ApprovalRequested { approval_id, .. } => {
+                    pending.insert(approval_id.clone(), t.event.clone());
+                }
+                EventKind::ApprovalGranted { approval_id, .. }
+                | EventKind::ApprovalDenied { approval_id, .. } => {
+                    decided.insert(approval_id.clone());
+                }
+                _ => {}
+            }
+        }
+        let last = tailed.last().expect("non-empty checked above").global_seq;
+        from = last;
+        if tailed.len() < batch {
+            break;
+        }
+    }
+
+    pending.retain(|id, _| !decided.contains(id));
+    if pending.is_empty() {
+        return Ok(ApprovalReplayReport::default());
+    }
+
+    let now = Utc::now();
+    let timeout_chrono = chrono::Duration::from_std(timeout)
+        .unwrap_or_else(|_| chrono::Duration::seconds(300));
+
+    let mut report = ApprovalReplayReport::default();
+    for (approval_id, ev) in pending {
+        let age = now.signed_duration_since(ev.timestamp);
+        if age >= timeout_chrono {
+            // Expired across the restart — seal the audit trail.
+            let stream_id = match &ev.kind {
+                EventKind::ApprovalRequested { stream_id, .. } => stream_id.clone(),
+                _ => unreachable!("pending only holds ApprovalRequested"),
+            };
+            let denied = Event::new(
+                stream_id.clone(),
+                EventKind::ApprovalDenied {
+                    approval_id: approval_id.clone(),
+                    stream_id,
+                    decided_by: "orchestrator".into(),
+                    reason: Some("restart_timeout".into()),
+                },
+                "orchestrator".into(),
+            );
+            let denied = if let Some(corr) = ev.correlation_id {
+                denied.with_correlation(corr)
+            } else {
+                denied
+            };
+            if let Err(e) = bus.publish(denied).await {
+                log::warn!("approval replay: failed to publish restart_timeout for {approval_id}: {e}");
+                continue;
+            }
+            report.expired.push(approval_id);
+        } else {
+            // Still in-flight — let live channels see the request again.
+            bus.redeliver(Arc::new(ev)).await;
+            report.redelivered.push(approval_id);
+        }
+    }
+
+    Ok(report)
+}
+
 /// Telegram-driven [`ApprovalChannel`] (ADR-0022). Builds on the same
 /// reqwest + axum stack that backs `http_post` / `http_inbound` —
 /// declarative composition rather than a new transport.
@@ -908,6 +1040,159 @@ mod resolver_tests {
         let (name, channel) = registry.build_one(entry).unwrap();
         assert_eq!(name, "ops_tg");
         assert_eq!(channel.name(), "ops_tg");
+    }
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+    use crate::events::store::SqliteEventStore;
+    use tempfile::TempDir;
+
+    async fn setup() -> (TempDir, Arc<EventBus>) {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(SqliteEventStore::new(&dir.path().join("replay.db")).unwrap());
+        let bus = Arc::new(EventBus::new(store));
+        (dir, bus)
+    }
+
+    /// Approval older than the timeout window gets sealed with
+    /// `restart_timeout` so the audit trail closes.
+    #[tokio::test]
+    async fn expired_request_sealed_with_restart_timeout() {
+        let (_dir, bus) = setup().await;
+
+        // Forge an ApprovalRequested with a stale timestamp.
+        let mut stale = Event::new(
+            "stream-A".into(),
+            EventKind::ApprovalRequested {
+                approval_id: "old-1".into(),
+                stream_id: "stream-A".into(),
+                description: "rm -rf /".into(),
+                explanation: None,
+                channel: "terminal".into(),
+            },
+            "orchestrator".into(),
+        );
+        stale.timestamp = chrono::Utc::now() - chrono::Duration::seconds(3600);
+        bus.store().append(&mut stale.clone()).await.unwrap();
+
+        let report = replay_unfulfilled_approvals(Arc::clone(&bus), Duration::from_secs(60))
+            .await
+            .unwrap();
+
+        assert_eq!(report.expired, vec!["old-1".to_string()]);
+        assert!(report.redelivered.is_empty());
+
+        // ApprovalDenied{restart_timeout} now lives in the store.
+        let mut from = 0u64;
+        let mut found = false;
+        loop {
+            let batch = bus.store().tail(from, 256).await.unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            for t in &batch {
+                if let EventKind::ApprovalDenied { approval_id, reason, .. } = &t.event.kind {
+                    if approval_id == "old-1" && reason.as_deref() == Some("restart_timeout") {
+                        found = true;
+                    }
+                }
+            }
+            from = batch.last().unwrap().global_seq;
+            if batch.len() < 256 {
+                break;
+            }
+        }
+        assert!(found, "expected ApprovalDenied{{restart_timeout}} in store");
+    }
+
+    /// In-flight approval (still within timeout window) is redelivered to
+    /// live subscribers; the store gains no new events.
+    ///
+    /// Append straight to the store instead of [`EventBus::publish`] —
+    /// publish records the id in the bus's local-dedup ring, which is
+    /// exactly what suppresses double-delivery from the tail watcher.
+    /// We're modelling a *fresh* process where that ring is empty.
+    #[tokio::test]
+    async fn in_flight_request_redelivered() {
+        let (_dir, bus) = setup().await;
+
+        let mut req = Event::new(
+            "stream-B".into(),
+            EventKind::ApprovalRequested {
+                approval_id: "fresh-1".into(),
+                stream_id: "stream-B".into(),
+                description: "hello".into(),
+                explanation: None,
+                channel: "terminal".into(),
+            },
+            "orchestrator".into(),
+        );
+        bus.store().append(&mut req).await.unwrap();
+        let pre_seq = bus.store().current_global_seq().await.unwrap();
+
+        let mut rx = bus.subscribe().await;
+
+        let report = replay_unfulfilled_approvals(Arc::clone(&bus), Duration::from_secs(3600))
+            .await
+            .unwrap();
+
+        assert_eq!(report.redelivered, vec!["fresh-1".to_string()]);
+        assert!(report.expired.is_empty());
+
+        // Subscriber sees the redelivered event.
+        let ev = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("redelivered event timeout")
+            .expect("bus closed");
+        match &ev.kind {
+            EventKind::ApprovalRequested { approval_id, .. } => {
+                assert_eq!(approval_id, "fresh-1");
+            }
+            other => panic!("expected ApprovalRequested, got {other:?}"),
+        }
+
+        // Store unchanged — redeliver does not append.
+        assert_eq!(bus.store().current_global_seq().await.unwrap(), pre_seq);
+    }
+
+    /// Already-decided approvals are ignored — replay touches nothing.
+    #[tokio::test]
+    async fn decided_request_ignored() {
+        let (_dir, bus) = setup().await;
+
+        let req = Event::new(
+            "stream-C".into(),
+            EventKind::ApprovalRequested {
+                approval_id: "done-1".into(),
+                stream_id: "stream-C".into(),
+                description: "x".into(),
+                explanation: None,
+                channel: "terminal".into(),
+            },
+            "orchestrator".into(),
+        );
+        bus.publish(req).await.unwrap();
+
+        let granted = Event::new(
+            "stream-C".into(),
+            EventKind::ApprovalGranted {
+                approval_id: "done-1".into(),
+                stream_id: "stream-C".into(),
+                decided_by: "alice".into(),
+                reason: None,
+            },
+            "channel".into(),
+        );
+        bus.publish(granted).await.unwrap();
+
+        let report = replay_unfulfilled_approvals(Arc::clone(&bus), Duration::from_secs(3600))
+            .await
+            .unwrap();
+
+        assert!(report.expired.is_empty());
+        assert!(report.redelivered.is_empty());
     }
 }
 

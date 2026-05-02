@@ -407,10 +407,10 @@ pub(crate) async fn start_approval_channels(
     use crate::approval::ApprovalChannel;
 
     if let Some(mode) = flag_mode {
-        return match mode {
+        let handles = match mode {
             "terminal" => {
                 let channel = crate::approval::TerminalApprovalChannel::new("terminal");
-                Ok(vec![channel.start(bus).await?])
+                vec![channel.start(Arc::clone(&bus)).await?]
             }
             #[cfg(feature = "webhook")]
             "webhook" => {
@@ -423,31 +423,64 @@ pub(crate) async fn start_approval_channels(
                     config = config.with_callback_url(url);
                 }
                 let channel = crate::webhook::HttpApprovalChannel::new(config);
-                Ok(vec![channel.start(bus).await?])
+                vec![channel.start(Arc::clone(&bus)).await?]
             }
             #[cfg(not(feature = "webhook"))]
-            "webhook" => Err(
+            "webhook" => return Err(
                 "webhook approval requires the 'webhook' feature. \
                  Rebuild with --features webhook"
                     .into(),
             ),
-            other => Err(format!(
+            other => return Err(format!(
                 "unknown approval mode '{other}'. Expected 'terminal' or 'webhook' (or remove --approval to use project.yml::approvals)"
             )),
         };
+        replay_pending_approvals(Arc::clone(&bus)).await;
+        return Ok(handles);
     }
 
     if !project.approvals.is_empty() {
-        let started = crate::approval::spawn_approval_channels(&project.approvals, bus).await?;
+        let started = crate::approval::spawn_approval_channels(&project.approvals, Arc::clone(&bus)).await?;
         for (name, err) in &started.failures {
             eprintln!("approval channel '{name}' failed to start: {err}");
         }
+        replay_pending_approvals(Arc::clone(&bus)).await;
         return Ok(started.handles);
     }
 
     // Zero-config fallback: no flag, no approvals: section.
     let channel = crate::approval::TerminalApprovalChannel::new("terminal");
-    Ok(vec![channel.start(bus).await?])
+    let handles = vec![channel.start(Arc::clone(&bus)).await?];
+    replay_pending_approvals(Arc::clone(&bus)).await;
+    Ok(handles)
+}
+
+/// Best-effort replay of approvals left dangling by a previous process
+/// crash (ADR-0022). Logs a warning on store-read failure rather than
+/// aborting startup — replay is housekeeping, not a hard requirement.
+async fn replay_pending_approvals(bus: Arc<crate::events::bus::EventBus>) {
+    match crate::approval::replay_unfulfilled_approvals(
+        bus,
+        crate::approval::DEFAULT_APPROVAL_TIMEOUT,
+    )
+    .await
+    {
+        Ok(report) => {
+            if !report.expired.is_empty() {
+                log::info!(
+                    "approval replay: sealed {} expired request(s) with restart_timeout",
+                    report.expired.len()
+                );
+            }
+            if !report.redelivered.is_empty() {
+                log::info!(
+                    "approval replay: redelivered {} in-flight request(s) to live channels",
+                    report.redelivered.len()
+                );
+            }
+        }
+        Err(e) => log::warn!("approval replay skipped: {e}"),
+    }
 }
 
 /// Create a tokio runtime for async operations.

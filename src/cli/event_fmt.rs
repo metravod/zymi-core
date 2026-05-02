@@ -507,3 +507,83 @@ pub fn truncate(s: &str, max: usize) -> &str {
         &s[..end]
     }
 }
+
+#[cfg(test)]
+mod approval_render_tests {
+    //! Lock down the operator-facing rendering of approval events
+    //! (ADR-0022 sub-8). `zymi runs` and the observe TUI both call
+    //! [`format_event`], so testing it covers both surfaces.
+    use super::*;
+    use crate::events::{Event, EventKind};
+
+    fn req(channel: &str) -> Event {
+        Event::new(
+            "stream-1".into(),
+            EventKind::ApprovalRequested {
+                approval_id: "a-1".into(),
+                stream_id: "stream-1".into(),
+                description: "delete /etc/passwd".into(),
+                explanation: Some("matches deny pattern".into()),
+                channel: channel.into(),
+            },
+            "orchestrator".into(),
+        )
+    }
+
+    #[test]
+    fn approval_requested_renders_as_warning_with_channel() {
+        let f = format_event(&req("ops_tg"));
+        assert_eq!(f.label, "Approval");
+        assert!(matches!(f.color, EventColor::Warning));
+        assert!(f.short_detail.starts_with("ops_tg:"));
+        assert!(f.full_detail.contains("id: a-1"));
+        assert!(f.full_detail.contains("channel: ops_tg"));
+        assert!(f.full_detail.contains("explanation: matches deny pattern"));
+    }
+
+    #[test]
+    fn approval_granted_renders_as_success_with_decided_by() {
+        let ev = Event::new(
+            "stream-1".into(),
+            EventKind::ApprovalGranted {
+                approval_id: "a-1".into(),
+                stream_id: "stream-1".into(),
+                decided_by: "telegram:alice".into(),
+                reason: None,
+            },
+            "channel".into(),
+        );
+        let f = format_event(&ev);
+        assert_eq!(f.label, "Approved");
+        assert!(matches!(f.color, EventColor::Success));
+        assert_eq!(f.short_detail, "by telegram:alice");
+    }
+
+    /// Surface the `restart_timeout` reason produced by replay sub-7
+    /// so operators see why an approval was sealed across a crash.
+    #[test]
+    fn approval_denied_restart_timeout_surfaced_in_short_detail() {
+        let ev = Event::new(
+            "stream-1".into(),
+            EventKind::ApprovalDenied {
+                approval_id: "a-1".into(),
+                stream_id: "stream-1".into(),
+                decided_by: "orchestrator".into(),
+                reason: Some("restart_timeout".into()),
+            },
+            "orchestrator".into(),
+        );
+        let f = format_event(&ev);
+        assert_eq!(f.label, "Denied");
+        assert!(matches!(f.color, EventColor::Failure));
+        assert!(f.short_detail.contains("restart_timeout"));
+        assert!(f.full_detail.contains("reason: restart_timeout"));
+    }
+
+    /// Approval events must indent under the parent intention/tool so the
+    /// TUI tree shows the human-decision sub-flow.
+    #[test]
+    fn approval_events_indented_for_tui_tree() {
+        assert_eq!(format_event(&req("terminal")).indent, 2);
+    }
+}
