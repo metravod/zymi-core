@@ -140,6 +140,10 @@ impl ActionExecutor for CatalogActionExecutor {
         if self.catalog.is_mcp(tool_name) {
             return self.execute_mcp(tool_name, arguments_json).await;
         }
+        #[cfg(feature = "python")]
+        if self.catalog.is_python(tool_name) {
+            return self.execute_python(tool_name, arguments_json).await;
+        }
         if self.catalog.is_declarative(tool_name) {
             let config = self.catalog.declarative_config(tool_name)
                 .ok_or_else(|| format!("declarative tool '{tool_name}' config missing"))?;
@@ -224,6 +228,73 @@ fn render_mcp_content(content: &[serde_json::Value]) -> String {
         "(no content)".to_string()
     } else {
         parts.join("\n")
+    }
+}
+
+#[cfg(feature = "python")]
+impl CatalogActionExecutor {
+    /// Dispatch an auto-discovered Python tool through the embedded
+    /// interpreter (ADR-0014 slice 3).
+    ///
+    /// Acquires the GIL, deserialises `arguments_json` into a Python
+    /// dict, calls the registered callable with `**kwargs`, and returns
+    /// `str(result)`. Async functions are resolved via the same
+    /// `asyncio.run`-with-fallback path the user-facing `ToolRegistry`
+    /// uses.
+    async fn execute_python(
+        &self,
+        tool_name: &str,
+        arguments_json: &str,
+    ) -> Result<String, String> {
+        // Parse args outside the GIL closure so a malformed JSON body
+        // fails before we cross into Python.
+        let args_value: serde_json::Value = if arguments_json.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(arguments_json)
+                .map_err(|e| format!("python tool '{tool_name}' invalid arguments json: {e}"))?
+        };
+
+        // Hold the catalog as an Arc so the closure can keep it alive
+        // and reach back to the entry inside with_gil — that's where
+        // we can safely clone the Py<PyAny> handle and call it.
+        let catalog = std::sync::Arc::clone(&self.catalog);
+        let tool_label = tool_name.to_string();
+
+        // spawn_blocking: pyo3 calls park the tokio worker on the GIL
+        // anyway; the blocking pool is the right home for a "may take a
+        // while" call. From-the-blocking-pool back-into-tokio is fine
+        // because we await the join handle here.
+        let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
+            pyo3::Python::with_gil(|py| {
+                let entry = catalog
+                    .python_entry(&tool_label)
+                    .ok_or_else(|| format!("python tool '{tool_label}' not registered"))?;
+                let kwargs = crate::python::tool::json_value_to_pydict_pub(py, &args_value)
+                    .map_err(|e| format!("python tool '{tool_label}' arg conversion: {e}"))?;
+                let raw = entry
+                    .callable
+                    .call_bound(py, (), Some(&kwargs))
+                    .map_err(|e| format!("python tool '{tool_label}' raised: {e}"))?;
+                let resolved = if entry.is_async {
+                    crate::python::tool::run_coroutine_pub(py, &raw)
+                        .map_err(|e| format!("python tool '{tool_label}' coroutine: {e}"))?
+                } else {
+                    raw
+                };
+                use pyo3::types::PyAnyMethods;
+                let s: String = resolved
+                    .bind(py)
+                    .str()
+                    .map_err(|e| format!("python tool '{tool_label}' str(): {e}"))?
+                    .to_string();
+                Ok(s)
+            })
+        })
+        .await
+        .map_err(|e| format!("python tool '{tool_name}' join: {e}"))??;
+
+        Ok(result)
     }
 }
 

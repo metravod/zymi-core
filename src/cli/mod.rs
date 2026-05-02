@@ -262,6 +262,7 @@ pub fn run_from_args(args: impl IntoIterator<Item = String>) {
 }
 
 fn dispatch(cli: Cli) {
+    load_dotenv(command_dir(&cli.command));
     let result = match cli.command {
         Command::Init { name, example } => init::exec(name, example.as_deref()),
         Command::Run {
@@ -350,9 +351,104 @@ fn resolve_root(dir: Option<&Path>) -> PathBuf {
         .unwrap_or_else(|| std::env::current_dir().expect("cannot determine current directory"))
 }
 
+/// Inspect the parsed subcommand for its `--dir` argument, if it carries
+/// one. Used solely to seed `.env` loading before dispatch.
+fn command_dir(cmd: &Command) -> Option<&Path> {
+    match cmd {
+        Command::Run { dir, .. }
+        | Command::Events { dir, .. }
+        | Command::Pipelines { dir }
+        | Command::Runs { dir, .. }
+        | Command::Observe { dir, .. }
+        | Command::Verify { dir, .. }
+        | Command::Serve { dir, .. }
+        | Command::Resume { dir, .. } => dir.as_deref(),
+        Command::Init { .. } | Command::Mcp { .. } | Command::Schema { .. } => None,
+    }
+}
+
+/// Load `.env` next to `project.yml` so users don't have to remember
+/// `set -a; source .env; set +a` before every CLI invocation.
+///
+/// Resolution order:
+///   1. The path passed via `--dir`, if the subcommand has one;
+///   2. The current working directory.
+///
+/// Existing process env vars always win — `.env` only fills holes. We
+/// log on parse error but never fail the command: a malformed `.env`
+/// shouldn't take down `zymi schema`.
+fn load_dotenv(explicit_dir: Option<&Path>) {
+    let mut tried: Vec<PathBuf> = Vec::new();
+    if let Some(d) = explicit_dir {
+        tried.push(d.join(".env"));
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        let cwd_env = cwd.join(".env");
+        if !tried.iter().any(|p| p == &cwd_env) {
+            tried.push(cwd_env);
+        }
+    }
+    for path in tried {
+        if !path.exists() {
+            continue;
+        }
+        match dotenvy::from_path(&path) {
+            Ok(()) => log::debug!("loaded env from {}", path.display()),
+            Err(e) => log::warn!("could not load {}: {e}", path.display()),
+        }
+    }
+}
+
 /// Path to the event store database within a project.
 pub(crate) fn store_path(root: &Path) -> PathBuf {
     root.join(".zymi").join("events.db")
+}
+
+/// Resolve the configured event-store backend for read-only CLI
+/// subcommands (`events`, `runs`, `observe`, `resume`, …) that don't go
+/// through `RuntimeBuilder`. Honours `project.yml`'s `store:` field;
+/// falls back to embedded sqlite at `<root>/.zymi/events.db` when the
+/// project file is absent (some commands are usable in pure inspection
+/// mode without a fully-configured project).
+pub(crate) fn resolve_store_backend_for_cli(
+    root: &Path,
+) -> Result<crate::events::store::StoreBackend, String> {
+    use crate::events::store::StoreBackend;
+    let project_path = root.join("project.yml");
+    if !project_path.exists() {
+        return Ok(StoreBackend::Sqlite {
+            path: store_path(root),
+        });
+    }
+    let workspace = crate::config::load_project_dir(root)
+        .map_err(|e| format!("failed to load project: {e}"))?;
+    workspace
+        .project
+        .resolve_store_backend(root)
+        .map_err(|e| format!("project.store: {e}"))
+}
+
+/// Human-friendly label for a [`StoreBackend`] used in CLI banners and
+/// error messages.
+pub(crate) fn describe_backend(backend: &crate::events::store::StoreBackend) -> String {
+    use crate::events::store::StoreBackend;
+    match backend {
+        StoreBackend::Sqlite { path } => path.display().to_string(),
+        StoreBackend::Postgres { url } => redact_url(url),
+    }
+}
+
+fn redact_url(url: &str) -> String {
+    // Strip any inline password — `postgres://user:pw@host/db` →
+    // `postgres://user:***@host/db` — so the banner is safe to copy/paste.
+    if let Some((scheme_user, rest)) = url.split_once("://") {
+        if let Some((auth, host_rest)) = rest.split_once('@') {
+            if let Some((user, _pw)) = auth.split_once(':') {
+                return format!("{scheme_user}://{user}:***@{host_rest}");
+            }
+        }
+    }
+    url.to_string()
 }
 
 /// Pure resolution of the project-wide default approval channel name

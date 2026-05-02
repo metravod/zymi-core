@@ -639,6 +639,9 @@ extract:
         let ctx = PluginContext {
             bus: SArc::clone(&bus),
             project_root: dir.path().to_path_buf(),
+            cursor_store: SArc::new(
+                crate::connectors::cursor_store::SqliteCursorStore::in_memory(),
+            ),
         };
         let handle = connector.start("hook".into(), ctx).await.unwrap();
 
@@ -676,6 +679,9 @@ extract:
         let ctx = PluginContext {
             bus: SArc::clone(&bus),
             project_root: dir.path().to_path_buf(),
+            cursor_store: SArc::new(
+                crate::connectors::cursor_store::SqliteCursorStore::in_memory(),
+            ),
         };
         let handle = connector.start("hook".into(), ctx).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;

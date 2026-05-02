@@ -20,6 +20,7 @@ use serde_yml::Value as YamlValue;
 use tokio_util::sync::CancellationToken;
 
 use crate::connectors::cursor_store::CursorStore;
+use std::sync::Arc as StdArc;
 use crate::connectors::{ConnectorError, InboundConnector, PluginContext, PluginHandle};
 use crate::events::{Event, EventKind};
 use crate::plugin::PluginBuilder;
@@ -190,11 +191,8 @@ impl InboundConnector for HttpPollConnector {
         resolved_name: String,
         ctx: PluginContext,
     ) -> Result<PluginHandle, ConnectorError> {
-        let cursor_store = match &self.cfg.cursor {
-            Some(c) if c.persist => Some(
-                CursorStore::open(&ctx.project_root)
-                    .map_err(|e| ConnectorError::Internal(e.to_string()))?,
-            ),
+        let cursor_store: Option<StdArc<dyn CursorStore>> = match &self.cfg.cursor {
+            Some(c) if c.persist => Some(StdArc::clone(&ctx.cursor_store)),
             _ => None,
         };
 
@@ -247,7 +245,7 @@ async fn run_poll_loop(
     client: reqwest::Client,
     compiled: Arc<Compiled>,
     ctx: PluginContext,
-    cursor_store: Option<CursorStore>,
+    cursor_store: Option<StdArc<dyn CursorStore>>,
     shutdown: CancellationToken,
 ) {
     log::info!("http_poll '{name}' started (every {}s)", cfg.interval_secs);
@@ -658,6 +656,9 @@ pipeline_input: message
         let ctx = PluginContext {
             bus: SArc::clone(&bus),
             project_root: dir.path().to_path_buf(),
+            cursor_store: SArc::new(
+                crate::connectors::cursor_store::SqliteCursorStore::in_memory(),
+            ),
         };
         let handle = connector.start("telegram".into(), ctx).await.unwrap();
 

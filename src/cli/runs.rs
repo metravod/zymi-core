@@ -2,11 +2,11 @@ use std::path::Path;
 
 use chrono::Local;
 
-use crate::events::store::{open_store, StoreBackend};
+use crate::events::store::{open_store_async, StoreBackend};
 
 use super::event_fmt::{BOLD, DIM, GREEN, RED, RESET, YELLOW};
 use super::runs_data::{format_duration, list_runs, RunStatus, RunSummary};
-use super::{runtime, store_path};
+use super::{resolve_store_backend_for_cli, runtime};
 
 pub fn exec(
     pipeline_filter: Option<&str>,
@@ -14,18 +14,20 @@ pub fn exec(
     raw: bool,
     root: impl AsRef<Path>,
 ) -> Result<(), String> {
-    let db_path = store_path(root.as_ref());
-    if !db_path.exists() {
-        return Err(format!(
-            "no event store found at {}. Run a pipeline first or check --dir.",
-            db_path.display()
-        ));
+    let backend = resolve_store_backend_for_cli(root.as_ref())?;
+    if let StoreBackend::Sqlite { path } = &backend {
+        if !path.exists() {
+            return Err(format!(
+                "no event store found at {}. Run a pipeline first or check --dir.",
+                path.display()
+            ));
+        }
     }
 
-    let store = open_store(StoreBackend::Sqlite { path: db_path })
-        .map_err(|e| format!("failed to open event store: {e}"))?;
-
     let rt = runtime();
+    let store = rt
+        .block_on(open_store_async(backend))
+        .map_err(|e| format!("failed to open event store: {e}"))?;
     let runs = rt.block_on(list_runs(store, pipeline_filter))?;
     let shown: Vec<_> = runs.iter().take(limit).collect();
 

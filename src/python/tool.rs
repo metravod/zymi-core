@@ -358,7 +358,7 @@ fn check_is_async(py: Python<'_>, func: &PyObject) -> PyResult<bool> {
 }
 
 /// Introspect a Python function to extract name, docstring, JSON Schema, and async flag.
-fn introspect_function(
+pub(crate) fn introspect_function(
     py: Python<'_>,
     func: &PyObject,
 ) -> PyResult<(String, String, serde_json::Value, bool)> {
@@ -515,6 +515,22 @@ fn python_type_to_json_schema(
 }
 
 /// Run a Python coroutine, handling the case where an event loop is already running.
+#[allow(dead_code)]
+pub(crate) fn run_coroutine_pub(py: Python<'_>, coro: &PyObject) -> PyResult<PyObject> {
+    run_coroutine(py, coro)
+}
+
+/// Convert a Python dict to JSON via json.dumps. Public so the auto-discovery
+/// loader can hand a serialised result back to the catalog.
+#[allow(dead_code)]
+pub(crate) fn json_value_to_pydict_pub<'py>(
+    py: Python<'py>,
+    value: &serde_json::Value,
+) -> PyResult<Bound<'py, PyDict>> {
+    json_value_to_pydict(py, value)
+}
+
+
 ///
 /// Tries `asyncio.run()` first. If that fails because a loop is already running,
 /// creates a new thread with its own event loop to execute the coroutine.

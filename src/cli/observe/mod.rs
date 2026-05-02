@@ -29,11 +29,11 @@ use ratatui::Terminal;
 use tokio::sync::mpsc;
 
 use crate::config::load_project_dir;
-use crate::events::store::{open_store, StoreBackend};
+use crate::events::store::{open_store_async, StoreBackend};
 use crate::handlers::resume_pipeline::{self, ResumePipeline};
 use crate::runtime::Runtime;
 
-use super::{runtime, store_path};
+use super::{resolve_store_backend_for_cli, runtime};
 
 use self::app::{App, ForkPrompt, ForkState, Focus};
 
@@ -46,24 +46,27 @@ struct ForkResult {
 
 pub fn exec(initial_run: Option<&str>, root: impl AsRef<Path>) -> Result<(), String> {
     let root = root.as_ref().to_path_buf();
-    let db_path = store_path(&root);
-    if !db_path.exists() {
-        return Err(format!(
-            "no event store found at {}. Run a pipeline first or check --dir.",
-            db_path.display()
-        ));
+    let backend = resolve_store_backend_for_cli(&root)?;
+    if let StoreBackend::Sqlite { path } = &backend {
+        if !path.exists() {
+            return Err(format!(
+                "no event store found at {}. Run a pipeline first or check --dir.",
+                path.display()
+            ));
+        }
     }
 
     let rt = runtime();
-    rt.block_on(run_loop(root, db_path, initial_run.map(|s| s.to_string())))
+    rt.block_on(run_loop(root, backend, initial_run.map(|s| s.to_string())))
 }
 
 async fn run_loop(
     root: PathBuf,
-    db_path: PathBuf,
+    backend: StoreBackend,
     initial_run: Option<String>,
 ) -> Result<(), String> {
-    let store = open_store(StoreBackend::Sqlite { path: db_path })
+    let store = open_store_async(backend)
+        .await
         .map_err(|e| format!("failed to open event store: {e}"))?;
 
     let mut app = App::new(root, store.clone());

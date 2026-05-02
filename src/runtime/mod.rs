@@ -364,8 +364,10 @@ impl RuntimeBuilder {
         // We need the bus early so both `spawn_mcp_servers` and the
         // connector tasks wire themselves to the same bus `build_inner`
         // will end up owning. If the caller didn't inject one, mirror
-        // `build_inner`'s default.
-        let bus_for_startup = self.resolve_bus_for_startup()?;
+        // `build_inner`'s default — but consult `project.store` so a
+        // Postgres-configured project actually opens Postgres here, not
+        // a stale sqlite file.
+        let bus_for_startup = self.resolve_bus_for_startup_async().await?;
 
         let mcp_outcome = if mcp_specs.is_empty() {
             SpawnOutcome::default()
@@ -386,6 +388,15 @@ impl RuntimeBuilder {
         }
 
         let project_root = self.project_root.clone();
+        // Resolve the store backend off the original ProjectConfig before
+        // consuming `self` into `build_inner`. We need it later to pair
+        // the cursor store with the event-store backend.
+        #[cfg(feature = "connectors")]
+        let store_backend_for_cursor = self
+            .workspace
+            .project
+            .resolve_store_backend(&project_root)
+            .map_err(|e| format!("project.store: {e}"))?;
         let self_with_bus = self.with_event_bus(Arc::clone(&bus_for_startup));
         let runtime = self_with_bus.build_inner(mcp_outcome.state)?;
 
@@ -408,16 +419,28 @@ impl RuntimeBuilder {
         // ── Connectors & outputs (ADR-0021) ────────────────────────────
         #[cfg(feature = "connectors")]
         {
+            // Pair the cursor store with the event-store backend so
+            // multi-process `zymi serve` against a shared Postgres
+            // doesn't double-fire `update_id`-style cursors.
+            let cursor_store = crate::connectors::cursor_store::open_cursor_store(
+                &store_backend_for_cursor,
+                &project_root,
+            )
+            .await
+            .map_err(|e| format!("failed to open cursor store: {e}"))?;
+
             let connector_startup = crate::connectors::spawn_connectors(
                 &connector_entries,
                 Arc::clone(runtime.bus()),
                 project_root.clone(),
+                Arc::clone(&cursor_store),
             )
             .await?;
             let output_startup = crate::connectors::spawn_outputs(
                 &output_entries,
                 Arc::clone(runtime.bus()),
                 project_root.clone(),
+                cursor_store,
             )
             .await?;
 
@@ -456,23 +479,34 @@ impl RuntimeBuilder {
         Ok(runtime)
     }
 
-    /// Resolve the event bus `build_inner` will end up using, so that
-    /// [`spawn_mcp_servers`] can share it. If the caller injected both a bus
-    /// and a store, reuse them. If the caller injected only a store, build
-    /// the bus over it. Otherwise open the default SQLite store and bus —
-    /// matching the untouched happy path in `build_inner`.
-    fn resolve_bus_for_startup(&self) -> Result<Arc<EventBus>, String> {
+    /// Async resolution of the bus + store the runtime will own. Honours
+    /// `project.store` (so Postgres projects actually hit Postgres on the
+    /// `build_async` path) and falls back to embedded SQLite at
+    /// `<project_root>/.zymi/events.db`. The returned bus is the one
+    /// `build_inner` will adopt via [`with_event_bus`].
+    async fn resolve_bus_for_startup_async(&self) -> Result<Arc<EventBus>, String> {
         if let Some(bus) = self.bus.as_ref() {
             return Ok(Arc::clone(bus));
         }
         let store: Arc<dyn EventStore> = match self.store.as_ref() {
             Some(s) => Arc::clone(s),
             None => {
-                let store_dir = self.project_root.join(".zymi");
-                std::fs::create_dir_all(&store_dir)
-                    .map_err(|e| format!("failed to create .zymi directory: {e}"))?;
-                let db_path = store_dir.join("events.db");
-                open_store(StoreBackend::Sqlite { path: db_path })
+                let backend = self
+                    .workspace
+                    .project
+                    .resolve_store_backend(&self.project_root)
+                    .map_err(|e| format!("project.store: {e}"))?;
+                if let StoreBackend::Sqlite { path } = &backend {
+                    if let Some(parent) = path.parent() {
+                        if !parent.as_os_str().is_empty() {
+                            std::fs::create_dir_all(parent).map_err(|e| {
+                                format!("failed to create store directory {}: {e}", parent.display())
+                            })?;
+                        }
+                    }
+                }
+                crate::events::store::open_store_async(backend)
+                    .await
                     .map_err(|e| format!("failed to open event store: {e}"))?
             }
         };
@@ -499,17 +533,41 @@ impl RuntimeBuilder {
             provider: provider_override,
         } = self;
 
-        // 1. Store + bus — either injected together, or build the SQLite
-        //    default at <project_root>/.zymi/events.db.
+        // 1. Store + bus — either injected together, or open the
+        //    backend declared by `project.store` (defaulting to embedded
+        //    sqlite at <project_root>/.zymi/events.db). The sync
+        //    `build()` entrypoint can only open a sqlite backend; any
+        //    other configured backend (e.g. Postgres) requires going
+        //    through `build_async` so the connect can await.
         let store: Arc<dyn EventStore> = match store {
             Some(s) => s,
             None => {
-                let store_dir = project_root.join(".zymi");
-                std::fs::create_dir_all(&store_dir)
-                    .map_err(|e| format!("failed to create .zymi directory: {e}"))?;
-                let db_path = store_dir.join("events.db");
-                open_store(StoreBackend::Sqlite { path: db_path })
-                    .map_err(|e| format!("failed to open event store: {e}"))?
+                let backend = workspace
+                    .project
+                    .resolve_store_backend(&project_root)
+                    .map_err(|e| format!("project.store: {e}"))?;
+                match backend {
+                    StoreBackend::Sqlite { path } => {
+                        if let Some(parent) = path.parent() {
+                            if !parent.as_os_str().is_empty() {
+                                std::fs::create_dir_all(parent).map_err(|e| {
+                                    format!(
+                                        "failed to create store directory {}: {e}",
+                                        parent.display()
+                                    )
+                                })?;
+                            }
+                        }
+                        open_store(StoreBackend::Sqlite { path })
+                            .map_err(|e| format!("failed to open event store: {e}"))?
+                    }
+                    other => {
+                        return Err(format!(
+                            "project.store backend {other:?} requires async open — \
+                             call RuntimeBuilder::build_async or inject a pre-built store"
+                        ));
+                    }
+                }
             }
         };
         let bus = bus.unwrap_or_else(|| Arc::new(EventBus::new(Arc::clone(&store))));
@@ -542,14 +600,34 @@ impl RuntimeBuilder {
 
         // 4. Tool catalog — built-in tools + declarative tools from
         //    workspace.tools (tools/*.yml) + MCP-backed tools from any
-        //    server that completed its handshake. Programmatic
-        //    registrations come later via with_programmatic_tool().
+        //    server that completed its handshake + auto-discovered
+        //    Python tools from <project>/tools/*.py (ADR-0014 slice 3,
+        //    behind the `python` feature).
         let mut catalog = ToolCatalog::with_declarative(&workspace.tools)
             .map_err(|e| format!("tool catalog error: {e}"))?;
         for (server, (tools, requires_approval)) in &mcp_state.tools_by_server {
             catalog
                 .add_mcp_server(server, tools, *requires_approval)
                 .map_err(|e| format!("mcp catalog error: {e}"))?;
+        }
+        #[cfg(feature = "python")]
+        {
+            let outcome = crate::python::auto_discover::discover_python_tools(&project_root);
+            for (path, err) in &outcome.errors {
+                log::warn!(
+                    "python tool discovery: failed to load {}: {err}",
+                    path.display()
+                );
+            }
+            if !outcome.tools.is_empty() {
+                log::info!(
+                    "python tool discovery: registering {} tool(s) from tools/*.py",
+                    outcome.tools.len()
+                );
+                catalog
+                    .add_python_tools(outcome.tools, false)
+                    .map_err(|e| format!("python catalog error: {e}"))?;
+            }
         }
         let tool_catalog = Arc::new(catalog);
 

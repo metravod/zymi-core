@@ -2,6 +2,15 @@
 
 Date: 2026-04-07
 
+## Backend roadmap (2026-05-02)
+
+- **SQLite (rusqlite, default)**: shipped in v0.3. Embedded, file-based, the zero-config path.
+- **Postgres**: shipped v0.4 sprint 3 (P10). Behind the `postgres` Cargo feature. Tokio-postgres + deadpool pool, schema mirrors the SQLite events table (events + per-stream sequence + hash chain + global `BIGSERIAL id`). Per-stream sequence assignment + hash-chain reads run inside a transaction guarded by `pg_advisory_xact_lock(hashtextextended(stream_id, 0))`, so two concurrent appenders to the same stream serialise without external coordination. `StoreTailWatcher` polls `id > ?` exactly as it does on SQLite — no protocol change required. Project config opts in via `store: postgres://…` (templated, so `store: ${env.DATABASE_URL}` is the canonical form). Cross-process delivery validated by an integration test gated on `ZYMI_POSTGRES_TEST_URL` (skipped when unset, so plain `cargo test` doesn't require a database).
+- **Sync vs async open**: `factory::open_store` (sync) accepts only SQLite; Postgres requires `factory::open_store_async`. `RuntimeBuilder::build_async` and CLI subcommands (`events`, `runs`, `observe`, `resume`, `serve`) thread through the async path automatically. The sync `RuntimeBuilder::build` returns a clear error if `project.store` resolves to Postgres rather than panicking via a nested-runtime trick.
+- **Cursor store pairing**: `http_poll`'s per-connector cursor (Telegram `update_id`, Gmail `pageToken`, …) lives in a separate small store, but its backend is **paired with the event-store backend** (sqlite events ↔ sqlite cursors at `.zymi/connectors.db`; postgres events ↔ postgres cursors in the same DB's `connector_cursors` table). Pairing happens automatically in `RuntimeBuilder::build_async` via `connectors::cursor_store::open_cursor_store(&backend, &project_root)`; the user picks one backend through `store:`. Without this pairing, two `zymi serve` processes against shared Postgres would both keep local `.zymi/connectors.db` files and double-fire on every `update_id`. Cursors are still **deliberately separate from the event log** — they're control-plane state, not part of the audit chain.
+
+- **libSQL (deferred → v0.6 P12)**: not a like-for-like backend swap — pulled out of v0.4 because it gives nothing over SQLite on the v0.4 goal. The real value is libSQL's embedded vector index (`F32_BLOB` + `vector_top_k`), which we'll pick up alongside a concrete consumer: a semantic memory layer for inter-agent context (new `memory:` YAML section + `query:` step type, separate ADR). Switching the embedded backend without that consumer = moving the foundation without picking the fruit.
+
 ## Context
 
 ADR-0005 declared Python components as **cross-process participants on the
