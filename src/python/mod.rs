@@ -1,3 +1,4 @@
+pub mod auto_discover;
 pub mod bus;
 pub mod event;
 #[cfg(feature = "runtime")]

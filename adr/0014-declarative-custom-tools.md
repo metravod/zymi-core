@@ -209,3 +209,29 @@ What was deferred from the ADR design:
 - `ProgrammaticTool` trait — not yet needed; will land with Python auto-discovery.
 - Unsafe-shell miette warning — deferred with `kind: shell`.
 - `intention` field on `ToolConfig` — deferred; all declarative tools map to `CallCustomTool` for now.
+
+## Slice 3 — what landed (v0.4, 2026-05-02)
+
+Auto-discovery of Python tools from `<project_root>/tools/*.py`, gated on the `python` Cargo feature.
+
+User-facing surface: `from zymi import tool` + `@tool` decorator. Drop a file in `tools/<anything>.py` with one or more `@tool`-decorated functions and they appear in the catalog at runtime startup — no YAML stub required. The decorator is intentionally a *marker* (sets `_zymi_tool` and a few optional `_zymi_tool_*` attributes), not a registry, so the function still works as a plain Python callable in tests / scripts.
+
+Key changes:
+- `zymi_core/__init__.py` — adds `tool` decorator. Pure Python, no Rust call. Supports `@tool` and `@tool(name=..., description=..., intention=..., requires_approval=...)` forms.
+- `src/python/auto_discover.rs` — new loader. Walks `tools/*.py` in alphabetical filename order, imports each via `PyModule::from_code_bound`, iterates the module dict in declaration order, picks up callables whose `_zymi_tool` is truthy, and reuses `crate::python::tool::introspect_function` (now `pub(crate)`) to produce JSON Schema + async detection. Returns `DiscoveryOutcome { tools, errors }` so a broken file does not nuke a working sibling.
+- `src/runtime/tool_catalog.rs` — `ToolCatalog` gained a `python: HashMap<String, PythonEntry>` field behind `cfg(feature = "python")`, plus `add_python_tools()`, `is_python()`, `python_entry()`, `python_tool_count()`. Collisions with builtin / declarative / MCP / existing python entries are hard errors at registration. `knows()`, `definition()`, `requires_approval()`, `all_tool_names()` all consult the Python map under cfg.
+- `src/runtime/action_executor.rs` — `CatalogActionExecutor::execute_python` dispatches via `tokio::task::spawn_blocking` + `Python::with_gil`: parses arguments JSON outside the GIL, converts to a Python dict, calls the captured `Py<PyAny>` with `**kwargs`, awaits coroutines via the same `asyncio.run`-with-fallback path the user-facing `ToolRegistry` uses, returns `str(result)`.
+- `src/runtime/mod.rs` — `RuntimeBuilder::build_inner` invokes the discovery after declarative + MCP wiring; per-file errors log at `warn`, the registered count logs at `info`. No change to call sites without the python feature.
+- `src/python/tool.rs` — `introspect_function` exposed as `pub(crate)`; small re-exporting helpers `run_coroutine_pub` / `json_value_to_pydict_pub` (with `#[allow(dead_code)]` so feature combos without `cli` still compile clean).
+
+Intention mapping: discovered tools always map to `Intention::CallCustomTool` for v1 — the `intention="…"` decorator argument is captured but currently advisory (logged when set, no policy effect). Wiring it through to `Intention` variants is symmetrical to `PyToolRegistry::to_intention` and lands as a follow-up if a user hits it.
+
+Approval defaults: discovered tools default to `requires_approval: false` to match `kind: http`. Override per-tool with `@tool(requires_approval=True)` on the function.
+
+Build story: pyo3 with `extension-module` only links at runtime when loaded by Python (the canonical pip-install / maturin path). The Rust CLI binary built via `cargo build --features cli` does **not** include the python feature, so auto-discovery is silently absent there — projects that actually want Python tools install via `pip install zymi-core` and run the same `zymi` CLI from inside Python (`zymi_core/_cli.py:main`). Local `cargo test --features python` does not link on macOS for this reason; CI exercises the path through the `python-smoke` matrix that uses `maturin build` + `pytest`.
+
+What is still deferred from the ADR design:
+- `kind: shell` declarative tool dispatcher.
+- `intention` mapping for declarative tools (Python-side tag → `Intention` variant).
+- Unsafe-shell miette warning.
+- `ProgrammaticTool` Rust trait — auto-discovery currently stores `Py<PyAny>` directly in `PythonEntry`; lifting that to a trait waits for a second source of programmatic tools.

@@ -6,7 +6,7 @@ use crate::config::load_project_dir;
 use crate::events::store::{StoreTailWatcher, TailWatcherPolicy};
 use crate::runtime::{EventCommandRouter, Runtime};
 
-use super::store_path;
+use super::{describe_backend, resolve_store_backend_for_cli};
 
 /// Run a pipeline as a long-lived event-driven service.
 ///
@@ -106,10 +106,10 @@ async fn serve_loop(
         .with_policy(runtime.tail_policy().clone())
         .spawn();
 
-    let db_path = store_path(&root);
+    let backend = resolve_store_backend_for_cli(&root)?;
     println!(
         "zymi serve: listening for PipelineRequested events targeting '{pipeline_name}'\n  store: {}\n  poll:  {poll_interval_ms}ms\n  press Ctrl+C to stop",
-        db_path.display()
+        describe_backend(&backend)
     );
 
     let router = EventCommandRouter::new(Arc::clone(&runtime)).with_pipeline_filter(&pipeline_name);

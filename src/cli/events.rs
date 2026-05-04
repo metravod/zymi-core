@@ -1,10 +1,10 @@
 use std::path::Path;
 
 use super::event_fmt::{format_event, EventColor, BOLD, DIM, RESET};
-use crate::events::store::{open_store, StoreBackend};
+use crate::events::store::{open_store_async, StoreBackend};
 use crate::events::Event;
 
-use super::{runtime, store_path};
+use super::{resolve_store_backend_for_cli, runtime};
 
 pub fn exec(
     stream: Option<&str>,
@@ -14,18 +14,20 @@ pub fn exec(
     verbose: bool,
     root: impl AsRef<Path>,
 ) -> Result<(), String> {
-    let db_path = store_path(root.as_ref());
-    if !db_path.exists() {
-        return Err(format!(
-            "no event store found at {}. Run a pipeline first or check --dir.",
-            db_path.display()
-        ));
+    let backend = resolve_store_backend_for_cli(root.as_ref())?;
+    if let StoreBackend::Sqlite { path } = &backend {
+        if !path.exists() {
+            return Err(format!(
+                "no event store found at {}. Run a pipeline first or check --dir.",
+                path.display()
+            ));
+        }
     }
 
-    let store = open_store(StoreBackend::Sqlite { path: db_path.clone() })
-        .map_err(|e| format!("failed to open event store: {e}"))?;
-
     let rt = runtime();
+    let store = rt
+        .block_on(open_store_async(backend))
+        .map_err(|e| format!("failed to open event store: {e}"))?;
 
     match stream {
         Some(stream_id) => {

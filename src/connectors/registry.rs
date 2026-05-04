@@ -2,19 +2,29 @@
 
 use std::sync::Arc;
 
+use crate::connectors::cron::CronBuilder;
 use crate::connectors::cursor_store::CursorStore;
+use crate::connectors::file_append::FileAppendBuilder;
+use crate::connectors::file_read::FileReadBuilder;
 use crate::connectors::http_inbound::HttpInboundBuilder;
 use crate::connectors::http_poll::HttpPollBuilder;
 use crate::connectors::http_post::HttpPostBuilder;
+use crate::connectors::stdio::{StdinBuilder, StdoutBuilder};
 use crate::connectors::{InboundConnector, OutboundSink, PluginContext, PluginHandle};
 use crate::events::bus::EventBus;
 use crate::plugin::PluginRegistry;
+
+#[allow(unused_imports)]
+use crate::connectors::cursor_store::SqliteCursorStore;
 
 /// Populate the inbound registry with every built-in connector type.
 pub fn build_core_connectors() -> PluginRegistry<dyn InboundConnector> {
     let mut r: PluginRegistry<dyn InboundConnector> = PluginRegistry::new();
     r.register(Box::new(HttpInboundBuilder));
     r.register(Box::new(HttpPollBuilder));
+    r.register(Box::new(CronBuilder));
+    r.register(Box::new(FileReadBuilder));
+    r.register(Box::new(StdinBuilder));
     r
 }
 
@@ -22,6 +32,8 @@ pub fn build_core_connectors() -> PluginRegistry<dyn InboundConnector> {
 pub fn build_core_outputs() -> PluginRegistry<dyn OutboundSink> {
     let mut r: PluginRegistry<dyn OutboundSink> = PluginRegistry::new();
     r.register(Box::new(HttpPostBuilder));
+    r.register(Box::new(FileAppendBuilder));
+    r.register(Box::new(StdoutBuilder));
     r
 }
 
@@ -43,10 +55,17 @@ pub struct OutputStartup {
 /// failure is captured in `failures` and surfaces as a log line, but does
 /// not abort runtime construction. Config-shape errors (duplicate names,
 /// missing `type:`) are hard errors returned upfront.
+///
+/// The caller is responsible for opening the [`CursorStore`] paired with
+/// the event-store backend (see
+/// [`crate::connectors::cursor_store::open_cursor_store`]) and threading
+/// it in here. Connectors that need a cursor (today: `http_poll`) take it
+/// from `PluginContext`, so the same handle is shared across instances.
 pub async fn spawn_connectors(
     entries: &[serde_yml::Value],
     bus: Arc<EventBus>,
     project_root: std::path::PathBuf,
+    cursor_store: Arc<dyn CursorStore>,
 ) -> Result<ConnectorStartup, String> {
     if entries.is_empty() {
         return Ok(ConnectorStartup {
@@ -60,16 +79,10 @@ pub async fn spawn_connectors(
         .build_all(entries.to_vec())
         .map_err(|e| format!("connectors: {e}"))?;
 
-    // Pre-create the shared cursor store once so http_poll instances don't
-    // race to initialise it.
-    if entries.iter().any(is_http_poll) {
-        // Validate the cursor store can open before we spawn.
-        CursorStore::open(&project_root).map_err(|e| format!("connectors: {e}"))?;
-    }
-
     let ctx = PluginContext {
         bus,
         project_root,
+        cursor_store,
     };
 
     let mut handles = Vec::new();
@@ -91,6 +104,7 @@ pub async fn spawn_outputs(
     entries: &[serde_yml::Value],
     bus: Arc<EventBus>,
     project_root: std::path::PathBuf,
+    cursor_store: Arc<dyn CursorStore>,
 ) -> Result<OutputStartup, String> {
     if entries.is_empty() {
         return Ok(OutputStartup {
@@ -104,7 +118,11 @@ pub async fn spawn_outputs(
         .build_all(entries.to_vec())
         .map_err(|e| format!("outputs: {e}"))?;
 
-    let ctx = PluginContext { bus, project_root };
+    let ctx = PluginContext {
+        bus,
+        project_root,
+        cursor_store,
+    };
 
     let mut handles = Vec::new();
     let mut failures = Vec::new();
@@ -118,12 +136,4 @@ pub async fn spawn_outputs(
         }
     }
     Ok(OutputStartup { handles, failures })
-}
-
-fn is_http_poll(entry: &serde_yml::Value) -> bool {
-    entry
-        .as_mapping()
-        .and_then(|m| m.get(serde_yml::Value::String("type".into())))
-        .and_then(|v| v.as_str())
-        == Some("http_poll")
 }

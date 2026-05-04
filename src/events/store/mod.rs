@@ -15,10 +15,14 @@
 
 pub mod event_store;
 pub mod factory;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 pub mod sqlite;
 pub mod watcher;
 
 pub use event_store::{EventStore, TailedEvent};
-pub use factory::{open_store, StoreBackend};
+pub use factory::{open_store, open_store_async, StoreBackend};
+#[cfg(feature = "postgres")]
+pub use postgres::PostgresEventStore;
 pub use sqlite::SqliteEventStore;
 pub use watcher::{StoreTailWatcher, TailWatcherPolicy, WatcherHandle};

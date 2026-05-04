@@ -1,6 +1,6 @@
 [package]
 name = "zymi-core"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "Event-sourced agent engine with boundary contracts, hash-chain audit, and declarative pipelines"
 repository = "https://github.com/metravod/zymi-core"
@@ -36,11 +36,14 @@ hmac = { version = "0.12", optional = true }
 hex = { version = "0.4", optional = true }
 subtle = { version = "2", optional = true }
 tokio-util = { version = "0.7", features = ["rt"], optional = true }
+dotenvy = { version = "0.15", optional = true }
+tokio-postgres = { version = "0.7", features = ["with-uuid-1", "with-chrono-0_4"], optional = true }
+deadpool-postgres = { version = "0.14", optional = true }
 
 [features]
 default = []
 python = ["pyo3"]
-cli = ["clap", "runtime", "ratatui", "crossterm", "futures", "connectors"]
+cli = ["clap", "runtime", "ratatui", "crossterm", "futures", "connectors", "dotenvy"]
 runtime = ["reqwest"]
 webhook = ["axum", "runtime"]
 services = ["runtime"]
@@ -55,6 +58,7 @@ connectors = [
     "tokio-util",
     "futures",
 ]
+postgres = ["tokio-postgres", "deadpool-postgres"]
 
 [lib]
 name = "zymi_core"

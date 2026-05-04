@@ -674,6 +674,7 @@ mod tests {
                 outputs: Vec::new(),
                 approvals: Vec::new(),
                 default_approval_channel: None,
+                store: None,
             },
             agents,
             pipelines,

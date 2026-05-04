@@ -55,6 +55,31 @@ pub(crate) struct McpEntry {
     pub(crate) requires_approval: bool,
 }
 
+/// Entry for an auto-discovered Python tool (ADR-0014 slice 3). Lives
+/// only when the `python` feature is on; the runtime walks
+/// `<project>/tools/*.py` at startup and registers every
+/// `@zymi.tool`-decorated callable here.
+#[cfg(feature = "python")]
+pub(crate) struct PythonEntry {
+    pub(crate) definition: ToolDefinition,
+    pub(crate) callable: pyo3::Py<pyo3::PyAny>,
+    pub(crate) is_async: bool,
+    pub(crate) requires_approval: bool,
+    pub(crate) source: std::path::PathBuf,
+}
+
+#[cfg(feature = "python")]
+impl std::fmt::Debug for PythonEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PythonEntry")
+            .field("name", &self.definition.name)
+            .field("is_async", &self.is_async)
+            .field("requires_approval", &self.requires_approval)
+            .field("source", &self.source)
+            .finish()
+    }
+}
+
 /// The tool catalog. Constructed once per [`super::Runtime`] and shared by
 /// the config validator, the pipeline handler, and the action executor.
 #[derive(Debug)]
@@ -62,7 +87,8 @@ pub struct ToolCatalog {
     builtin: HashMap<String, BuiltinEntry>,
     declarative: HashMap<String, DeclarativeEntry>,
     mcp: HashMap<String, McpEntry>,
-    // Future: programmatic: HashMap<String, Arc<dyn ProgrammaticTool>>,
+    #[cfg(feature = "python")]
+    python: HashMap<String, PythonEntry>,
 }
 
 impl ToolCatalog {
@@ -172,6 +198,8 @@ impl ToolCatalog {
             builtin,
             declarative: HashMap::new(),
             mcp: HashMap::new(),
+            #[cfg(feature = "python")]
+            python: HashMap::new(),
         }
     }
 
@@ -256,11 +284,79 @@ impl ToolCatalog {
         Ok(())
     }
 
+    /// Register a batch of auto-discovered Python tools. Behind the
+    /// `python` feature. Returns an error if a name collides with an
+    /// existing builtin / declarative / MCP / Python entry.
+    #[cfg(feature = "python")]
+    pub fn add_python_tools(
+        &mut self,
+        tools: Vec<crate::python::auto_discover::DiscoveredTool>,
+        default_requires_approval: bool,
+    ) -> Result<(), String> {
+        for tool in tools {
+            if self.builtin.contains_key(&tool.name)
+                || self.declarative.contains_key(&tool.name)
+                || self.mcp.contains_key(&tool.name)
+                || self.python.contains_key(&tool.name)
+            {
+                return Err(format!(
+                    "python tool '{}' (from {}) collides with an existing tool",
+                    tool.name,
+                    tool.source.display()
+                ));
+            }
+            let definition = ToolDefinition {
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                parameters: tool.parameters.clone(),
+            };
+            let requires_approval = tool.requires_approval.unwrap_or(default_requires_approval);
+            self.python.insert(
+                tool.name.clone(),
+                PythonEntry {
+                    definition,
+                    callable: tool.callable,
+                    is_async: tool.is_async,
+                    requires_approval,
+                    source: tool.source,
+                },
+            );
+        }
+        Ok(())
+    }
+
     /// Is this tool name registered in the catalog?
     pub fn knows(&self, name: &str) -> bool {
-        self.builtin.contains_key(name)
+        let base = self.builtin.contains_key(name)
             || self.declarative.contains_key(name)
-            || self.mcp.contains_key(name)
+            || self.mcp.contains_key(name);
+        #[cfg(feature = "python")]
+        {
+            base || self.python.contains_key(name)
+        }
+        #[cfg(not(feature = "python"))]
+        {
+            base
+        }
+    }
+
+    /// Is this an auto-discovered Python tool?
+    #[cfg(feature = "python")]
+    pub fn is_python(&self, name: &str) -> bool {
+        self.python.contains_key(name)
+    }
+
+    /// Borrow the underlying Python entry for dispatch. Internal API.
+    #[cfg(feature = "python")]
+    pub(crate) fn python_entry(&self, name: &str) -> Option<&PythonEntry> {
+        self.python.get(name)
+    }
+
+    /// Number of registered Python tools — used in startup logs and the
+    /// `tools list` command.
+    #[cfg(feature = "python")]
+    pub fn python_tool_count(&self) -> usize {
+        self.python.len()
     }
 
     /// Is this a declarative (YAML-defined) tool?
@@ -295,11 +391,20 @@ impl ToolCatalog {
 
     /// Get the [`ToolDefinition`] for a tool (sent to the LLM).
     pub fn definition(&self, name: &str) -> Option<&ToolDefinition> {
-        self.builtin
+        let core = self
+            .builtin
             .get(name)
             .map(|e| &e.definition)
             .or_else(|| self.declarative.get(name).map(|e| &e.definition))
-            .or_else(|| self.mcp.get(name).map(|e| &e.definition))
+            .or_else(|| self.mcp.get(name).map(|e| &e.definition));
+        #[cfg(feature = "python")]
+        {
+            core.or_else(|| self.python.get(name).map(|e| &e.definition))
+        }
+        #[cfg(not(feature = "python"))]
+        {
+            core
+        }
     }
 
     /// Build the tool definition list for an agent's declared tool names.
@@ -357,6 +462,10 @@ impl ToolCatalog {
         if let Some(entry) = self.mcp.get(name) {
             return entry.requires_approval;
         }
+        #[cfg(feature = "python")]
+        if let Some(entry) = self.python.get(name) {
+            return entry.requires_approval;
+        }
         false
     }
 
@@ -365,6 +474,8 @@ impl ToolCatalog {
         let mut names: Vec<&str> = self.builtin.keys().map(|s| s.as_str()).collect();
         names.extend(self.declarative.keys().map(|s| s.as_str()));
         names.extend(self.mcp.keys().map(|s| s.as_str()));
+        #[cfg(feature = "python")]
+        names.extend(self.python.keys().map(|s| s.as_str()));
         names.sort_unstable();
         names
     }

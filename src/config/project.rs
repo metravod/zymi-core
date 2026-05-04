@@ -77,6 +77,19 @@ pub struct ProjectConfig {
     /// (zero-config UX); otherwise the orchestrator fail-closes.
     #[serde(default)]
     pub default_approval_channel: Option<String>,
+    /// Override the event store backend (ADR-0012). Accepts:
+    ///
+    /// * `sqlite` or omitted → embedded SQLite at `<root>/.zymi/events.db`
+    ///   (the zero-config default).
+    /// * `postgres://user:pass@host/db` → networked Postgres backend.
+    ///   Requires the `postgres` Cargo feature; rebuild the CLI with
+    ///   `--features postgres` if you set this and see a "not compiled in"
+    ///   error.
+    ///
+    /// Templated like every other secret-bearing field — write
+    /// `store: ${env.DATABASE_URL}` and keep the URL out of the YAML.
+    #[serde(default)]
+    pub store: Option<String>,
 }
 
 /// One entry in the top-level `mcp_servers:` list (ADR-0023).
@@ -132,6 +145,58 @@ pub struct McpRestartConfig {
     /// 30s. Empty or unset defaults to `[1]`.
     #[serde(default)]
     pub backoff_secs: Option<Vec<u64>>,
+}
+
+impl ProjectConfig {
+    /// Resolve the configured `store:` URL into a [`StoreBackend`],
+    /// falling back to the embedded SQLite default at `<root>/.zymi/events.db`.
+    ///
+    /// Recognised forms:
+    /// * absent / empty / `sqlite` → `Sqlite { path: <root>/.zymi/events.db }`
+    /// * `sqlite:</absolute/path>` or `sqlite:<relative/path>` →
+    ///   `Sqlite { path: <resolved> }`
+    /// * `postgres://…` or `postgresql://…` → `Postgres { url }`
+    ///
+    /// Returns `Err` for an unrecognised scheme rather than silently
+    /// falling through to the SQLite default — typos in the URL should
+    /// surface at startup, not after several green-path operations.
+    pub fn resolve_store_backend(
+        &self,
+        project_root: &Path,
+    ) -> Result<crate::events::store::StoreBackend, ConfigError> {
+        use crate::events::store::StoreBackend;
+
+        let default_sqlite = || StoreBackend::Sqlite {
+            path: project_root.join(".zymi").join("events.db"),
+        };
+
+        let raw = match self.store.as_deref().map(str::trim) {
+            None | Some("") | Some("sqlite") => return Ok(default_sqlite()),
+            Some(s) => s,
+        };
+
+        if let Some(rest) = raw
+            .strip_prefix("postgres://")
+            .or_else(|| raw.strip_prefix("postgresql://"))
+        {
+            let _ = rest; // shape check only — full parsing happens in tokio-postgres.
+            return Ok(StoreBackend::Postgres { url: raw.to_string() });
+        }
+
+        if let Some(path_str) = raw.strip_prefix("sqlite:") {
+            let path = std::path::PathBuf::from(path_str);
+            let resolved = if path.is_absolute() {
+                path
+            } else {
+                project_root.join(path)
+            };
+            return Ok(StoreBackend::Sqlite { path: resolved });
+        }
+
+        Err(ConfigError::UnsupportedStoreUrl {
+            url: raw.to_string(),
+        })
+    }
 }
 
 impl McpServerConfig {

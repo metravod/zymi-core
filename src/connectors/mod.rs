@@ -20,14 +20,19 @@ use thiserror::Error;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::connectors::cursor_store::CursorStore;
 use crate::events::bus::EventBus;
 
 pub mod context;
+pub mod cron;
 pub mod cursor_store;
+pub mod file_append;
+pub mod file_read;
 pub mod http_inbound;
 pub mod http_poll;
 pub mod http_post;
 pub mod registry;
+pub mod stdio;
 
 pub use registry::{
     build_core_connectors, build_core_outputs, spawn_connectors, spawn_outputs, ConnectorStartup,
@@ -52,9 +57,14 @@ pub struct PluginHandle {
 pub struct PluginContext {
     /// The in-process event bus — connectors publish; outputs subscribe.
     pub bus: Arc<EventBus>,
-    /// Project root. Used by stateful plugins (e.g. http_poll's cursor
-    /// store) to derive on-disk paths.
+    /// Project root. Used by stateful plugins (e.g. for resolving
+    /// relative paths in `file_read` / `file_append`).
     pub project_root: std::path::PathBuf,
+    /// Shared cursor store handle. Backend (sqlite vs postgres) is
+    /// chosen once at runtime startup to pair with the event-store
+    /// backend, so multi-process `zymi serve` against shared Postgres
+    /// sees one cursor table instead of N local sqlite files.
+    pub cursor_store: Arc<dyn CursorStore>,
 }
 
 /// Inbound connector: an event *source*. Starts a long-running task that

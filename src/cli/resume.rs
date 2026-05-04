@@ -1,12 +1,12 @@
 use std::path::Path;
 
 use crate::config::load_project_dir;
-use crate::events::store::{open_store, StoreBackend};
+use crate::events::store::{open_store_async, StoreBackend};
 use crate::handlers::resume_pipeline::{self, ResumePipeline};
 use crate::runtime::Runtime;
 
 use super::event_fmt::{BOLD, DIM, GREEN, RESET, YELLOW};
-use super::store_path;
+use super::resolve_store_backend_for_cli;
 
 pub fn exec(
     parent_stream: &str,
@@ -35,14 +35,17 @@ pub fn exec(
     // Bypass Runtime::builder so projects without an `llm` block can still
     // preview a fork.
     if dry_run {
-        let db_path = store_path(root);
-        if !db_path.exists() {
-            return Err(format!(
-                "no event store found at {}. Cannot dry-run resume.",
-                db_path.display()
-            ));
+        let backend = resolve_store_backend_for_cli(root)?;
+        if let StoreBackend::Sqlite { path } = &backend {
+            if !path.exists() {
+                return Err(format!(
+                    "no event store found at {}. Cannot dry-run resume.",
+                    path.display()
+                ));
+            }
         }
-        let store = open_store(StoreBackend::Sqlite { path: db_path })
+        let store = rt
+            .block_on(open_store_async(backend))
             .map_err(|e| format!("failed to open event store: {e}"))?;
         let cmd = ResumePipeline {
             parent_stream_id: parent_stream.to_string(),
@@ -61,7 +64,7 @@ pub fn exec(
     if let Some(name) = default_channel.as_deref() {
         builder = builder.with_approval_channel(name);
     }
-    let runtime = builder.build()?;
+    let runtime = rt.block_on(builder.build_async())?;
 
     let approval_channels = rt.block_on(super::start_approval_channels(
         approval_mode,

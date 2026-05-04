@@ -62,6 +62,15 @@ pub enum ConfigError {
         first: PathBuf,
         second: PathBuf,
     },
+
+    #[error("unsupported store URL `{url}` in project.yml")]
+    #[diagnostic(
+        code(zymi::config::store),
+        help(
+            "set `store:` to one of: `sqlite` (default), `sqlite:<path>`, or `postgres://...`"
+        )
+    )]
+    UnsupportedStoreUrl { url: String },
 }
 
 /// Build a [`ConfigError::Parse`] from a serde_yml error and the raw source.
