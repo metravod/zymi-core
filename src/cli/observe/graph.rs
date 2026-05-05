@@ -71,9 +71,17 @@ impl Graph {
         for step in &pipeline.steps {
             let rank = ranks[&step.id];
             rank_counts[rank] += 1;
+            // Tool steps don't have an agent name; show the tool name
+            // prefixed so the graph view stays informative (ADR-0024).
+            let agent = match &step.kind {
+                crate::config::pipeline::PipelineStepKind::Agent { agent, .. } => agent.clone(),
+                crate::config::pipeline::PipelineStepKind::Tool { tool, .. } => {
+                    format!("tool:{tool}")
+                }
+            };
             nodes.push(GraphNode {
                 id: step.id.clone(),
-                agent: step.agent.clone(),
+                agent,
                 rank,
                 status: NodeStatus::Pending,
             });

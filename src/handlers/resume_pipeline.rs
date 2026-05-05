@@ -449,6 +449,7 @@ async fn append_event(store: &dyn EventStore, mut event: Event) -> Result<(), St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::pipeline::PipelineStepKind;
     use crate::config::PipelineStep;
 
     fn pipe(steps: &[(&str, &[&str])]) -> PipelineConfig {
@@ -460,8 +461,10 @@ mod tests {
                 .iter()
                 .map(|(id, deps)| PipelineStep {
                     id: (*id).into(),
-                    agent: "a".into(),
-                    task: "".into(),
+                    kind: PipelineStepKind::Agent {
+                        agent: "a".into(),
+                        task: "".into(),
+                    },
                     depends_on: deps.iter().map(|s| (*s).into()).collect(),
                 })
                 .collect(),
@@ -645,11 +648,14 @@ mod tests {
         let mut p = make_pipeline();
         p.name = "research".into();
         for s in &mut p.steps {
-            s.agent = "researcher".into();
-            s.task = match s.id.as_str() {
+            let task = match s.id.as_str() {
                 "search" => "search the web".into(),
                 "summarize" => "summarize ${steps.search.output}".into(),
                 _ => "".into(),
+            };
+            s.kind = PipelineStepKind::Agent {
+                agent: "researcher".into(),
+                task,
             };
         }
         pipelines.insert("research".into(), p);
@@ -811,8 +817,10 @@ mod tests {
         let p = ws_initial.pipelines.get_mut("research").unwrap();
         p.steps.push(crate::config::PipelineStep {
             id: "extra".into(),
-            agent: "researcher".into(),
-            task: "do extra".into(),
+            kind: PipelineStepKind::Agent {
+                agent: "researcher".into(),
+                task: "do extra".into(),
+            },
             depends_on: vec![],
         });
         if let Some(sum) = p.steps.iter_mut().find(|s| s.id == "summarize") {

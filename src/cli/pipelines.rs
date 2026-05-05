@@ -62,9 +62,17 @@ pub fn exec(root: impl AsRef<Path>) -> Result<(), String> {
                     } else {
                         format!(" ← [{}]", step.depends_on.join(", "))
                     };
+                    let label = match &step.kind {
+                        crate::config::pipeline::PipelineStepKind::Agent { agent, .. } => {
+                            agent.clone()
+                        }
+                        crate::config::pipeline::PipelineStepKind::Tool { tool, .. } => {
+                            format!("tool:{tool}")
+                        }
+                    };
                     println!(
                         "    {DIM}·{RESET} {} {DIM}({}){RESET}{deps}",
-                        step.id, step.agent
+                        step.id, label
                     );
                 }
                 if let Some(out) = &cfg.output {

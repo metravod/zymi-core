@@ -27,16 +27,17 @@ use std::time::Instant;
 use uuid::Uuid;
 
 use crate::commands::RunPipeline;
+use crate::config::pipeline::PipelineStepKind;
 use crate::config::AgentConfig;
 use crate::engine::tools::{new_memory_store, MemoryStore};
-use crate::runtime::ToolCatalog;
-use crate::runtime::context_builder::{ContextBuilder, ContextConfig};
-use crate::runtime::context_window::approx_chars;
-use crate::esaa::orchestrator::{Orchestrator, OrchestratorResult};
+use crate::esaa::orchestrator::{ApprovalContext, Orchestrator, OrchestratorResult};
 use crate::events::bus::EventBus;
 use crate::events::store::EventStore;
 use crate::events::{Event, EventKind};
 use crate::llm::{ChatRequest, ChatResponse, LlmProvider};
+use crate::runtime::context_builder::{ContextBuilder, ContextConfig};
+use crate::runtime::context_window::approx_chars;
+use crate::runtime::ToolCatalog;
 use crate::runtime::{ActionContext, ActionExecutor, Runtime};
 use crate::types::Message;
 
@@ -140,16 +141,20 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
     if let Some(ctx) = &resume {
         for (step_id, output) in &ctx.frozen_outputs {
             step_outputs.insert(step_id.clone(), output.clone());
+            let label = pipeline
+                .steps
+                .iter()
+                .find(|s| &s.id == step_id)
+                .map(|s| match &s.kind {
+                    PipelineStepKind::Agent { agent, .. } => agent.clone(),
+                    PipelineStepKind::Tool { tool, .. } => format!("tool:{tool}"),
+                })
+                .unwrap_or_default();
             all_results.insert(
                 step_id.clone(),
                 StepResult {
                     step_id: step_id.clone(),
-                    agent_name: pipeline
-                        .steps
-                        .iter()
-                        .find(|s| &s.id == step_id)
-                        .map(|s| s.agent.clone())
-                        .unwrap_or_default(),
+                    agent_name: label,
                     output: output.clone(),
                     iterations: 0,
                     success: true,
@@ -190,18 +195,6 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
                 .find(|s| &s.id == step_id)
                 .ok_or_else(|| format!("step '{step_id}' not found in pipeline config"))?;
 
-            let agent = workspace
-                .agents
-                .get(&step.agent)
-                .ok_or_else(|| {
-                    format!("agent '{}' not found for step '{step_id}'", step.agent)
-                })?;
-
-            let task = resolve_task_template(&step.task, &cmd.inputs, &step_outputs);
-            let context = build_step_context(step_id, &step.depends_on, &step_outputs);
-
-            let step_id = step_id.clone();
-            let agent = agent.clone();
             let provider = Arc::clone(rt.provider());
             let orchestrator = Arc::clone(rt.orchestrator());
             let bus = Arc::clone(rt.bus());
@@ -209,7 +202,7 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
             let action_executor = Arc::clone(rt.action_executor());
             let tool_catalog = Arc::clone(rt.tool_catalog());
             let memory = memory.clone();
-            let stream_id = stream_id.clone();
+            let stream_id_clone = stream_id.clone();
             let project_root = rt.project_root().to_path_buf();
             let defaults = workspace.project.defaults.clone();
             // ADR-0022 §"Resolution order": pipeline override beats the
@@ -227,29 +220,69 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
                 .map(|r| r.context.clone().into())
                 .unwrap_or_default();
 
-            handles.push(tokio::spawn(async move {
-                run_agent_step(
-                    &step_id,
-                    &agent,
-                    &task,
-                    &context,
-                    Arc::clone(&provider),
-                    &orchestrator,
-                    Arc::clone(&bus),
-                    &store,
-                    action_executor.as_ref(),
-                    &tool_catalog,
-                    &memory,
-                    &stream_id,
-                    correlation_id,
-                    &project_root,
-                    defaults.max_iterations,
-                    approval_channel,
-                    approval_timeout,
-                    context_config,
-                )
-                .await
-            }));
+            let step_id_owned = step_id.clone();
+
+            match &step.kind {
+                PipelineStepKind::Agent { agent: agent_name, task: raw_task } => {
+                    let agent = workspace
+                        .agents
+                        .get(agent_name)
+                        .ok_or_else(|| {
+                            format!("agent '{agent_name}' not found for step '{step_id}'")
+                        })?
+                        .clone();
+                    let task = resolve_task_template(raw_task, &cmd.inputs, &step_outputs);
+                    let context = build_step_context(step_id, &step.depends_on, &step_outputs);
+
+                    handles.push(tokio::spawn(async move {
+                        run_agent_step(
+                            &step_id_owned,
+                            &agent,
+                            &task,
+                            &context,
+                            Arc::clone(&provider),
+                            &orchestrator,
+                            Arc::clone(&bus),
+                            &store,
+                            action_executor.as_ref(),
+                            &tool_catalog,
+                            &memory,
+                            &stream_id_clone,
+                            correlation_id,
+                            &project_root,
+                            defaults.max_iterations,
+                            approval_channel,
+                            approval_timeout,
+                            context_config,
+                        )
+                        .await
+                    }));
+                }
+                PipelineStepKind::Tool { tool, args } => {
+                    let tool_name = tool.clone();
+                    let resolved_args =
+                        resolve_args_value(args, &cmd.inputs, &step_outputs);
+
+                    handles.push(tokio::spawn(async move {
+                        run_tool_step(
+                            &step_id_owned,
+                            &tool_name,
+                            resolved_args,
+                            Arc::clone(&bus),
+                            &orchestrator,
+                            action_executor.as_ref(),
+                            &tool_catalog,
+                            &memory,
+                            &stream_id_clone,
+                            correlation_id,
+                            &project_root,
+                            approval_channel,
+                            approval_timeout,
+                        )
+                        .await
+                    }));
+                }
+            }
         }
 
         for handle in handles {
@@ -608,6 +641,193 @@ async fn run_agent_step(
     }
 }
 
+/// Run a deterministic tool step (ADR-0024).
+///
+/// No LLM hop. The catalog is dispatched with templated args; approvals and
+/// audit events flow through the same surface as agent-issued tool calls.
+#[allow(clippy::too_many_arguments)]
+async fn run_tool_step(
+    step_id: &str,
+    tool_name: &str,
+    args: serde_json::Value,
+    bus: Arc<EventBus>,
+    orchestrator: &Orchestrator,
+    action_executor: &dyn ActionExecutor,
+    tool_catalog: &ToolCatalog,
+    memory: &MemoryStore,
+    stream_id: &str,
+    correlation_id: Uuid,
+    project_root: &std::path::Path,
+    approval_channel: Option<String>,
+    approval_timeout: std::time::Duration,
+) -> Result<StepResult, String> {
+    let bus_ref: &EventBus = &bus;
+    let step_stream_id = format!("{stream_id}:step:{step_id}");
+
+    emit_event(
+        bus_ref,
+        stream_id,
+        correlation_id,
+        EventKind::WorkflowNodeStarted {
+            node_id: step_id.to_string(),
+            description: format!("tool={tool_name}"),
+        },
+    )
+    .await;
+
+    let args_json = serde_json::to_string(&args)
+        .map_err(|e| format!("[{step_id}] failed to serialize args: {e}"))?;
+
+    let call_id = Uuid::new_v4().to_string();
+    emit_event(
+        bus_ref,
+        &step_stream_id,
+        correlation_id,
+        EventKind::ToolCallRequested {
+            tool_name: tool_name.to_string(),
+            arguments: truncate(&args_json, 200).to_string(),
+            call_id: call_id.clone(),
+        },
+    )
+    .await;
+
+    let intention = tool_catalog.intention(tool_name, &args_json);
+    let verdict = orchestrator
+        .process_intention(
+            &intention,
+            stream_id,
+            correlation_id,
+            ApprovalContext {
+                channel: approval_channel.as_deref(),
+                timeout: approval_timeout,
+            },
+        )
+        .await;
+
+    let start = Instant::now();
+    let tool_result = match verdict {
+        OrchestratorResult::Approved => {
+            let ctx = ActionContext {
+                project_root,
+                memory,
+                stream_id,
+                correlation_id,
+            };
+            match action_executor.execute(tool_name, &args_json, &ctx).await {
+                Ok(out) => out,
+                Err(e) => format!("[tool error] {e}"),
+            }
+        }
+        OrchestratorResult::Denied { reason } => format!("[denied by policy] {reason}"),
+        OrchestratorResult::HumanRejected => "[rejected by human]".to_string(),
+        OrchestratorResult::NoApprovalHandler => {
+            "[requires approval but no approval handler configured]".to_string()
+        }
+    };
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+    let is_error = tool_result.starts_with("[tool error]")
+        || tool_result.starts_with("[denied")
+        || tool_result.starts_with("[rejected")
+        || tool_result.starts_with("[requires approval");
+
+    emit_event(
+        bus_ref,
+        &step_stream_id,
+        correlation_id,
+        EventKind::ToolCallCompleted {
+            call_id,
+            result: tool_result.clone(),
+            result_preview: truncate(&tool_result, 200).to_string(),
+            is_error,
+            duration_ms,
+        },
+    )
+    .await;
+
+    emit_event(
+        bus_ref,
+        stream_id,
+        correlation_id,
+        EventKind::WorkflowNodeCompleted {
+            node_id: step_id.to_string(),
+            success: !is_error,
+        },
+    )
+    .await;
+
+    Ok(StepResult {
+        step_id: step_id.to_string(),
+        agent_name: format!("tool:{tool_name}"),
+        output: tool_result,
+        iterations: 1,
+        success: !is_error,
+    })
+}
+
+/// Walk a YAML value tree, resolving `${inputs.*}` and `${steps.<id>.output}`
+/// on string leaves, then convert to JSON for catalog dispatch (ADR-0024).
+///
+/// `${env.*}` is already resolved at parse time by `template::resolve_templates`.
+fn resolve_args_value(
+    value: &serde_yml::Value,
+    inputs: &HashMap<String, String>,
+    step_outputs: &HashMap<String, String>,
+) -> serde_json::Value {
+    match value {
+        serde_yml::Value::Null => serde_json::Value::Null,
+        serde_yml::Value::Bool(b) => serde_json::Value::Bool(*b),
+        serde_yml::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                serde_json::Value::from(i)
+            } else if let Some(u) = n.as_u64() {
+                serde_json::Value::from(u)
+            } else if let Some(f) = n.as_f64() {
+                serde_json::Number::from_f64(f)
+                    .map(serde_json::Value::Number)
+                    .unwrap_or(serde_json::Value::Null)
+            } else {
+                serde_json::Value::Null
+            }
+        }
+        serde_yml::Value::String(s) => {
+            serde_json::Value::String(resolve_str_template(s, inputs, step_outputs))
+        }
+        serde_yml::Value::Sequence(seq) => serde_json::Value::Array(
+            seq.iter()
+                .map(|v| resolve_args_value(v, inputs, step_outputs))
+                .collect(),
+        ),
+        serde_yml::Value::Mapping(map) => {
+            let mut obj = serde_json::Map::with_capacity(map.len());
+            for (k, val) in map {
+                let key = match k {
+                    serde_yml::Value::String(s) => s.clone(),
+                    other => serde_yml::to_string(other).unwrap_or_default().trim().into(),
+                };
+                obj.insert(key, resolve_args_value(val, inputs, step_outputs));
+            }
+            serde_json::Value::Object(obj)
+        }
+        serde_yml::Value::Tagged(t) => resolve_args_value(&t.value, inputs, step_outputs),
+    }
+}
+
+fn resolve_str_template(
+    s: &str,
+    inputs: &HashMap<String, String>,
+    step_outputs: &HashMap<String, String>,
+) -> String {
+    let mut out = s.to_string();
+    for (k, v) in inputs {
+        out = out.replace(&format!("${{inputs.{k}}}"), v);
+    }
+    for (k, v) in step_outputs {
+        out = out.replace(&format!("${{steps.{k}.output}}"), v);
+    }
+    out
+}
+
 /// Resolve `${inputs.*}` and `${steps.<id>.output}` in a task template.
 fn resolve_task_template(
     task: &str,
@@ -721,5 +941,32 @@ mod tests {
         let catalog = ToolCatalog::builtin_only();
         let intention = catalog.intention("my_custom_tool", r#"{"arg":"val"}"#);
         assert_eq!(intention.tag(), "call_custom_tool");
+    }
+
+    #[test]
+    fn resolve_args_value_walks_strings() {
+        let yaml: serde_yml::Value = serde_yml::from_str(
+            r#"
+repo: "${inputs.repo}"
+ref: "main"
+nested:
+  - "${steps.fetch.output}"
+  - 42
+flag: true
+"#,
+        )
+        .unwrap();
+
+        let mut inputs = HashMap::new();
+        inputs.insert("repo".into(), "https://x/y".into());
+        let mut outputs = HashMap::new();
+        outputs.insert("fetch".into(), "abc123".into());
+
+        let json = resolve_args_value(&yaml, &inputs, &outputs);
+        assert_eq!(json["repo"], serde_json::json!("https://x/y"));
+        assert_eq!(json["ref"], serde_json::json!("main"));
+        assert_eq!(json["nested"][0], serde_json::json!("abc123"));
+        assert_eq!(json["nested"][1], serde_json::json!(42));
+        assert_eq!(json["flag"], serde_json::json!(true));
     }
 }

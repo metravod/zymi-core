@@ -252,7 +252,7 @@ impl App {
     /// pipeline config is missing. Constructs a synthetic [`PipelineConfig`]
     /// with one step per observed node in order of first appearance.
     fn linear_fallback(&self, name: &str) -> Graph {
-        use crate::config::pipeline::PipelineStep;
+        use crate::config::pipeline::{PipelineStep, PipelineStepKind};
 
         let mut seen: Vec<String> = Vec::new();
         for event in &self.events {
@@ -268,8 +268,10 @@ impl App {
             .enumerate()
             .map(|(i, id)| PipelineStep {
                 id: id.clone(),
-                agent: String::new(),
-                task: String::new(),
+                kind: PipelineStepKind::Agent {
+                    agent: String::new(),
+                    task: String::new(),
+                },
                 depends_on: if i == 0 {
                     Vec::new()
                 } else {

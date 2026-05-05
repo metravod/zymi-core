@@ -120,7 +120,7 @@ pub fn build_execution_plan(pipeline: &PipelineConfig) -> Result<ExecutionPlan, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::pipeline::{PipelineOutput, PipelineStep};
+    use crate::config::pipeline::{PipelineOutput, PipelineStep, PipelineStepKind};
 
     fn pipeline(name: &str, steps: Vec<(&str, Vec<&str>)>) -> PipelineConfig {
         PipelineConfig {
@@ -131,8 +131,10 @@ mod tests {
                 .into_iter()
                 .map(|(id, deps)| PipelineStep {
                     id: id.into(),
-                    agent: "a".into(),
-                    task: "t".into(),
+                    kind: PipelineStepKind::Agent {
+                        agent: "a".into(),
+                        task: "t".into(),
+                    },
                     depends_on: deps.into_iter().map(String::from).collect(),
                 })
                 .collect(),

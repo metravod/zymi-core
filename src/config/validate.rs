@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use super::agent::AgentConfig;
 use super::error::ConfigError;
-use super::pipeline::PipelineConfig;
+use super::pipeline::{PipelineConfig, PipelineStepKind};
 
 /// Validate cross-references and structural invariants across the workspace.
 ///
@@ -23,7 +23,7 @@ pub fn validate_workspace(
     }
 
     for pipeline in pipelines.values() {
-        validate_pipeline_refs(pipeline, agents)?;
+        validate_pipeline_refs(pipeline, agents, known_tools)?;
         validate_pipeline_dag(pipeline)?;
     }
 
@@ -119,28 +119,86 @@ impl ToolNameResolver for ConfigToolNameResolver {
     }
 }
 
-/// Check that pipeline steps reference existing agents and valid step IDs.
+/// Check that pipeline steps reference existing agents/tools and valid step IDs.
 fn validate_pipeline_refs(
     pipeline: &PipelineConfig,
     agents: &HashMap<String, AgentConfig>,
+    known_tools: &dyn ToolNameResolver,
 ) -> Result<(), ConfigError> {
     let step_ids: HashSet<&str> = pipeline.steps.iter().map(|s| s.id.as_str()).collect();
     let path = PathBuf::from(format!("pipelines/{}.yml", pipeline.name));
 
     for step in &pipeline.steps {
-        // Check agent exists.
-        if !agents.contains_key(&step.agent) {
-            return Err(ConfigError::Validation {
-                message: format!(
-                    "step `{}` references unknown agent `{}`",
-                    step.id, step.agent
-                ),
-                help: format!(
-                    "available agents: {}",
-                    agents.keys().cloned().collect::<Vec<_>>().join(", ")
-                ),
-                path: path.clone(),
-            });
+        match &step.kind {
+            PipelineStepKind::Agent { agent, .. } => {
+                if !agents.contains_key(agent) {
+                    return Err(ConfigError::Validation {
+                        message: format!(
+                            "step `{}` references unknown agent `{}`",
+                            step.id, agent
+                        ),
+                        help: format!(
+                            "available agents: {}",
+                            agents.keys().cloned().collect::<Vec<_>>().join(", ")
+                        ),
+                        path: path.clone(),
+                    });
+                }
+            }
+            PipelineStepKind::Tool { tool, args } => {
+                // ADR-0024: tool name must resolve in the catalog. The
+                // ConfigToolNameResolver covers builtins + declarative +
+                // mcp__server__* prefixes; per-MCP-tool existence is
+                // deferred to runtime as for agent.tools.
+                if !known_tools.knows(tool) {
+                    return Err(ConfigError::Validation {
+                        message: format!(
+                            "tool step `{}` references unknown tool `{}`",
+                            step.id, tool
+                        ),
+                        help: format!(
+                            "known tools: {}",
+                            known_tools.all_tool_names().join(", ")
+                        ),
+                        path: path.clone(),
+                    });
+                }
+                // ADR-0024: any `${steps.<other>.output}` ref inside `args`
+                // must be in `depends_on`.
+                let referenced = collect_step_refs(args);
+                for other in referenced {
+                    if other == step.id {
+                        // self-ref is the cycle check's domain
+                        continue;
+                    }
+                    if !step.depends_on.iter().any(|d| d == &other) {
+                        return Err(ConfigError::Validation {
+                            message: format!(
+                                "tool step `{}` references `${{steps.{}.output}}` in args but `{}` is not in depends_on",
+                                step.id, other, other
+                            ),
+                            help: format!(
+                                "add `{}` to step `{}`'s depends_on list",
+                                other, step.id
+                            ),
+                            path: path.clone(),
+                        });
+                    }
+                    if !step_ids.contains(other.as_str()) {
+                        return Err(ConfigError::Validation {
+                            message: format!(
+                                "tool step `{}` references unknown step `${{steps.{}.output}}`",
+                                step.id, other
+                            ),
+                            help: format!(
+                                "available steps: {}",
+                                step_ids.iter().copied().collect::<Vec<_>>().join(", ")
+                            ),
+                            path: path.clone(),
+                        });
+                    }
+                }
+            }
         }
 
         // Check depends_on references valid step IDs.
@@ -176,6 +234,57 @@ fn validate_pipeline_refs(
     }
 
     Ok(())
+}
+
+/// Walk a YAML value and collect all `${steps.<id>.output}` references.
+///
+/// Used by [`validate_pipeline_refs`] to check that tool-step `args:` only
+/// reference upstream steps that are in `depends_on` (ADR-0024 §validator).
+fn collect_step_refs(value: &serde_yml::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    walk_step_refs(value, &mut out);
+    out
+}
+
+fn walk_step_refs(value: &serde_yml::Value, out: &mut Vec<String>) {
+    match value {
+        serde_yml::Value::String(s) => extract_step_refs(s, out),
+        serde_yml::Value::Sequence(seq) => {
+            for v in seq {
+                walk_step_refs(v, out);
+            }
+        }
+        serde_yml::Value::Mapping(map) => {
+            for (k, v) in map {
+                walk_step_refs(k, out);
+                walk_step_refs(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn extract_step_refs(s: &str, out: &mut Vec<String>) {
+    // Match `${steps.<id>.output}` — keep the regex local to avoid pulling
+    // a heavy dep here. Manual scan: find each `${steps.` and read until `}`.
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i + 8 < bytes.len() {
+        if &bytes[i..i + 8] == b"${steps." {
+            let start = i + 8;
+            if let Some(end_rel) = s[start..].find('}') {
+                let inner = &s[start..start + end_rel];
+                if let Some(id) = inner.strip_suffix(".output") {
+                    if !id.is_empty() && !out.iter().any(|s| s == id) {
+                        out.push(id.to_string());
+                    }
+                }
+                i = start + end_rel + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
 }
 
 /// Detect cycles in the pipeline step DAG using iterative DFS.
@@ -264,13 +373,27 @@ mod tests {
                 .into_iter()
                 .map(|(id, ag, deps)| super::super::pipeline::PipelineStep {
                     id: id.into(),
-                    agent: ag.into(),
-                    task: "task".into(),
+                    kind: super::super::pipeline::PipelineStepKind::Agent {
+                        agent: ag.into(),
+                        task: "task".into(),
+                    },
                     depends_on: deps.into_iter().map(String::from).collect(),
                 })
                 .collect(),
             output: None,
             approval_channel: None,
+        }
+    }
+
+    fn tool_step(id: &str, tool: &str, args_yaml: &str, deps: Vec<&str>) -> super::super::pipeline::PipelineStep {
+        let args: serde_yml::Value = serde_yml::from_str(args_yaml).unwrap();
+        super::super::pipeline::PipelineStep {
+            id: id.into(),
+            kind: super::super::pipeline::PipelineStepKind::Tool {
+                tool: tool.into(),
+                args,
+            },
+            depends_on: deps.into_iter().map(String::from).collect(),
         }
     }
 
@@ -427,6 +550,73 @@ mod tests {
             ConfigToolNameResolver::new(vec![]).with_mcp_servers(vec!["fs".into()]);
         let err = validate_workspace(&agents, &HashMap::new(), &resolver).unwrap_err();
         assert!(matches!(err, ConfigError::Validation { .. }));
+    }
+
+    #[test]
+    fn tool_step_unknown_tool_rejected() {
+        let agents = HashMap::new();
+        let mut pipelines = HashMap::new();
+        let mut p = pipeline_from_steps("p", vec![]);
+        p.steps.push(tool_step("s1", "ghost_tool", "{}", vec![]));
+        pipelines.insert("p".into(), p);
+
+        let err = validate_workspace(
+            &agents,
+            &pipelines,
+            &ConfigToolNameResolver::new(vec![]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::Validation { message, .. } if message.contains("ghost_tool")));
+    }
+
+    #[test]
+    fn tool_step_known_declarative_tool_accepted() {
+        let agents = HashMap::new();
+        let mut pipelines = HashMap::new();
+        let mut p = pipeline_from_steps("p", vec![]);
+        p.steps.push(tool_step("s1", "my_http_tool", "{}", vec![]));
+        pipelines.insert("p".into(), p);
+
+        let resolver = ConfigToolNameResolver::new(vec!["my_http_tool".into()]);
+        assert!(validate_workspace(&agents, &pipelines, &resolver).is_ok());
+    }
+
+    #[test]
+    fn tool_step_args_step_ref_must_be_in_depends_on() {
+        let agents = HashMap::new();
+        let mut pipelines = HashMap::new();
+        let mut p = pipeline_from_steps("p", vec![]);
+        p.steps.push(tool_step("a", "t", "{}", vec![]));
+        p.steps.push(tool_step(
+            "b",
+            "t",
+            r#"{"x":"${steps.a.output}"}"#,
+            // depends_on intentionally empty — should fail
+            vec![],
+        ));
+        pipelines.insert("p".into(), p);
+
+        let resolver = ConfigToolNameResolver::new(vec!["t".into()]);
+        let err = validate_workspace(&agents, &pipelines, &resolver).unwrap_err();
+        assert!(matches!(err, ConfigError::Validation { message, .. } if message.contains("depends_on")));
+    }
+
+    #[test]
+    fn tool_step_args_step_ref_with_proper_depends_on_ok() {
+        let agents = HashMap::new();
+        let mut pipelines = HashMap::new();
+        let mut p = pipeline_from_steps("p", vec![]);
+        p.steps.push(tool_step("a", "t", "{}", vec![]));
+        p.steps.push(tool_step(
+            "b",
+            "t",
+            r#"{"x":"prefix-${steps.a.output}-suffix"}"#,
+            vec!["a"],
+        ));
+        pipelines.insert("p".into(), p);
+
+        let resolver = ConfigToolNameResolver::new(vec!["t".into()]);
+        assert!(validate_workspace(&agents, &pipelines, &resolver).is_ok());
     }
 
     #[test]
