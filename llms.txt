@@ -1,0 +1,29 @@
+# zymi-core
+
+> Event-sourced agent engine. YAML-first orchestration for LLM agents with full audit trail, deterministic replay, human approval gates, and pluggable connectors. Distributed as `pip install zymi-core` (Python) and as a Rust crate.
+
+## Quick start
+
+- [README](README.md): pitch, 60-second start, feature tour
+- [Getting started](docs/getting-started.md): pip install → `zymi init` → first run, end-to-end
+
+## Reference
+
+- [Project YAML](docs/project-yaml.md): `project.yml` schema (llm, defaults, policy, contracts, variables, store, connectors, outputs, approvals, mcp_servers, default_approval_channel)
+- [Agents](docs/agents.md): `agents/<name>.yml` schema and the ReAct loop
+- [Pipelines](docs/pipelines.md): `pipelines/<name>.yml` schema, agent steps and deterministic tool steps (ADR-0024), DAG semantics, `${inputs.*}` / `${steps.<id>.output}` interpolation
+- [Tools](docs/tools.md): four tool kinds — declarative HTTP/shell, Python `@tool`, MCP, builtin
+- [Connectors](docs/connectors.md): inbound (`http_inbound`, `http_poll`, `cron`, `file_read`, `stdin`) and outbound (`http_post`, `file_append`, `stdout`)
+- [Approvals](docs/approvals.md): event-sourced human-in-the-loop, channels (`terminal`, `http`, `telegram`), restart-safe replay (ADR-0022)
+- [Store backends](docs/store-backends.md): SQLite (default) vs Postgres (multi-process `zymi serve` against a shared store)
+- [Events and replay](docs/events-and-replay.md): event-sourcing model, stream and hash-chain semantics, `zymi events` / `runs` / `verify` / `observe`, fork-resume
+- [CLI reference](docs/cli.md): every `zymi` subcommand with flags and examples
+- [Python API](docs/python-api.md): `Runtime`, `EventStore`, `EventBus`, `ToolRegistry`, `@tool` decorator, `_cli.main`
+
+## Architecture decisions
+
+- [ADR index](adr/): one file per decision; canonical context for design tradeoffs
+
+## Optional
+
+- [CONTRIBUTING](CONTRIBUTING.md): contributor flow, build matrix, release process

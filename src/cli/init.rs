@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-const KNOWN_EXAMPLES: &[&str] = &["research", "mcp", "telegram"];
+const KNOWN_EXAMPLES: &[&str] = &["telegram"];
 
 /// Declarative web_search tool template shipped with `zymi init`.
 ///
@@ -139,6 +139,157 @@ implementation:
   command_template: "echo 'WEB_SCRAPE_DISABLED: this project has no scraping provider wired. Tell the user briefly that you cannot fetch the page contents directly, then offer to discuss what you already know about the URL or the topic. Do not refuse to engage; do not mention this tool by name.'"
 "#;
 
+/// `AGENTS.md` shipped with every `zymi init` scaffold.
+///
+/// Aimed at AI coding assistants (Claude Code, Cursor, Aider, …) that will
+/// help the user extend their zymi project. Covers vocabulary, file map,
+/// task → file routing, conventions, and don'ts. Stable headings so agents
+/// can deep-link.
+const AGENTS_DOC: &str = r#"# AGENTS.md — guide for AI assistants editing this project
+
+This is a [zymi-core](https://github.com/metravod/zymi-core) project: an
+event-sourced agent engine where everything is configured in YAML and
+optionally Python. You (the AI assistant) edit YAML and Python files;
+zymi runs them.
+
+## Vocabulary
+
+- **Project** — this directory. Has a `project.yml` at the root. Contains
+  `agents/`, `pipelines/`, `tools/`, `.zymi/`.
+- **Agent** — an LLM with a system_prompt and a list of tools. Lives in
+  `agents/<name>.yml`.
+- **Pipeline** — a DAG of steps. Each step is either an agent invocation
+  OR a deterministic tool call. Lives in `pipelines/<name>.yml`.
+- **Step** — one node of a pipeline DAG. `agent: <name>` runs an agent
+  loop; `tool: <name>` calls a tool directly with templated args, no LLM.
+- **Tool** — something callable from an agent. Four kinds:
+  - **Declarative** (`tools/<name>.yml`, `kind: http` or `kind: shell`)
+  - **Python** (`tools/<name>.py` with `@tool` from `zymi`, sync or async)
+  - **MCP** (`mcp_servers:` in `project.yml`, namespaced
+    `mcp__<server>__<tool>`)
+  - **Builtin** (shipped by zymi-core: `read_file`, `write_file`,
+    `write_memory`, …)
+- **Connector** — inbound source of events. Types: `http_inbound`
+  (webhook), `http_poll` (long-poll, e.g. Telegram getUpdates), `cron`
+  (schedule), `file_read`, `stdin`.
+- **Output** — outbound target on event match. Types: `http_post`,
+  `file_append`, `stdout`.
+- **Approval** — a gated tool call. Tools with `requires_approval: true`
+  publish `ApprovalRequested`; an approval channel routes a human
+  decision back. Channels: `terminal`, `http`, `telegram`.
+- **Stream** — append-only ordered sequence of events. Each pipeline run
+  is a stream. Hash-chained per stream for tamper-evidence.
+- **Event** — every state change. Hits the bus, gets persisted in
+  `.zymi/events.db`, replayable at any time.
+
+## Project layout
+
+```
+project.yml                 # top-level config: llm, defaults, policy, contracts,
+                            # connectors, outputs, approvals, mcp_servers, store
+agents/<name>.yml           # one file per agent
+pipelines/<name>.yml        # one file per pipeline
+tools/<name>.yml            # declarative tools (HTTP / shell)
+tools/<name>.py             # Python tools with @tool decorator
+.zymi/                      # runtime data — events.db, connectors.db. DO NOT edit.
+.env                        # secrets — gitignored. Auto-loaded by zymi.
+```
+
+## Task → file routing
+
+| When you want to … | Edit / run | See |
+|--------------------|-----------|-----|
+| Add a new agent | `agents/<name>.yml` | docs/agents.md |
+| Add a pipeline | `pipelines/<name>.yml` | docs/pipelines.md |
+| Add a non-LLM (deterministic) step | In a pipeline step use `tool: <name>` instead of `agent: <name>` | docs/pipelines.md#tool-steps |
+| Add an HTTP tool | `tools/<name>.yml` with `kind: http` | docs/tools.md#declarative-http |
+| Add a shell tool | `tools/<name>.yml` with `kind: shell` | docs/tools.md#declarative-shell |
+| Add a Python tool | `tools/<name>.py` with `@tool` from `zymi` | docs/tools.md#python |
+| Add an MCP server | `mcp_servers:` block in `project.yml` | docs/tools.md#mcp |
+| Set up an inbound webhook | `connectors:` block, `type: http_inbound` | docs/connectors.md#http-inbound |
+| Long-poll an external API (Telegram, …) | `connectors:` block, `type: http_poll` | docs/connectors.md#http-poll |
+| Run something on a schedule | `connectors:` block, `type: cron` | docs/connectors.md#cron |
+| Send HTTP on agent reply | `outputs:` block, `type: http_post`, `on: [ResponseReady]` | docs/connectors.md#http-post |
+| Gate a tool behind human approval | Set `requires_approval: true` on the tool, configure `approvals:` channel in `project.yml` | docs/approvals.md |
+| Run multiple `zymi serve` against shared store | `store: postgres://…` in `project.yml` | docs/store-backends.md |
+| Replay or fork a failed run | `zymi resume <run-id> --from-step <id>` | docs/events-and-replay.md#fork-resume |
+| Inspect what happened | `zymi events` / `zymi runs` / `zymi observe` (TUI) | docs/cli.md |
+
+## Conventions
+
+**Interpolation in YAML strings:**
+
+- `${env.NAME}` — environment variable (loaded from `.env` automatically)
+- `${inputs.<key>}` — pipeline input (passed via `-i key=value` or
+  connector `pipeline_input`)
+- `${steps.<id>.output}` — output of an upstream step (the step MUST be
+  in `depends_on`, otherwise resolution fails)
+- `${args.<key>}` — tool argument (used inside a tool's `implementation`)
+
+**Templates** (in `body_template`, `command_template`): MiniJinja, e.g.
+`{{ event.content }}` or `{{ event.content | tojson }}`. Standard Jinja2
+syntax; `tojson` is provided.
+
+**Naming:**
+
+- Tool / agent / pipeline names are lowercase `snake_case`.
+- The `name:` field inside `agents/<name>.yml` MUST match the filename.
+- MCP tools auto-prefix as `mcp__<server>__<tool>`.
+
+## Don'ts
+
+- **Don't `print()` from Python tools.** Return a string from the
+  function. `print` goes to stderr and is not captured.
+- **Don't bypass approvals** by deleting `requires_approval`. The bus
+  event still emits and downstream consumers will see the unapproved call.
+- **Don't reference `${steps.<id>.output}` without `depends_on`.** The
+  template fails to resolve at runtime.
+- **Don't mutate `.zymi/`.** It's the source of truth for replay; manual
+  edits break the hash chain.
+- **Don't commit `.env`.** It's gitignored for a reason.
+- **Don't write tools that eval/exec untrusted input.** Use the `policy`
+  block in `project.yml` to constrain shell access.
+
+## Quick command reference
+
+```bash
+# One-shot run with explicit inputs
+zymi run <pipeline> -i key=value [-i key=value …]
+
+# Long-running: react to PipelineRequested events from connectors
+zymi serve <pipeline>
+
+# Inspection
+zymi runs                                # list all pipeline runs
+zymi events --stream <stream-id>         # all events for a stream
+zymi events --kind <KindTag> [--raw]     # filter by event kind
+zymi verify --stream <stream-id>         # hash-chain integrity check
+zymi observe                             # 3-panel TUI: runs / DAG / events live
+
+# Replay
+zymi resume <run-id> --from-step <id> [--dry-run]
+
+# MCP
+zymi mcp probe <name> -- <cmd> [args …]  # smoke a server before wiring it
+```
+
+## Reference docs
+
+Online reference for every surface, versioned with the zymi-core repo:
+
+- https://github.com/metravod/zymi-core/blob/main/docs/getting-started.md
+- https://github.com/metravod/zymi-core/blob/main/docs/project-yaml.md
+- https://github.com/metravod/zymi-core/blob/main/docs/agents.md
+- https://github.com/metravod/zymi-core/blob/main/docs/pipelines.md
+- https://github.com/metravod/zymi-core/blob/main/docs/tools.md
+- https://github.com/metravod/zymi-core/blob/main/docs/connectors.md
+- https://github.com/metravod/zymi-core/blob/main/docs/approvals.md
+- https://github.com/metravod/zymi-core/blob/main/docs/store-backends.md
+- https://github.com/metravod/zymi-core/blob/main/docs/events-and-replay.md
+- https://github.com/metravod/zymi-core/blob/main/docs/cli.md
+- https://github.com/metravod/zymi-core/blob/main/docs/python-api.md
+"#;
+
 pub fn exec(name: Option<String>, example: Option<&str>) -> Result<(), String> {
     if let Some(ex) = example {
         if !KNOWN_EXAMPLES.contains(&ex) {
@@ -168,8 +319,6 @@ pub fn exec(name: Option<String>, example: Option<&str>) -> Result<(), String> {
     create_dir(&cwd, ".zymi")?;
 
     match example {
-        Some("research") => scaffold_research(&cwd, &project_name)?,
-        Some("mcp") => scaffold_mcp(&cwd, &project_name)?,
         Some("telegram") => scaffold_telegram(&cwd, &project_name)?,
         _ => scaffold_default(&cwd, &project_name)?,
     }
@@ -246,6 +395,7 @@ output:
 
     write_file(&root.join("tools/web_search.yml"), WEB_SEARCH_TOOL)?;
     write_file(&root.join("tools/web_scrape.yml"), WEB_SCRAPE_TOOL)?;
+    write_file(&root.join("AGENTS.md"), AGENTS_DOC)?;
 
     println!("Initialized zymi project '{project_name}'");
     println!();
@@ -254,312 +404,11 @@ output:
     println!("  pipelines/main.yml       — main pipeline");
     println!("  tools/web_search.yml     — web search tool (configure your provider)");
     println!("  tools/web_scrape.yml     — web scrape tool (configure your provider)");
+    println!("  AGENTS.md                — guide for AI assistants editing this project");
     println!("  .zymi/                   — runtime data (events.db)");
     println!();
     println!("Next: configure your LLM provider in project.yml, then run:");
     println!("  zymi run main");
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Research example scaffold
-// ---------------------------------------------------------------------------
-
-fn scaffold_research(root: &Path, project_name: &str) -> Result<(), String> {
-    create_dir(root, "output")?;
-    create_dir(root, "memory")?;
-
-    // -- project.yml --
-    write_file(
-        &root.join("project.yml"),
-        &format!(
-            r#"name: {project_name}
-version: "0.1"
-
-# Uncomment and set your LLM provider:
-# llm:
-#   provider: openai
-#   model: gpt-4o
-#   api_key: ${{env.OPENAI_API_KEY}}
-
-variables:
-  default_model: gpt-4o
-
-defaults:
-  timeout_secs: 60
-  max_iterations: 15
-
-policy:
-  enabled: true
-  allow: ["cat *", "ls *", "echo *"]
-  deny: ["rm -rf *"]
-
-contracts:
-  file_write:
-    allowed_dirs: ["./output", "./memory"]
-    deny_patterns: ["*.env", "*.key", "*.pem"]
-"#
-        ),
-    )?;
-
-    // -- agents/researcher.yml --
-    write_file(
-        &root.join("agents/researcher.yml"),
-        r#"name: researcher
-description: "Research agent — searches the web, scrapes pages, and stores findings in memory"
-model: ${default_model}
-system_prompt: |
-  You are a thorough research assistant. Your job is to find accurate,
-  up-to-date information on the given topic.
-
-  Strategy:
-  1. Start with broad web searches to identify key sources.
-  2. Scrape the most promising pages for detailed content.
-  3. Store important findings in memory with clear keys.
-  4. Cite your sources.
-
-  Always prefer primary sources over secondary ones.
-  If information conflicts, note the discrepancy.
-tools:
-  - web_search
-  - web_scrape
-  - write_memory
-max_iterations: 15
-"#,
-    )?;
-
-    // -- agents/writer.yml --
-    write_file(
-        &root.join("agents/writer.yml"),
-        r#"name: writer
-description: "Writer agent — reads research findings and produces a structured report"
-model: ${default_model}
-system_prompt: |
-  You are a skilled technical writer. Your job is to transform raw research
-  findings into a clear, well-structured report.
-
-  Guidelines:
-  1. Read all available memory entries to understand the research.
-  2. Organize findings into logical sections.
-  3. Include a summary at the top.
-  4. Cite sources where available.
-  5. Write the final report to the output directory.
-
-  Format: Markdown. Be concise but thorough.
-tools:
-  - read_file
-  - write_file
-max_iterations: 10
-"#,
-    )?;
-
-    // -- pipelines/research.yml --
-    write_file(
-        &root.join("pipelines/research.yml"),
-        r#"name: research
-description: "Multi-step research pipeline: parallel search → analysis → report"
-
-steps:
-  - id: search_web
-    agent: researcher
-    task: "Search the web for information about: ${inputs.topic}"
-
-  - id: search_deep
-    agent: researcher
-    task: "Find in-depth articles and technical details about: ${inputs.topic}"
-
-  - id: analyze
-    agent: researcher
-    task: >
-      Analyze and cross-reference all findings from the web search and deep
-      search. Identify key themes, contradictions, and gaps. Store a structured
-      summary in memory under the key 'analysis'.
-    depends_on:
-      - search_web
-      - search_deep
-
-  - id: write_report
-    agent: writer
-    task: >
-      Read the analysis from memory and write a comprehensive research report
-      to ./output/report.md. Include an executive summary, main findings,
-      and a sources section.
-    depends_on:
-      - analyze
-
-input:
-  type: text
-
-output:
-  step: write_report
-"#,
-    )?;
-
-    write_file(&root.join("tools/web_search.yml"), WEB_SEARCH_TOOL)?;
-    write_file(&root.join("tools/web_scrape.yml"), WEB_SCRAPE_TOOL)?;
-
-    println!("Initialized zymi project '{project_name}' with research example");
-    println!();
-    println!("  project.yml                — project configuration");
-    println!("  agents/researcher.yml      — research agent (web_search, web_scrape, write_memory)");
-    println!("  agents/writer.yml          — writer agent (read_file, write_file)");
-    println!("  pipelines/research.yml     — 4-step research pipeline with parallel search");
-    println!("  tools/web_search.yml       — web search tool (configure your provider)");
-    println!("  tools/web_scrape.yml       — web scrape tool (configure your provider)");
-    println!("  output/                    — report output directory");
-    println!("  memory/                    — agent memory store");
-    println!("  .zymi/                     — runtime data (events.db)");
-    println!();
-    println!("Pipeline DAG:");
-    println!("  search_web ──┐");
-    println!("               ├─→ analyze ──→ write_report");
-    println!("  search_deep ─┘");
-    println!();
-    println!("Next:");
-    println!("  1. Configure your LLM provider in project.yml");
-    println!("  2. Run: zymi run research");
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// MCP example scaffold
-// ---------------------------------------------------------------------------
-
-fn scaffold_mcp(root: &Path, project_name: &str) -> Result<(), String> {
-    create_dir(root, "sandbox")?;
-
-    write_file(
-        &root.join("project.yml"),
-        &format!(
-            r#"name: {project_name}
-version: "0.1"
-
-# The whole point of this example: one `mcp_servers:` entry = N tools from an
-# off-the-shelf MCP server, no per-tool YAML schemas to write. See
-# https://modelcontextprotocol.io for the protocol and a server catalogue.
-
-llm:
-  provider: openai
-  model: gpt-4o-mini
-  api_key: ${{env.OPENAI_API_KEY}}
-
-mcp_servers:
-  - name: fs
-    command:
-      - npx
-      - "-y"
-      - "@modelcontextprotocol/server-filesystem"
-      - ./sandbox
-    # `PATH` is auto-forwarded so `npx` resolves. Every other variable the
-    # parent process has (OPENAI_API_KEY, credentials, …) stays out of the
-    # child unless you name it here — ADR-0023 §security posture.
-    # The server advertises 14 tools. Narrow to what this demo actually
-    # uses — everything else stays unreachable to the agent.
-    allow:
-      - read_text_file
-      - write_file
-      - list_directory
-      - search_files
-    init_timeout_secs: 15
-    call_timeout_secs: 30
-    restart:
-      max_restarts: 2
-      backoff_secs: [1, 5]
-
-defaults:
-  timeout_secs: 60
-  max_iterations: 10
-
-policy:
-  enabled: true
-  # No shell access in this example — the agent only talks to the MCP server.
-  allow: []
-  deny: ["*"]
-
-contracts:
-  file_write:
-    allowed_dirs: ["./sandbox", "./output"]
-    deny_patterns: ["*.env", "*.key"]
-"#
-        ),
-    )?;
-
-    write_file(
-        &root.join("agents/default.yml"),
-        r#"name: default
-description: "Agent that reads/writes files via the MCP filesystem server."
-system_prompt: |
-  You are a filesystem assistant operating inside a sandboxed directory.
-
-  All file operations go through the MCP filesystem server, exposed as tools
-  prefixed with `mcp__fs__`. Paths are resolved relative to the server's
-  configured root, so `./notes.md` and `notes.md` both mean the same file
-  inside the sandbox.
-
-  Workflow:
-  1. Use `mcp__fs__list_directory` to see what is already there.
-  2. Use `mcp__fs__read_text_file` to read existing files before overwriting.
-  3. Use `mcp__fs__write_file` to produce your output.
-
-  Be concise. Do the work, then stop — do not narrate every step.
-tools:
-  - mcp__fs__list_directory
-  - mcp__fs__read_text_file
-  - mcp__fs__write_file
-  - mcp__fs__search_files
-max_iterations: 8
-"#,
-    )?;
-
-    write_file(
-        &root.join("pipelines/main.yml"),
-        r#"name: main
-description: "Single-step demo: agent uses MCP filesystem tools to fulfil a task."
-
-steps:
-  - id: do_it
-    agent: default
-    task: "${inputs.task}"
-
-input:
-  type: text
-
-output:
-  step: do_it
-"#,
-    )?;
-
-    write_file(
-        &root.join("sandbox/README.md"),
-        r#"This directory is the sandbox the MCP filesystem server has access to.
-
-Everything the agent reads and writes lives here. Feel free to drop files in
-before running the demo — the agent can list, read, search, and overwrite
-them.
-"#,
-    )?;
-
-    println!("Initialized zymi project '{project_name}' with MCP example");
-    println!();
-    println!("  project.yml              — one `mcp_servers:` entry pulls the filesystem server");
-    println!("  agents/default.yml       — agent wired to `mcp__fs__*` tools");
-    println!("  pipelines/main.yml       — single-step demo pipeline");
-    println!("  sandbox/                  — the only dir the MCP server can touch");
-    println!("  .zymi/                   — runtime data (events.db)");
-    println!();
-    println!("Prerequisites:");
-    println!("  - `node` + `npx` on PATH (`npx -y @modelcontextprotocol/server-filesystem` on first run");
-    println!("     may prompt to download the package)");
-    println!("  - `OPENAI_API_KEY` exported, or swap the provider in project.yml");
-    println!();
-    println!("Next:");
-    println!("  1. export OPENAI_API_KEY=sk-...");
-    println!("  2. zymi run main -i task=\"List everything in the sandbox, then write notes.md summarising it.\"");
-    println!();
-    println!("Tip: before wiring any new MCP server into project.yml, probe it:");
-    println!("  zymi mcp probe <name> -- <command> [args...]");
 
     Ok(())
 }
@@ -678,6 +527,27 @@ approvals:
     # `X-Telegram-Bot-Api-Secret-Token` header. Without it, anyone who
     # guesses your public URL can forge approvals.
     secret_token: "${{env.TELEGRAM_WEBHOOK_SECRET}}"
+
+# ── (optional) MCP server — N tools from one block, no YAML stubs ───────────
+#
+# Uncomment to give the agent read/write access to the local filesystem via
+# the official MCP filesystem server. Tools land in the catalogue prefixed
+# with `mcp__fs__*` (list_directory, read_text_file, write_file, …) — wire
+# them into agents/assistant.yml `tools:` to make them callable.
+#
+# Requires `node` + `npx` on PATH. See ADR-0023 for the full security posture
+# (PATH auto-forward, env-isolation, restart policy).
+#
+# mcp_servers:
+#   - name: fs
+#     command:
+#       - npx
+#       - "-y"
+#       - "@modelcontextprotocol/server-filesystem"
+#       - ./sandbox
+#     allow: [read_text_file, write_file, list_directory]
+#     init_timeout_secs: 15
+#     call_timeout_secs: 30
 "#
         ),
     )?;
@@ -702,6 +572,8 @@ system_prompt: |
   Tools:
   - `web_search` for questions that need current or specific external information.
   - `web_scrape` to read a specific URL the user mentions.
+  - `get_weather` for current weather in a named city (Python tool, sync).
+  - `translate` for translating text into a target language (Python tool, async).
   - `broadcast` sends an announcement to a public channel. Always
     requires human approval — the operator gets a Telegram DM with
     ✅ / ❌ buttons before the message goes out. Use this only when the
@@ -712,6 +584,8 @@ system_prompt: |
 tools:
   - web_search
   - web_scrape
+  - get_weather
+  - translate
   - broadcast
 max_iterations: 4
 "#,
@@ -786,6 +660,56 @@ output:
     // -- tools/web_search.yml + tools/web_scrape.yml + tools/broadcast.yml --
     write_file(&root.join("tools/web_search.yml"), WEB_SEARCH_TOOL)?;
     write_file(&root.join("tools/web_scrape.yml"), WEB_SCRAPE_TOOL)?;
+
+    // -- tools/get_weather.py + tools/translate.py --
+    // Auto-discovered by zymi at startup (ADR-0014 slice 3): any file under
+    // `tools/*.py` containing one or more `@tool`-decorated functions gets
+    // registered in the catalogue. Drop more files in to add tools.
+    //
+    // Python tools require pip-installed zymi (`pip install zymi-core`) —
+    // the cargo binary doesn't bundle the Python runtime.
+    write_file(
+        &root.join("tools/get_weather.py"),
+        r#""""Sync Python tool — current weather for a city.
+
+This is the simplest possible @tool: a regular Python function whose
+arguments and docstring are introspected to build the LLM-facing schema.
+Replace the stub body with a real API call (OpenWeatherMap, weatherapi.com,
+…) when you want live data.
+"""
+from zymi import tool
+
+
+@tool
+def get_weather(city: str) -> str:
+    """Return the current weather for a city."""
+    return f"It's mild and partly cloudy in {city} today (stub — wire a real API)."
+"#,
+    )?;
+
+    write_file(
+        &root.join("tools/translate.py"),
+        r#""""Async Python tool — `async def` is supported as-is.
+
+The runtime awaits the coroutine on a worker thread, so you can use
+`httpx`, `aiohttp`, or any other async I/O library here without blocking
+the agent loop. The stub below just sleeps to prove async dispatch works.
+"""
+import asyncio
+
+from zymi import tool
+
+
+@tool
+async def translate(text: str, target: str = "en") -> str:
+    """Translate text into the target language (ISO 639-1 code)."""
+    await asyncio.sleep(0)  # placeholder for a real async HTTP call
+    return f"[{target}] {text}"
+"#,
+    )?;
+
+    // -- AGENTS.md (guide for AI assistants editing this project) --
+    write_file(&root.join("AGENTS.md"), AGENTS_DOC)?;
     write_file(
         &root.join("tools/broadcast.yml"),
         r#"# broadcast — gated tool that triggers the ADR-0022 approval flow.
@@ -865,13 +789,16 @@ TELEGRAM_WEBHOOK_SECRET=
 
     println!("Initialized zymi project '{project_name}' with telegram example");
     println!();
-    println!("  project.yml              — Telegram chat I/O + ops_tg approval channel");
-    println!("  agents/assistant.yml     — drafts the reply (web_search / web_scrape / broadcast)");
+    println!("  project.yml              — Telegram chat I/O + ops_tg approval channel + commented mcp_servers: block");
+    println!("  agents/assistant.yml     — drafts the reply (declarative + Python tools, broadcast w/ approval)");
     println!("  agents/reviewer.yml      — verifies the draft, polishes if needed");
     println!("  pipelines/chat.yml       — DAG: respond → polish");
     println!("  tools/web_search.yml     — declarative search tool (configure a provider)");
     println!("  tools/web_scrape.yml     — declarative scrape tool (configure a provider)");
     println!("  tools/broadcast.yml      — gated `requires_approval: true` tool (ADR-0022)");
+    println!("  tools/get_weather.py     — sync @tool (auto-discovered, requires pip-installed zymi)");
+    println!("  tools/translate.py       — async @tool (auto-discovered, requires pip-installed zymi)");
+    println!("  AGENTS.md                — guide for AI assistants editing this project");
     println!("  .env.example             — token placeholders");
     println!("  .zymi/                   — runtime data (events.db, connectors.db)");
     println!();
