@@ -24,5 +24,7 @@ __pycache__/
 /.drift
 /.claude
 CLAUDE.md
-AGENTS.md
-TESTING.md
+# AGENTS.md is generated INTO user projects by `zymi init`; in this repo
+# the equivalent is CLAUDE.md (kept local). Don't commit a root AGENTS.md
+# here by accident.
+/AGENTS.md

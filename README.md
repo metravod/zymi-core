@@ -4,7 +4,7 @@
 
 <h1 align="center">zymi-core</h1>
 
-<p align="center"><em>Declarative agent engine — dbt for AI workflows, with event sourcing built in.</em></p>
+<p align="center"><em>dbt for AI workflows — declarative agents, deterministic replay, human-in-the-loop, all from YAML.</em></p>
 
 <p align="center"><sub>Pronounced <em>zoomi</em> — like dog zoomies.</sub></p>
 
@@ -16,21 +16,23 @@
 
 ## Why zymi-core?
 
-Most agent frameworks are imperative Python: you write a script that makes LLM calls, maybe persists some messages, and leaves you guessing about the rest. Debugging a bad run means reading logs, hoping you logged enough.
+Most agent frameworks are imperative Python: write a script that makes LLM calls, persist some messages, hope you logged enough to debug a bad run later.
 
 `zymi-core` inverts that:
 
-- **Declarative, like dbt.** Describe agents, tools, pipelines, and integrations in YAML. The engine loads them, validates them, runs them as a DAG. No orchestration code to write.
-- **Event-sourced.** Every state change — inbound message, LLM call, tool result, approval, outbound reply — is an immutable event persisted to SQLite with a per-stream hash chain. Runs are replayable, resumable, and auditable without extra logging.
-- **Boundary-safe.** Agents emit *intentions* ("I want to write this file", "I want to run this shell command") that pass through contracts and optional human approval before execution. The unsafe thing never happens until someone said yes.
+- **Declarative, like dbt.** Agents, pipelines, tools, connectors, approvals — all YAML. The engine validates and runs them as a DAG.
+- **Event-sourced.** Every state change is an immutable, hash-chained event. Runs are replayable, resumable, and auditable without extra logging.
+- **Boundary-safe.** Agents emit *intentions* (run shell, write file, call HTTP) that pass through policy + contracts + optional human approval before execution. The risky thing doesn't happen until someone says yes.
 
-The ergonomic target: you can bring a useful agent online in minutes without writing code, and a year later still answer *exactly what this agent did* on any past run.
+Bring a useful agent online in minutes without writing code. A year later, still answer *exactly what this agent did* on any past run.
+
+📚 **AI-assistant friendly out of the box.** Every `zymi init` scaffold drops an `AGENTS.md` into the user's project — vocabulary, file map, task→file routing. Claude Code / Cursor / Aider read it automatically; the YAML they help you write gets noticeably more correct.
 
 ---
 
 ## Run a Telegram agent in two minutes
 
-This is the primary demo — a real chat bot you talk to on your phone, wired declaratively.
+This is the canonical demo — a real chat bot, wired declaratively.
 
 ```bash
 pip install zymi-core
@@ -42,379 +44,208 @@ zymi init --example telegram
 # 2. Fill .env:
 cp .env.example .env       # edit TELEGRAM_BOT_TOKEN + OPENAI_API_KEY
 # 3. Open project.yml, replace "your_username_here" with your actual
-#    Telegram username (no @). This keeps strangers out of the bot.
+#    Telegram username (no @). Keeps strangers out of the bot.
 
-source .env
+set -a; source .env; set +a
 zymi serve chat
 ```
 
-Message the bot — it replies within a couple of seconds. Every inbound message, LLM call, and outbound reply is persisted to `.zymi/events.db`; watch it live with `zymi observe`.
+Message the bot. It replies in seconds. Every inbound message, LLM call, approval decision, and outbound reply is in `.zymi/events.db`; watch live with `zymi observe`.
 
-The entire wiring lives in `project.yml`:
+The whole wiring — Telegram I/O, two-step DAG (`assistant` drafts, `reviewer` polishes), declarative + Python tools, approval channel — lives in YAML. The scaffold also drops `AGENTS.md` so an AI coding assistant can extend the project safely. Concrete demo of:
 
-```yaml
-llm:
-  provider: openai
-  model: gpt-4o-mini
-  api_key: ${env.OPENAI_API_KEY}
+- **`http_poll` connector** — long-polls Telegram's `getUpdates`, no HTTPS / ngrok needed
+- **`http_post` output** — sends each `ResponseReady` back to the user
+- **Telegram approval channel** — DMs admins with ✅ / ❌ buttons when the agent calls `broadcast` (`requires_approval: true`)
+- **Python `@tool` auto-discovery** — drop `tools/get_weather.py` (sync) or `tools/translate.py` (async) and the agent picks them up
 
-connectors:
-  - type: http_poll                   # long-polls getUpdates (no HTTPS needed)
-    name: telegram
-    url: "https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getUpdates"
-    interval_secs: 2
-    extract:
-      items:     "$.result[*]"
-      stream_id: "$.message.chat.id"
-      content:   "$.message.text"
-    cursor: { param: offset, from_item: "$.update_id", plus_one: true, persist: true }
-    filter:
-      "$.message.from.username":
-        one_of: ["your_username_here"]
-    pipeline: chat                    # every accepted message → `zymi serve chat`
+Ask the bot to "announce that we're closing at 5pm" — the agent calls `broadcast`, you get a DM with approve/deny buttons, nothing goes out until you click. End-to-end audit trail in `zymi events`.
 
-outputs:
-  - type: http_post                   # reply on every pipeline completion
-    name: telegram_reply
-    on: [ResponseReady]
-    url: "https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage"
-    headers: { Content-Type: "application/json" }
-    body_template: '{"chat_id":"{{ event.stream_id }}","text":{{ event.content | tojson }}}'
-    retry: { attempts: 3, backoff_secs: [1, 5, 30] }
-```
-
-That's it. No Rust. No Python. The scaffold ships with a small two-step DAG — `respond` (assistant with `web_search` / `web_scrape` tools) → `polish` (a brutally lazy reviewer that keeps the draft verbatim unless it's actually broken). Both steps are visible live in `zymi observe`.
-
-Ask the bot to "announce that we're closing at 5pm" and the agent reaches for `tools/broadcast.yml` (`requires_approval: true`). The `approvals:` section in `project.yml` DMs you with ✅ / ❌ buttons; nothing goes out until you click. See [Approvals on the bus](#approvals-on-the-bus) below.
-
-Want a real search backend? Open `tools/web_search.yml`, uncomment a provider block (Brave, Tavily, SerpAPI, Google), set its key in `.env`. Out of the box the bot still works — the assistant just answers from its own knowledge.
-
-### Same primitives elsewhere
-
-`http_inbound` / `http_poll` / `http_post` cover webhooks and REST for most SaaS. Pick `http_inbound` when the service can POST to you over HTTPS, `http_poll` when you're behind NAT or the service has no webhooks. Filter recipes for the common cases:
-
-```yaml
-# GitHub — only react to PR opens, not pushes or issues
-filter:
-  "$.action":              { equals: "opened" }
-  "$.pull_request.draft":  { equals: false }
-
-# Slack Events API — one channel, skip bot echoes
-filter:
-  "$.event.channel":  { equals: "C0123456789" }
-  "$.event.subtype":  { equals: null }
-```
-
-Out of the box `filter:` supports `one_of` / `equals`. 429 rate-limiting is handled automatically (`Retry-After` header + Telegram's body-level hint are both honoured on retries).
+Full setup in [docs/getting-started.md](docs/getting-started.md). Connector deep-dive in [docs/connectors.md](docs/connectors.md). Approvals in [docs/approvals.md](docs/approvals.md).
 
 ---
 
-## Highlights
+## What's in the box
 
-### Pipelines are DAGs
+### Pipelines — DAGs, agent steps, deterministic tool steps
 
-A pipeline is a list of steps with `depends_on:` edges. Independent steps run in parallel, dependencies stay explicit.
+A pipeline is a list of steps with `depends_on:` edges. Independent steps run in parallel. Each step is either an **agent step** (LLM ReAct loop) or a **deterministic tool step** ([ADR-0024](adr/0024-deterministic-tool-steps.md)) — direct dispatch with templated args, no LLM hop, but the same event envelope.
+
+Mix them freely:
 
 ```yaml
-# pipelines/research.yml
 steps:
-  - id: search_web
-    agent: researcher
-    task: "Find articles on: ${inputs.topic}"
+  - id: fetch                            # deterministic — no LLM
+    tool: http_get
+    args: { url: "https://api.example.com/${inputs.id}" }
 
-  - id: search_deep
-    agent: researcher
-    task: "Find technical details on: ${inputs.topic}"
-
-  - id: analyze
-    agent: researcher
-    task: "Cross-reference findings, store a structured summary in memory."
-    depends_on: [search_web, search_deep]    # runs after both finish
-
-  - id: write_report
-    agent: writer
-    task: "Read memory, write ./output/report.md."
-    depends_on: [analyze]
+  - id: classify                         # LLM
+    agent: classifier
+    task: "${steps.fetch.output}"
+    depends_on: [fetch]
 ```
 
-Try it: `zymi init --example research`. The scaffold pre-configures a two-agent pipeline with parallel search.
+Schema, examples, gotchas → [docs/pipelines.md](docs/pipelines.md).
+
+### Tools — four kinds, one catalogue
+
+All four kinds emit identical `ToolCallRequested` / `ToolCallCompleted` events; the agent doesn't know which catalogue a tool came from.
+
+- **Declarative HTTP / shell** in `tools/<name>.yml` — no code.
+- **Python `@tool`** in `tools/<name>.py` — sync or async, signature → JSON Schema, auto-discovered.
+- **MCP servers** — one `mcp_servers:` entry gives N tools, namespaced `mcp__<server>__<tool>` ([ADR-0023](adr/0023-mcp-client-integration.md)).
+- **Builtins** — `read_file`, `write_file`, `write_memory`, `execute_shell_command`, `spawn_sub_agent`.
+
+```python
+# tools/get_weather.py — auto-discovered at runtime startup.
+from zymi import tool
+
+@tool
+def get_weather(city: str) -> str:
+    """Return the current weather for a city."""
+    return f"sunny in {city}"
+```
+
+Schema and the four kinds in detail → [docs/tools.md](docs/tools.md).
+
+### Connectors and outputs
+
+Inbound: `http_inbound` (webhook), `http_poll` (long-poll), `cron`, `file_read`, `stdin`.
+Outbound: `http_post`, `file_append`, `stdout`.
+
+All declarative, all emit events. Filter recipes ([docs/connectors.md](docs/connectors.md#http-poll)):
+
+```yaml
+# GitHub — only react to PR opens
+filter:
+  "$.action":              { equals: "opened" }
+  "$.pull_request.draft":  { equals: false }
+```
+
+429 + `Retry-After` handled automatically. Cursors persist across restarts. Multi-process `zymi serve` against shared Postgres sees one cursor table, no double-fire.
+
+### Approvals — event-sourced, restart-safe
+
+Tools with `requires_approval: true` publish `ApprovalRequested` on the bus; an approval channel routes a human decision back. Three channels in the box: `terminal`, `http`, `telegram` ([ADR-0022](adr/0022-event-sourced-approvals.md)).
+
+Resolution order: **pipeline override → project default → fail-closed**. A `zymi serve` crash mid-approval is repaired on next start: in-flight requests are redelivered to live channels; expired ones are sealed with `ApprovalDenied{reason: restart_timeout}`.
+
+Full schemas + telegram setup → [docs/approvals.md](docs/approvals.md).
 
 ### Replay, resume, observe
 
-Because everything is an event, you don't just log runs — you *keep* them.
-
 ```bash
 zymi runs                                   # all pipeline runs
-zymi events --stream pipeline-research-abc  # every event in one run
-zymi verify --stream pipeline-research-abc  # hash-chain integrity check
+zymi events --stream pipeline-chat-abc      # every event in one run
+zymi verify --stream pipeline-chat-abc      # hash-chain integrity check
 zymi observe                                # 3-panel TUI: runs / DAG / events live
 
-# Fork-resume an earlier run from a chosen step. Upstream steps are frozen;
-# the fork step + DAG-descendants re-run against current configs on disk.
-zymi resume pipeline-research-abc --from-step write_report
-zymi resume pipeline-research-abc --from-step write_report --dry-run
+# Fork-resume from a chosen step. Upstream steps are frozen; the fork
+# step + DAG-descendants re-run against current configs on disk.
+zymi resume pipeline-chat-abc --from-step polish
+zymi resume pipeline-chat-abc --from-step polish --dry-run
 ```
 
-Fork-resume is useful when you're iterating on a prompt or tool config: you don't have to re-burn the expensive early steps every time you tweak the later ones. See [ADR-0018](adr/0018-idempotent-fork-resume.md).
+Useful when you're iterating on a prompt: don't re-burn the expensive early steps every time you tweak the later ones. → [docs/events-and-replay.md](docs/events-and-replay.md).
 
-### MCP servers — N tools per YAML entry
+### Store backends
 
-Declarative tools cover HTTP and shell. For anything heavier — filesystem sandbox, git client, search index, proprietary protocol — drop a [Model Context Protocol][mcp] server into `project.yml` and `zymi-core` handles the subprocess, handshake, restarts, and tool-catalog wiring.
+SQLite (default, zero-config) for single-process / dev. Postgres for multi-process `zymi serve` against shared state — one `store: postgres://…` line in `project.yml` ([ADR-0012](adr/0012-cross-process-event-delivery.md)). Same hash-chain semantics either way. → [docs/store-backends.md](docs/store-backends.md).
 
-```yaml
-mcp_servers:
-  - name: fs
-    command: [npx, -y, "@modelcontextprotocol/server-filesystem", ./sandbox]
-    allow: [read_text_file, write_file, list_directory]
-    restart: { max_restarts: 2, backoff_secs: [1, 5] }
-```
+### Context window management
 
-Then in the agent:
-
-```yaml
-tools:
-  - mcp__fs__read_text_file
-  - mcp__fs__write_file
-  - mcp__fs__list_directory
-```
-
-No per-tool schemas to author — they come from the server's `tools/list` at startup. Every call is audited as a normal tool event. Probe new servers before wiring:
-
-```bash
-zymi mcp probe fs -- npx -y @modelcontextprotocol/server-filesystem /tmp
-zymi mcp probe gh --env GITHUB_PERSONAL_ACCESS_TOKEN=ghp_... \
-                  -- npx -y @modelcontextprotocol/server-github
-```
-
-End-to-end demo: `zymi init --example mcp`. Full posture (PATH forwarding, env-isolation, restart policy) in [ADR-0023](adr/0023-mcp-client-integration.md).
-
-### Declarative custom tools
-
-HTTP and shell tools live in `tools/*.yml`. No rebuild, no Rust.
-
-```yaml
-# tools/slack_post.yml
-name: slack_post
-description: "Post a message to a Slack channel"
-parameters:
-  type: object
-  properties:
-    channel: { type: string }
-    text:    { type: string }
-  required: [channel, text]
-implementation:
-  kind: http
-  method: POST
-  url: "https://slack.com/api/chat.postMessage"
-  headers:
-    Authorization: "Bearer ${env.SLACK_TOKEN}"
-    Content-Type:  "application/json"
-  body_template: '{"channel": "${args.channel}", "text": "${args.text}"}'
-```
-
-`${env.*}` resolves at parse time; `${args.*}` resolves at call time from LLM arguments. Collisions with built-in tools are a hard error.
-
-### Automatic context management
-
-The agent's working context is reconstructed from the event log each iteration, not accumulated in a growing buffer. Older tool observations are masked in-place (~2× cost reduction, no extra LLM calls). When the token budget still gets tight, hybrid compaction summarises the oldest masked batch with a fast LLM call. Both caps are tunable:
-
-```yaml
-runtime:
-  context:
-    observation_window: 10         # recent turns kept verbatim
-    soft_cap_chars: 400000         # triggers LLM summarisation
-    hard_cap_chars: 600000         # fatal if exceeded after compaction
-    min_tail_turns: 4
-```
-
-Design and trade-offs in [ADR-0016](adr/0016-context-window-management.md).
-
-### Safer side effects
-
-Agents don't take actions directly — they emit intentions (`ExecuteShellCommand`, `WriteFile`, `ReadFile`, `WebSearch`, `SpawnSubAgent`, `CallCustomTool`, …). Intentions pass through:
-
-1. **Policy engine** — shell command allow/deny patterns.
-2. **Contracts** — file-write boundaries, rate limits, tool-specific rules.
-3. **Approval** — declarative `approvals:` channels (terminal / http / telegram), or fail-closed when no channel is configured.
-
-Nothing with side effects runs until the intention is approved.
-
-### Approvals on the bus
-
-Approvals are declarative in `project.yml` ([ADR-0022](adr/0022-event-sourced-approvals.md)). Pick a channel — terminal prompt, HTTP endpoint, or Telegram DM with inline ✅/❌ keyboard — and any tool flagged `requires_approval: true` routes through it.
-
-```yaml
-default_approval_channel: ops_tg
-
-approvals:
-  - type: telegram
-    name: ops_tg
-    bot_token:    "${env.TELEGRAM_BOT_TOKEN}"
-    chat_id:      "${env.TELEGRAM_ADMIN_CHAT_ID}"
-    bind:         "127.0.0.1:8088"
-    callback_path: /telegram/approval
-    secret_token: "${env.TELEGRAM_WEBHOOK_SECRET}"
-```
-
-```yaml
-# tools/broadcast.yml — gated tool
-name: broadcast
-description: "Send an announcement to the team channel."
-parameters: { type: object, properties: { message: { type: string } }, required: [message] }
-requires_approval: true
-implementation:
-  kind: shell
-  command_template: "post-to-slack ${args.message}"
-```
-
-When the agent calls `broadcast`, the bot DMs the admin chat with approve/deny buttons; the click flows back as `ApprovalGranted` / `ApprovalDenied` events. Resolution order is **pipeline override → project default → fail-closed**. Every step is on the event bus, so the audit trail is uniform with the rest of the run, and a hard crash mid-approval is repaired on next start: in-flight requests are redelivered to live channels, expired ones are sealed with `ApprovalDenied{reason: restart_timeout}`. End-to-end demo: `zymi init --example telegram`.
+The agent's working context is reconstructed from the event log each iteration, not accumulated in a buffer. Older tool observations are masked in-place (~2× cost reduction, no extra LLM calls). When the budget still gets tight, hybrid compaction summarises the oldest masked batch with one fast LLM call. Tunable in `runtime.context:` ([ADR-0016](adr/0016-context-window-management.md)).
 
 ### JSON Schemas for configs
 
-IDE autocomplete and LLM-assisted config generation come free:
+IDE autocomplete and LLM-assisted YAML come free:
 
 ```bash
-zymi schema project       # draft-07 JSON Schema for project.yml
+zymi schema project          # draft-07 JSON Schema for project.yml
 zymi schema --all
 ```
 
 ---
 
-## Python bindings
+## Python embedding
 
-The same `pip install zymi-core` that gives you the CLI also exposes `Runtime`, `Event`, `EventBus`, `EventStore`, `Subscription`, `ToolRegistry`.
+The same `pip install zymi-core` exposes a Python API: `Runtime`, `Event`, `EventBus`, `EventStore`, `Subscription`, `ToolRegistry`, plus the `@tool` decorator.
 
 ```python
 from zymi_core import Runtime
 
 rt = Runtime.for_project(".", approval="terminal")
-result = rt.run_pipeline("research", {"topic": "rust event sourcing"})
+result = rt.run_pipeline("chat", {"message": "hello"})
 print(result.success, result.final_output)
 ```
 
-`rt.bus()` and `rt.store()` hand out wrappers over the same `Arc`s the Rust runtime uses — a Python subscriber sees exactly what the handler publishes, no second bus over the same SQLite file.
+`rt.bus()` and `rt.store()` share `Arc`-handles with the runtime — Python subscribers see exactly what the handler publishes.
 
-### Cross-process events (Django, Celery, scripts)
-
-The SQLite store is the source of truth: events written from one process are visible to every other process that opens the same file, and `zymi serve` picks them up via a polling tail watcher ([ADR-0012](adr/0012-cross-process-event-delivery.md)).
-
-Canonical pattern — a web app publishes `PipelineRequested`, the long-running `zymi serve` runs the pipeline, the result comes back as `PipelineCompleted` with the same `correlation_id`.
+**Cross-process pattern** (Django view / Celery task drives `zymi serve` over the shared store):
 
 ```python
-# Terminal A: zymi serve research
-# Terminal B: any Python process — Django view, Celery task, script
 import uuid
 from zymi_core import Event, EventBus, EventStore
 
 store = EventStore(".zymi/events.db")
-bus   = EventBus(store)
+bus = EventBus(store)
 
-correlation_id = str(uuid.uuid4())
-sub = bus.subscribe_correlation(correlation_id)
+corr = str(uuid.uuid4())
+sub = bus.subscribe_correlation(corr)
 
-event = Event(
-    stream_id=f"web-{correlation_id}",
-    kind={"type": "PipelineRequested", "data": {
-        "pipeline": "research",
-        "inputs":   {"topic": "rust event sourcing"},
-    }},
+ev = Event(
+    stream_id=f"web-{corr}",
+    kind={"type": "PipelineRequested",
+          "data": {"pipeline": "research", "inputs": {"topic": "rust event sourcing"}}},
     source="django",
 )
-event.with_correlation(correlation_id)
-bus.publish(event)
+ev.with_correlation(corr)
+bus.publish(ev)
 
 result = sub.recv(timeout_secs=300)
-print(result.kind)
 ```
 
-Inside `zymi serve` the `PipelineRequested → RunPipeline` translation is done by `EventCommandRouter` — re-exported from `zymi_core::runtime`, so your own scheduler or bot adapter can drive a `Runtime` without copying `cli/serve.rs`.
+Full surface → [docs/python-api.md](docs/python-api.md).
 
 ---
 
-## Rust crate
-
-```toml
-[dependencies]
-zymi-core = "0.4"
-```
-
-```rust
-use std::sync::Arc;
-use zymi_core::{open_store, Event, EventBus, EventKind, Message, StoreBackend};
-
-let store = open_store(StoreBackend::Sqlite { path: "events.db".into() })?;
-let bus   = EventBus::new(store.clone());
-let mut rx = bus.subscribe().await;
-
-let event = Event::new(
-    "conversation-1".into(),
-    EventKind::UserMessageReceived {
-        content:   Message::User("Hello".into()),
-        connector: "cli".into(),
-    },
-    "cli".into(),
-);
-bus.publish(event).await?;
-
-let received   = rx.recv().await.unwrap();
-let verified   = store.verify_chain("conversation-1").await?;
-```
-
-Feature flags:
-
-| Feature | Description |
-| --- | --- |
-| `python`     | PyO3 bindings for the `_zymi_core` extension module |
-| `cli`        | The `zymi` CLI binary (implies `connectors`) |
-| `runtime`    | Async runtime and HTTP dependencies |
-| `webhook`    | HTTP approval handler (axum) |
-| `services`   | Event-bus services (LangFuse) |
-| `connectors` | Declarative `connectors:` / `outputs:` (`http_inbound` / `http_poll` / `http_post`, [ADR-0021](adr/0021-generic-http-connectors-and-plugin-protocol.md)) |
-
----
-
-## CLI reference
+## CLI cheatsheet
 
 ```bash
-zymi init                              # minimal scaffold
-zymi init --example telegram           # declarative chat bot
-zymi init --example research           # parallel-search + writer pipeline
-zymi init --example mcp                # agent wired to an MCP server
+zymi init [--example telegram]              # scaffold a project
+zymi run <pipeline> -i key=value …          # one-shot run
+zymi serve <pipeline>                       # long-running: react to PipelineRequested
 
-zymi run <pipeline> -i key=value ...   # one-shot run
-zymi serve <pipeline>                  # long-running: react to PipelineRequested
+zymi runs                                   # list pipeline runs
+zymi events [--stream ID] [--kind TAG]      # query event log
+zymi verify [--stream ID]                   # hash-chain integrity check
+zymi observe [--run ID]                     # interactive TUI
+zymi resume <run-id> --from-step <id>       # fork-resume
 
-zymi pipelines                         # list pipelines in the project
-zymi runs [--pipeline NAME] [--limit N]
-zymi events [--stream ID] [--kind TAG] [--raw]
-zymi verify [--stream ID]              # hash-chain integrity check
-zymi observe [--run ID]                # 3-panel TUI
-zymi resume <run-id> --from-step <id> [--dry-run]
-
-zymi mcp probe <name> -- <cmd> [args...]
-zymi schema project|agent|pipeline|tool
-zymi schema --all
+zymi mcp probe <name> -- <cmd> [args …]     # smoke an MCP server
+zymi schema {project|agent|pipeline|tool|--all}
 ```
 
----
-
-## How it works
-
-1. **Every state change becomes an event.** The SQLite event store with per-stream hash chain is the source of truth.
-2. **Agents emit intentions, not side effects.** Intentions are evaluated against policy + contracts + approvals before execution.
-3. **Pipelines are DAGs.** Independent steps run in parallel; dependencies stay explicit.
-4. **Context is event-sourced.** The working context is reassembled from the log each iteration — older observations masked, hybrid compaction when the budget gets tight.
-5. **Runs stay replayable.** Inspect with `zymi events`, verify with `zymi verify`, fork-resume from any step.
-
-More detail lives in [`adr/`](adr/) — each architectural decision is a short markdown file.
+Full reference → [docs/cli.md](docs/cli.md).
 
 ---
 
-## Contributing
+## Documentation
 
-Bug reports, examples, and PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the dev-loop, test matrix, and ADR workflow.
+- [Getting started](docs/getting-started.md) — install → init → first run
+- [Project YAML](docs/project-yaml.md) — `project.yml` schema
+- [Agents](docs/agents.md) · [Pipelines](docs/pipelines.md) · [Tools](docs/tools.md)
+- [Connectors](docs/connectors.md) · [Approvals](docs/approvals.md) · [Store backends](docs/store-backends.md)
+- [Events and replay](docs/events-and-replay.md) · [CLI reference](docs/cli.md) · [Python API](docs/python-api.md)
+- [llms.txt](llms.txt) — flat index of this documentation tree for LLM scrapers and RAG tools
+- `AGENTS.md` — agent-onboarding doc generated by `zymi init` into each new project (vocabulary, file map, task→file routing)
+- [`adr/`](adr/) — architectural decision records, one short markdown file per decision
 
-## License
+---
+
+## Contributing & License
+
+zymi-core is built in Rust and shipped via PyPI. Bug reports, examples, PRs welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for the dev loop, test matrix, ADR workflow, and how to build from source.
 
 MIT — see [LICENSE](LICENSE).
 
