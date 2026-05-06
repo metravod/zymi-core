@@ -12,7 +12,7 @@ zymi-core is shipped as a single Python package with an embedded Rust runtime. Y
 pip install zymi-core
 ```
 
-This installs the `zymi` CLI on your `$PATH` plus the `zymi_core` Python module (used by `tools/*.py` files and embedding zymi in your own Python code).
+This installs the `zymi` CLI on your `$PATH` plus the `zymi` Python module (used by `tools/*.py` files and embedding zymi in your own Python code).
 
 Verify the install:
 

@@ -1,14 +1,20 @@
 //! `type: cron` — timer-driven synthetic event source (ADR-0021 slice 4).
 //!
-//! Publishes a fixed `content` as [`EventKind::UserMessageReceived`] on a
-//! schedule. Two scheduling forms are supported:
+//! Publishes a tick on a schedule defined by a standard cron expression.
+//! Two input shapes:
 //!
-//! * `every_secs: N` — fires every N seconds (first tick after one interval).
-//! * `at: "HH:MM"` — fires once per day at the given local time.
+//! * **New (multi-input):** `cron:` + `inputs:` map → every tick fires
+//!   `PipelineRequested { inputs }` with all keys set, suitable for
+//!   parameterised pipelines that also need to be runnable manually with
+//!   `zymi run <name> -i k=v -i k=v`.
+//! * **Legacy (single-content):** `cron:` + `content:` (+ optional
+//!   `pipeline_input:`) → tick fires `PipelineRequested` with one input
+//!   keyed by `pipeline_input` (default `"message"`).
 //!
-//! When `pipeline:` is set, every tick additionally publishes a
-//! [`EventKind::PipelineRequested`] so `zymi serve <pipeline>` picks it up
-//! without extra glue, mirroring `http_inbound` / `http_poll`.
+//! Both shapes additionally publish `UserMessageReceived` so observers
+//! and `zymi events` see the tick on the bus. Cron expressions accept 5
+//! fields (`min hour day month weekday`) or 6 fields (`sec min hour day
+//! month weekday`) for sub-minute granularity.
 //!
 //! No network involved — this is a clock, not an integration.
 
@@ -17,7 +23,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::{Local, NaiveTime};
+use chrono::Local;
+use croner::Cron;
 use serde::Deserialize;
 use serde_yml::Value as YamlValue;
 use tokio_util::sync::CancellationToken;
@@ -32,58 +39,50 @@ struct CronConfig {
     #[serde(default)]
     #[allow(dead_code)]
     name: Option<String>,
-    /// Fixed-interval schedule. Mutually exclusive with `at:`.
-    #[serde(default)]
-    every_secs: Option<u64>,
-    /// Daily-at-time schedule, `HH:MM` in local time. Mutually exclusive
-    /// with `every_secs:`.
-    #[serde(default)]
-    at: Option<String>,
+    /// Cron expression. 5 fields (`min hour day month weekday`) or 6
+    /// fields (`sec min hour day month weekday`). Examples: `*/15 * * * *`
+    /// (every 15 minutes), `0 9 * * *` (daily at 09:00), `*/30 * * * * *`
+    /// (every 30 seconds).
+    cron: String,
     /// Synthetic stream id. Defaults to the connector name.
     #[serde(default)]
     stream_id: Option<String>,
-    /// Synthetic message content. Required — this is the whole point.
-    content: String,
+    /// Static inputs to pass to the pipeline on every tick. Keys are
+    /// pipeline input names. Mutually exclusive with `content:`.
+    #[serde(default)]
+    inputs: HashMap<String, String>,
+    /// Legacy: synthetic message content. Pre-`inputs:` form. Mutually
+    /// exclusive with `inputs:`.
+    #[serde(default)]
+    content: Option<String>,
+    /// Legacy: pipeline input key under which `content:` is placed.
+    /// Defaults to `"message"`. Ignored when `inputs:` is set.
+    #[serde(default)]
+    pipeline_input: Option<String>,
     /// Optional: also publish `PipelineRequested` per tick.
     #[serde(default)]
     pipeline: Option<String>,
-    #[serde(default = "default_pipeline_input")]
-    pipeline_input: String,
 }
 
-fn default_pipeline_input() -> String {
-    "message".into()
+fn compile_schedule(expr: &str) -> Result<Cron, ConnectorError> {
+    Cron::new(expr)
+        .with_seconds_optional()
+        .parse()
+        .map_err(|e| ConnectorError::InvalidConfig(format!("cron: invalid expression '{expr}': {e}")))
 }
 
-#[derive(Debug, Clone)]
-enum Schedule {
-    Every(Duration),
-    DailyAt(NaiveTime),
-}
-
-impl Schedule {
-    fn from_config(cfg: &CronConfig) -> Result<Self, ConnectorError> {
-        match (cfg.every_secs, cfg.at.as_deref()) {
-            (Some(_), Some(_)) => Err(ConnectorError::InvalidConfig(
-                "set either 'every_secs' or 'at', not both".into(),
-            )),
-            (None, None) => Err(ConnectorError::InvalidConfig(
-                "cron requires 'every_secs' or 'at'".into(),
-            )),
-            (Some(0), _) => Err(ConnectorError::InvalidConfig(
-                "every_secs must be > 0".into(),
-            )),
-            (Some(n), None) => Ok(Schedule::Every(Duration::from_secs(n))),
-            (None, Some(s)) => {
-                let t = NaiveTime::parse_from_str(s, "%H:%M").map_err(|e| {
-                    ConnectorError::InvalidConfig(format!(
-                        "at: invalid HH:MM '{s}': {e}"
-                    ))
-                })?;
-                Ok(Schedule::DailyAt(t))
-            }
-        }
+fn validate(cfg: &CronConfig) -> Result<Cron, ConnectorError> {
+    if !cfg.inputs.is_empty() && cfg.content.is_some() {
+        return Err(ConnectorError::InvalidConfig(
+            "cron: set either 'inputs:' or legacy 'content:', not both".into(),
+        ));
     }
+    if cfg.inputs.is_empty() && cfg.content.is_none() && cfg.pipeline.is_some() {
+        return Err(ConnectorError::InvalidConfig(
+            "cron: when 'pipeline:' is set, provide 'inputs:' (preferred) or 'content:'".into(),
+        ));
+    }
+    compile_schedule(&cfg.cron)
 }
 
 pub struct CronBuilder;
@@ -99,7 +98,7 @@ impl PluginBuilder<dyn InboundConnector> for CronBuilder {
         entry: YamlValue,
     ) -> Result<Box<dyn InboundConnector>, Box<dyn std::error::Error + Send + Sync>> {
         let cfg: CronConfig = serde_yml::from_value(entry)?;
-        let schedule = Schedule::from_config(&cfg)
+        let schedule = validate(&cfg)
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
         let _ = name;
         Ok(Box::new(CronConnector { cfg, schedule }))
@@ -108,7 +107,7 @@ impl PluginBuilder<dyn InboundConnector> for CronBuilder {
 
 struct CronConnector {
     cfg: CronConfig,
-    schedule: Schedule,
+    schedule: Cron,
 }
 
 #[async_trait]
@@ -145,59 +144,53 @@ impl InboundConnector for CronConnector {
 async fn run_cron(
     name: String,
     cfg: CronConfig,
-    schedule: Schedule,
+    schedule: Cron,
     ctx: PluginContext,
     shutdown: CancellationToken,
 ) {
-    log::info!("cron '{name}' started ({})", describe_schedule(&schedule));
-    match schedule {
-        Schedule::Every(d) => {
-            let mut interval = tokio::time::interval(d);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            // First tick fires immediately — skip it so the first real
-            // emit waits one interval. Matches `http_poll`.
-            interval.tick().await;
-            loop {
-                tokio::select! {
-                    _ = shutdown.cancelled() => break,
-                    _ = interval.tick() => {
-                        emit(&name, &cfg, &ctx).await;
-                    }
-                }
+    log::info!("cron '{name}' started ({})", cfg.cron);
+    loop {
+        let wait = match next_wait(&schedule) {
+            Some(d) => d,
+            None => {
+                log::warn!("cron '{name}' has no future occurrences — stopping");
+                break;
+            }
+        };
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            _ = tokio::time::sleep(wait) => {
+                emit(&name, &cfg, &ctx).await;
             }
         }
-        Schedule::DailyAt(t) => loop {
-            let wait = duration_until_next(t);
-            tokio::select! {
-                _ = shutdown.cancelled() => break,
-                _ = tokio::time::sleep(wait) => {
-                    emit(&name, &cfg, &ctx).await;
-                }
-            }
-        },
     }
     log::info!("cron '{name}' stopped");
 }
 
-fn describe_schedule(s: &Schedule) -> String {
-    match s {
-        Schedule::Every(d) => format!("every {}s", d.as_secs()),
-        Schedule::DailyAt(t) => format!("daily at {}", t.format("%H:%M")),
-    }
+fn next_wait(schedule: &Cron) -> Option<Duration> {
+    let now = Local::now();
+    let next = schedule.find_next_occurrence(&now, false).ok()?;
+    let delta = next - now;
+    delta.to_std().ok().or(Some(Duration::from_millis(1)))
 }
 
-fn duration_until_next(target: NaiveTime) -> Duration {
-    let now = Local::now();
-    let today = now.date_naive().and_time(target);
-    let next = if today > now.naive_local() {
-        today
-    } else {
-        today + chrono::Duration::days(1)
-    };
-    let delta = next.and_local_timezone(Local).single().map(|dt| dt - now);
-    delta
-        .and_then(|d| d.to_std().ok())
-        .unwrap_or(Duration::from_secs(60))
+fn pipeline_inputs(cfg: &CronConfig) -> HashMap<String, String> {
+    if !cfg.inputs.is_empty() {
+        return cfg.inputs.clone();
+    }
+    if let Some(content) = cfg.content.as_deref() {
+        let key = cfg.pipeline_input.as_deref().unwrap_or("message");
+        let mut m = HashMap::new();
+        m.insert(key.to_string(), content.to_string());
+        return m;
+    }
+    HashMap::new()
+}
+
+fn tick_message(cfg: &CronConfig, name: &str) -> String {
+    cfg.content
+        .clone()
+        .unwrap_or_else(|| format!("cron tick from {name}"))
 }
 
 async fn emit(name: &str, cfg: &CronConfig, ctx: &PluginContext) {
@@ -206,7 +199,7 @@ async fn emit(name: &str, cfg: &CronConfig, ctx: &PluginContext) {
     let event = Event::new(
         stream_id.clone(),
         EventKind::UserMessageReceived {
-            content: Message::User(cfg.content.clone()),
+            content: Message::User(tick_message(cfg, name)),
             connector: name.to_string(),
         },
         name.to_string(),
@@ -219,8 +212,7 @@ async fn emit(name: &str, cfg: &CronConfig, ctx: &PluginContext) {
     }
 
     if let Some(pipeline) = cfg.pipeline.as_deref() {
-        let mut inputs = HashMap::new();
-        inputs.insert(cfg.pipeline_input.clone(), cfg.content.clone());
+        let inputs = pipeline_inputs(cfg);
         let req = Event::new(
             stream_id,
             EventKind::PipelineRequested {
@@ -246,7 +238,6 @@ mod tests {
     use super::*;
     use crate::events::bus::EventBus;
     use crate::events::store::SqliteEventStore;
-    use chrono::Timelike;
 
     fn yaml(src: &str) -> YamlValue {
         serde_yml::from_str(src).unwrap()
@@ -260,62 +251,143 @@ mod tests {
     }
 
     #[test]
-    fn build_requires_schedule_field() {
+    fn build_requires_cron_field() {
         let err = expect_build_err(yaml("type: cron\ncontent: hi"));
-        assert!(err.contains("every_secs"), "got {err}");
+        assert!(err.contains("cron") || err.contains("missing"), "got {err}");
     }
 
     #[test]
-    fn build_rejects_both_schedule_fields() {
+    fn build_rejects_invalid_expression() {
+        let err = expect_build_err(yaml("type: cron\ncron: \"not a cron\"\ncontent: hi"));
+        assert!(err.contains("invalid expression"), "got {err}");
+    }
+
+    #[test]
+    fn build_rejects_inputs_and_content_both() {
         let err = expect_build_err(yaml(
-            "type: cron\nevery_secs: 60\nat: \"09:00\"\ncontent: hi",
+            "type: cron\ncron: \"* * * * *\"\ninputs:\n  a: \"1\"\ncontent: hi",
         ));
-        assert!(err.contains("either"), "got {err}");
+        assert!(err.contains("either 'inputs:' or"), "got {err}");
     }
 
     #[test]
-    fn build_rejects_zero_every_secs() {
-        let err = expect_build_err(yaml("type: cron\nevery_secs: 0\ncontent: hi"));
-        assert!(err.contains("> 0"), "got {err}");
+    fn build_rejects_pipeline_without_inputs_or_content() {
+        let err = expect_build_err(yaml(
+            "type: cron\ncron: \"* * * * *\"\npipeline: digest",
+        ));
+        assert!(err.contains("'inputs:'"), "got {err}");
     }
 
     #[test]
-    fn build_rejects_invalid_at() {
-        let err = expect_build_err(yaml("type: cron\nat: \"not a time\"\ncontent: hi"));
-        assert!(err.contains("HH:MM"), "got {err}");
+    fn build_accepts_inputs_form() {
+        let res = CronBuilder.build(
+            "c".into(),
+            yaml(
+                r#"
+type: cron
+cron: "*/15 * * * *"
+pipeline: sync
+inputs:
+  repo_url: "git@github.com:foo/bar"
+  branch: "main"
+"#,
+            ),
+        );
+        assert!(res.is_ok(), "{:?}", res.err());
     }
 
     #[test]
-    fn duration_until_next_is_in_future() {
-        let now = Local::now();
-        let later = NaiveTime::from_hms_opt(
-            (now.hour() + 1) % 24,
-            now.minute(),
-            0,
-        )
-        .unwrap();
-        let d = duration_until_next(later);
-        assert!(d.as_secs() > 0);
-        assert!(d.as_secs() <= 24 * 3600);
+    fn build_accepts_legacy_content_form() {
+        let res = CronBuilder.build(
+            "c".into(),
+            yaml(
+                r#"
+type: cron
+cron: "0 9 * * *"
+content: "Daily digest"
+pipeline: digest
+"#,
+            ),
+        );
+        assert!(res.is_ok(), "{:?}", res.err());
+    }
+
+    #[test]
+    fn build_accepts_six_field_expression() {
+        let res = CronBuilder.build(
+            "c".into(),
+            yaml("type: cron\ncron: \"*/30 * * * * *\"\ncontent: hi"),
+        );
+        assert!(res.is_ok(), "{:?}", res.err());
+    }
+
+    #[test]
+    fn next_wait_returns_future_for_per_minute_schedule() {
+        let schedule = compile_schedule("* * * * *").unwrap();
+        let d = next_wait(&schedule).expect("future occurrence");
+        assert!(d.as_secs() <= 60);
+    }
+
+    #[test]
+    fn pipeline_inputs_prefers_inputs_map() {
+        let cfg = CronConfig {
+            name: None,
+            cron: "* * * * *".into(),
+            stream_id: None,
+            inputs: HashMap::from([("a".into(), "1".into()), ("b".into(), "2".into())]),
+            content: None,
+            pipeline_input: None,
+            pipeline: None,
+        };
+        let out = pipeline_inputs(&cfg);
+        assert_eq!(out.get("a").map(String::as_str), Some("1"));
+        assert_eq!(out.get("b").map(String::as_str), Some("2"));
+    }
+
+    #[test]
+    fn pipeline_inputs_legacy_uses_pipeline_input_key() {
+        let cfg = CronConfig {
+            name: None,
+            cron: "* * * * *".into(),
+            stream_id: None,
+            inputs: HashMap::new(),
+            content: Some("hello".into()),
+            pipeline_input: Some("query".into()),
+            pipeline: None,
+        };
+        let out = pipeline_inputs(&cfg);
+        assert_eq!(out.get("query").map(String::as_str), Some("hello"));
+    }
+
+    #[test]
+    fn pipeline_inputs_legacy_default_key_is_message() {
+        let cfg = CronConfig {
+            name: None,
+            cron: "* * * * *".into(),
+            stream_id: None,
+            inputs: HashMap::new(),
+            content: Some("hello".into()),
+            pipeline_input: None,
+            pipeline: None,
+        };
+        let out = pipeline_inputs(&cfg);
+        assert_eq!(out.get("message").map(String::as_str), Some("hello"));
     }
 
     #[tokio::test]
-    async fn every_secs_emits_user_message_received() {
+    async fn per_second_schedule_emits_user_message_received() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(SqliteEventStore::new(&dir.path().join("events.db")).unwrap());
         let bus = Arc::new(EventBus::new(store.clone()));
         let mut rx = bus.subscribe().await;
 
-        // Use a sub-second interval — the test budget is real time. The
-        // connector's "skip first immediate tick" rule means the first
-        // emit lands one interval after start.
         let connector = CronBuilder
             .build(
                 "tick".into(),
                 yaml(
                     r#"
 type: cron
-every_secs: 1
+cron: "* * * * * *"
 content: "hello world"
 "#,
                 ),
@@ -353,7 +425,7 @@ content: "hello world"
     }
 
     #[tokio::test]
-    async fn pipeline_field_publishes_pipeline_requested() {
+    async fn inputs_map_drives_pipeline_requested() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(SqliteEventStore::new(&dir.path().join("events.db")).unwrap());
         let bus = Arc::new(EventBus::new(store.clone()));
@@ -365,7 +437,58 @@ content: "hello world"
                 yaml(
                     r#"
 type: cron
-every_secs: 1
+cron: "* * * * * *"
+pipeline: sync
+inputs:
+  repo_url: "git@github.com:foo/bar"
+  branch: "main"
+"#,
+                ),
+            )
+            .unwrap();
+        let ctx = PluginContext {
+            bus: Arc::clone(&bus),
+            project_root: dir.path().to_path_buf(),
+            cursor_store: std::sync::Arc::new(
+                crate::connectors::cursor_store::SqliteCursorStore::in_memory(),
+            ),
+        };
+        let handle = connector.start("tick".into(), ctx).await.unwrap();
+
+        let mut saw_pipeline = false;
+        for _ in 0..2 {
+            let ev = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+                .await
+                .expect("event")
+                .expect("some");
+            if let EventKind::PipelineRequested { pipeline, inputs } = &ev.kind {
+                assert_eq!(pipeline, "sync");
+                assert_eq!(inputs.get("repo_url").map(String::as_str), Some("git@github.com:foo/bar"));
+                assert_eq!(inputs.get("branch").map(String::as_str), Some("main"));
+                saw_pipeline = true;
+                break;
+            }
+        }
+        assert!(saw_pipeline);
+
+        handle.shutdown.cancel();
+        let _ = handle.join.await;
+    }
+
+    #[tokio::test]
+    async fn legacy_content_drives_pipeline_requested() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteEventStore::new(&dir.path().join("events.db")).unwrap());
+        let bus = Arc::new(EventBus::new(store.clone()));
+        let mut rx = bus.subscribe().await;
+
+        let connector = CronBuilder
+            .build(
+                "tick".into(),
+                yaml(
+                    r#"
+type: cron
+cron: "* * * * * *"
 content: "do the thing"
 pipeline: digest
 "#,
@@ -381,24 +504,20 @@ pipeline: digest
         };
         let handle = connector.start("tick".into(), ctx).await.unwrap();
 
-        let mut saw_user = false;
         let mut saw_pipeline = false;
         for _ in 0..2 {
             let ev = tokio::time::timeout(Duration::from_secs(3), rx.recv())
                 .await
                 .expect("event")
                 .expect("some");
-            match &ev.kind {
-                EventKind::UserMessageReceived { .. } => saw_user = true,
-                EventKind::PipelineRequested { pipeline, inputs } => {
-                    assert_eq!(pipeline, "digest");
-                    assert_eq!(inputs.get("message").map(String::as_str), Some("do the thing"));
-                    saw_pipeline = true;
-                }
-                other => panic!("unexpected kind: {:?}", other.tag()),
+            if let EventKind::PipelineRequested { pipeline, inputs } = &ev.kind {
+                assert_eq!(pipeline, "digest");
+                assert_eq!(inputs.get("message").map(String::as_str), Some("do the thing"));
+                saw_pipeline = true;
+                break;
             }
         }
-        assert!(saw_user && saw_pipeline);
+        assert!(saw_pipeline);
 
         handle.shutdown.cancel();
         let _ = handle.join.await;

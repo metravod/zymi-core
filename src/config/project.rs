@@ -52,22 +52,27 @@ pub struct ProjectConfig {
     /// Inbound connectors — event sources (http_inbound, http_poll, ...).
     /// Dispatched at runtime by the `InboundConnector` plugin registry
     /// (ADR-0020 / ADR-0021). Stored as raw YAML so this crate can parse
-    /// projects without pulling in connector dependencies.
+    /// projects without pulling in connector dependencies; the JSON
+    /// schema therefore exposes them as a permissive array of objects
+    /// (each entry's `type:` selects a plugin whose own shape is
+    /// validated at runtime).
     #[serde(default)]
-    #[schemars(skip)]
+    #[schemars(with = "Vec<serde_json::Value>")]
     pub connectors: Vec<serde_yml::Value>,
     /// Outbound sinks — event consumers (http_post, ...). Dispatched via
     /// the `OutboundSink` plugin registry. Stored as raw YAML for the
-    /// same reason as `connectors`.
+    /// same reason as `connectors`; permissive JSON schema for the same
+    /// reason.
     #[serde(default)]
-    #[schemars(skip)]
+    #[schemars(with = "Vec<serde_json::Value>")]
     pub outputs: Vec<serde_yml::Value>,
     /// Approval channels (ADR-0022). Each entry is dispatched at runtime
     /// by the `ApprovalChannel` plugin registry: terminal prompt, HTTP
     /// endpoint, Telegram bot, etc. Stored as raw YAML so this crate
-    /// can parse projects without pulling in webhook/connectors deps.
+    /// can parse projects without pulling in webhook/connectors deps;
+    /// permissive JSON schema for the same reason.
     #[serde(default)]
-    #[schemars(skip)]
+    #[schemars(with = "Vec<serde_json::Value>")]
     pub approvals: Vec<serde_yml::Value>,
     /// Project-wide default approval channel name (ADR-0022 §"Resolution
     /// order"). Used when a pipeline does not declare its own

@@ -380,13 +380,14 @@ max_iterations: 10
         r#"name: main
 description: "Main pipeline"
 
+inputs:
+  - name: task
+    required: true
+
 steps:
   - id: process
     agent: default
     task: "${inputs.task}"
-
-input:
-  type: text
 
 output:
   step: process
@@ -631,6 +632,10 @@ max_iterations: 1
         r#"name: chat
 description: "Two-step chat loop: assistant drafts, reviewer polishes."
 
+inputs:
+  - name: message
+    required: true
+
 steps:
   - id: respond
     agent: assistant
@@ -648,9 +653,6 @@ steps:
       Decide whether to keep the draft verbatim or write a better version.
       Output ONLY the final answer the user will see.
     depends_on: [respond]
-
-input:
-  type: text
 
 output:
   step: polish

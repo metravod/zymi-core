@@ -1,11 +1,11 @@
-"""zymi-core — Event-sourced agent engine (Python bindings).
+"""zymi — Event-sourced agent engine (Python bindings).
 
 Public API re-exported from the native ``_zymi_core`` extension module,
 plus the ``@tool`` decorator used for auto-discovery of Python tools
 under ``tools/*.py`` (ADR-0014 slice 3).
 """
 
-from zymi_core._zymi_core import (
+from zymi._zymi_core import (
     Event,
     EventBus,
     EventStore,

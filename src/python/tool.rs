@@ -21,7 +21,7 @@ struct RegisteredTool {
 ///
 /// Usage from Python:
 /// ```python
-/// from _zymi_core import ToolRegistry
+/// from zymi import ToolRegistry
 ///
 /// registry = ToolRegistry()
 ///
