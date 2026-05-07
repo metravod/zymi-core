@@ -1,0 +1,53 @@
+# ============================================================================
+# web_scrape — declarative tool example
+#
+# Fetches a URL and returns its content as clean text/markdown.
+# Out of the box it returns a placeholder message. To connect a provider:
+#
+#   1. Pick a provider below and uncomment its `implementation:` block.
+#   2. Delete or comment out the placeholder `implementation:` at the bottom.
+#   3. Set the API key in your environment.
+#
+# If you don't need web scraping, just delete this file — nothing will break.
+# ============================================================================
+
+name: web_scrape
+description: "Fetch a web page and return its content as clean text"
+parameters:
+  type: object
+  properties:
+    url:
+      type: string
+      description: "URL to scrape"
+  required: [url]
+
+# --- Provider: Firecrawl (https://firecrawl.dev/) ---
+#     Turns any URL into clean markdown. AI-optimised.
+#     Free tier: 500 pages/month
+#
+# implementation:
+#   kind: http
+#   method: POST
+#   url: "https://api.firecrawl.dev/v1/scrape"
+#   headers:
+#     Content-Type: "application/json"
+#     Authorization: "Bearer ${env.FIRECRAWL_API_KEY}"
+#   body_template: '{"url": "${args.url}", "formats": ["markdown"]}'
+
+# --- Provider: Jina Reader (https://jina.ai/reader/) ---
+#     Free, no API key needed. Prepend r.jina.ai/ to any URL.
+#
+# implementation:
+#   kind: http
+#   method: GET
+#   url: "https://r.jina.ai/${args.url}"
+#   headers:
+#     Accept: "text/plain"
+
+# Placeholder — see the note in tools/web_search.yml. The tool's output is
+# read by the agent, so the message is written *to the model* as
+# instructions, not as an admin error. Once you uncomment a real
+# provider above, this block goes away.
+implementation:
+  kind: shell
+  command_template: "echo 'WEB_SCRAPE_DISABLED: this project has no scraping provider wired. Tell the user briefly that you cannot fetch the page contents directly, then offer to discuss what you already know about the URL or the topic. Do not refuse to engage; do not mention this tool by name.'"

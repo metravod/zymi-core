@@ -254,106 +254,46 @@ pub async fn handle(rt: &Runtime, cmd: ResumePipeline) -> Result<ResumeOutcome, 
 
     append_event(
         store.as_ref(),
-        Event::new(
-            new_stream_id.clone(),
-            EventKind::PipelineRequested {
-                pipeline: pipeline_name.clone(),
-                inputs: inputs.clone(),
-            },
-            "engine".into(),
-        )
-        .with_correlation(new_correlation_id),
+        &new_stream_id,
+        new_correlation_id,
+        EventKind::PipelineRequested {
+            pipeline: pipeline_name.clone(),
+            inputs: inputs.clone(),
+        },
     )
     .await?;
 
     append_event(
         store.as_ref(),
-        Event::new(
-            new_stream_id.clone(),
-            EventKind::ResumeForked {
-                parent_stream_id: cmd.parent_stream_id.clone(),
-                parent_correlation_id,
-                fork_at_step: cmd.fork_at_step.clone(),
-            },
-            "engine".into(),
-        )
-        .with_correlation(new_correlation_id),
+        &new_stream_id,
+        new_correlation_id,
+        EventKind::ResumeForked {
+            parent_stream_id: cmd.parent_stream_id.clone(),
+            parent_correlation_id,
+            fork_at_step: cmd.fork_at_step.clone(),
+        },
     )
     .await?;
 
     append_event(
         store.as_ref(),
-        Event::new(
-            new_stream_id.clone(),
-            EventKind::WorkflowStarted {
-                user_message: format!("pipeline: {pipeline_name} (resumed)"),
-                node_count: exec_plan.step_count(),
-            },
-            "engine".into(),
-        )
-        .with_correlation(new_correlation_id),
+        &new_stream_id,
+        new_correlation_id,
+        EventKind::WorkflowStarted {
+            user_message: format!("pipeline: {pipeline_name} (resumed)"),
+            node_count: exec_plan.step_count(),
+        },
     )
     .await?;
 
     for step_id in &frozen_in_dag_order {
-        let parent_started = parent_top.iter().find(|e| {
-            matches!(&e.kind, EventKind::WorkflowNodeStarted { node_id, .. } if node_id == step_id)
-        });
-        let description = parent_started
-            .and_then(|e| match &e.kind {
-                EventKind::WorkflowNodeStarted { description, .. } => Some(description.clone()),
-                _ => None,
-            })
-            .unwrap_or_else(|| format!("frozen from parent stream {}", cmd.parent_stream_id));
-
-        append_event(
+        replay_frozen_step(
             store.as_ref(),
-            Event::new(
-                new_stream_id.clone(),
-                EventKind::WorkflowNodeStarted {
-                    node_id: step_id.clone(),
-                    description,
-                },
-                "engine".into(),
-            )
-            .with_correlation(new_correlation_id),
-        )
-        .await?;
-
-        let sub_stream_src = format!("{}:step:{}", cmd.parent_stream_id, step_id);
-        let sub_stream_dst = format!("{}:step:{}", new_stream_id, step_id);
-        let events = store
-            .read_stream(&sub_stream_src, 1)
-            .await
-            .map_err(|e| format!("failed to re-read sub-stream '{sub_stream_src}': {e}"))?;
-        for src in events {
-            let mut copy = Event {
-                id: Uuid::new_v4(),
-                stream_id: sub_stream_dst.clone(),
-                sequence: 0,
-                timestamp: src.timestamp,
-                kind: src.kind,
-                correlation_id: Some(new_correlation_id),
-                causation_id: None,
-                source: src.source,
-            };
-            store
-                .append(&mut copy)
-                .await
-                .map_err(|e| format!("failed to copy frozen event: {e}"))?;
-        }
-
-        append_event(
-            store.as_ref(),
-            Event::new(
-                new_stream_id.clone(),
-                EventKind::WorkflowNodeCompleted {
-                    node_id: step_id.clone(),
-                    success: true,
-                },
-                "engine".into(),
-            )
-            .with_correlation(new_correlation_id),
+            &cmd.parent_stream_id,
+            &new_stream_id,
+            new_correlation_id,
+            step_id,
+            &parent_top,
         )
         .await?;
     }
@@ -436,14 +376,93 @@ fn extract_step_output(events: &[Event]) -> Option<String> {
     None
 }
 
-async fn append_event(store: &dyn EventStore, mut event: Event) -> Result<(), String> {
+/// Append a freshly-built event directly to the store, no bus publish.
+///
+/// Mirrors the shape of `run_pipeline::emit_event` (same arg list) so the two
+/// handlers' bootstrap-event sites read in parallel. The bus is intentionally
+/// skipped: bootstrap events are reconstructed from the store by `observe`
+/// and `runs` queries, and bypassing the bus avoids a feedback loop where
+/// the resume orchestrator would re-trigger its own pipeline router.
+async fn append_event(
+    store: &dyn EventStore,
+    stream_id: &str,
+    correlation_id: Uuid,
+    kind: EventKind,
+) -> Result<(), String> {
+    let mut event =
+        Event::new(stream_id.to_string(), kind, "engine".into()).with_correlation(correlation_id);
     store
         .append(&mut event)
         .await
         .map_err(|e| format!("failed to append event: {e}"))?;
-    // Also publish on the bus? The bootstrap events feed observe/runs queries,
-    // which read directly from the store, so direct append is sufficient.
     Ok(())
+}
+
+/// Copy one frozen step's events from the parent stream to the new stream
+/// (ADR-0018 §"frozen replay"): bracket with WorkflowNodeStarted/Completed,
+/// then physically copy every event in the step's sub-stream.
+async fn replay_frozen_step(
+    store: &dyn EventStore,
+    parent_stream_id: &str,
+    new_stream_id: &str,
+    new_correlation_id: Uuid,
+    step_id: &str,
+    parent_top: &[Event],
+) -> Result<(), String> {
+    let description = parent_top
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::WorkflowNodeStarted { node_id, description } if node_id == step_id => {
+                Some(description.clone())
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| format!("frozen from parent stream {parent_stream_id}"));
+
+    append_event(
+        store,
+        new_stream_id,
+        new_correlation_id,
+        EventKind::WorkflowNodeStarted {
+            node_id: step_id.to_string(),
+            description,
+        },
+    )
+    .await?;
+
+    let sub_stream_src = format!("{parent_stream_id}:step:{step_id}");
+    let sub_stream_dst = format!("{new_stream_id}:step:{step_id}");
+    let events = store
+        .read_stream(&sub_stream_src, 1)
+        .await
+        .map_err(|e| format!("failed to re-read sub-stream '{sub_stream_src}': {e}"))?;
+    for src in events {
+        let mut copy = Event {
+            id: Uuid::new_v4(),
+            stream_id: sub_stream_dst.clone(),
+            sequence: 0,
+            timestamp: src.timestamp,
+            kind: src.kind,
+            correlation_id: Some(new_correlation_id),
+            causation_id: None,
+            source: src.source,
+        };
+        store
+            .append(&mut copy)
+            .await
+            .map_err(|e| format!("failed to copy frozen event: {e}"))?;
+    }
+
+    append_event(
+        store,
+        new_stream_id,
+        new_correlation_id,
+        EventKind::WorkflowNodeCompleted {
+            node_id: step_id.to_string(),
+            success: true,
+        },
+    )
+    .await
 }
 
 #[cfg(test)]

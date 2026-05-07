@@ -71,16 +71,42 @@ Cursors live in `.zymi/connectors.db` (sqlite default) or in the `connector_curs
 
 ### `cron` — schedule {#cron}
 
+Standard cron expressions, 5 or 6 fields. `min hour day month weekday`,
+or with a leading `sec` for sub-minute granularity. Local timezone.
+
+**Multi-input form** (preferred for parameterised pipelines):
+
+```yaml
+connectors:
+  - type: cron
+    name: docs_sync
+    cron: "*/15 * * * *"               # every 15 minutes
+    pipeline: sync_docs                # PipelineRequested target
+    inputs:                            # static inputs passed every tick
+      repo_url: "${env.DOCS_REPO_URL}"
+      branch:   "${env.DOCS_REPO_BRANCH}"
+      local_dir: "${env.DOCS_LOCAL_DIR}"
+```
+
+The pipeline still runs manually with the same inputs:
+
+```bash
+zymi run sync_docs -i repo_url=… -i branch=main -i local_dir=./data/docs
+```
+
+**Single-content form** (legacy, for message-shaped triggers):
+
 ```yaml
 connectors:
   - type: cron
     name: morning_digest
-    at: "09:00"                        # daily at HH:MM (local time). Or:
-    # every_secs: 3600                 # ...fixed interval, mutually exclusive.
-    content: "Generate today's digest" # required. The synthetic message text.
-    pipeline: digest                   # optional. Pairs with PipelineRequested.
-    pipeline_input: message
+    cron: "0 9 * * *"                  # daily at 09:00
+    content: "Generate today's digest" # synthetic message text
+    pipeline: digest                   # optional
+    pipeline_input: message            # default "message"
 ```
+
+Pick one form per connector. `inputs:` and `content:` are mutually exclusive.
 
 Restart-naive: no cursor. A missed tick during downtime is not replayed.
 

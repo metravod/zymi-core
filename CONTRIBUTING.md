@@ -33,7 +33,7 @@ The `cli` feature pulls in `runtime`, `connectors`, and the TUI deps. For isolat
 
 ```bash
 maturin develop --features python,cli
-python -c "from zymi_core import Runtime; print(Runtime)"
+python -c "from zymi import Runtime; print(Runtime)"
 ```
 
 `maturin develop` builds the extension into your current virtualenv. For release wheels (not usually needed locally) use `maturin build --release --features python,cli`.

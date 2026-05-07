@@ -37,7 +37,7 @@ fn cli_main(args: Vec<String>) {
     crate::cli::run_from_args(args);
 }
 
-/// The native Python module. Importable as `import _zymi_core`.
+/// The native Python module. Importable as `from zymi import _zymi_core`.
 #[pymodule]
 fn _zymi_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyEvent>()?;

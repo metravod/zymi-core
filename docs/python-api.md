@@ -1,6 +1,6 @@
 # Python API
 
-`pip install zymi-core` ships the `zymi` CLI plus the `zymi_core` Python module for two use cases: writing `@tool`-decorated Python functions auto-discovered from `tools/*.py`, and embedding zymi inside your own Python application.
+`pip install zymi-core` ships the `zymi` CLI plus the `zymi` Python module for two use cases: writing `@tool`-decorated Python functions auto-discovered from `tools/*.py`, and embedding zymi inside your own Python application.
 
 ## Overview
 
@@ -9,7 +9,7 @@ The Python module is a thin wrapper over the Rust runtime, built with pyo3 + mat
 ## Top-level imports
 
 ```python
-from zymi_core import (
+from zymi import (
     Event,
     EventBus,
     EventStore,
@@ -61,7 +61,7 @@ The Rust loader walks every `tools/*.py` at runtime startup, picks up callables 
 Embed a zymi project in your Python app.
 
 ```python
-from zymi_core import Runtime
+from zymi import Runtime
 
 rt = Runtime.for_project("./my-zymi-project", approval="terminal")
 result = rt.run_pipeline("chat", inputs={"message": "hello"})
@@ -109,7 +109,7 @@ sr.success                  # bool
 For embedding scenarios where you want to inject your own events or observe live.
 
 ```python
-from zymi_core import EventStore, EventBus, Event
+from zymi import EventStore, EventBus, Event
 
 store = EventStore("./my-project/.zymi/events.db")
 bus = EventBus(store)
@@ -148,7 +148,7 @@ sub = bus.subscribe_correlation("approval-abc")
 Programmatic tool registration — useful when you want to define tools in Python WITHOUT relying on the `tools/*.py` auto-discovery (e.g. dynamically generated tools, tools loaded from a non-standard directory).
 
 ```python
-from zymi_core import ToolRegistry
+from zymi import ToolRegistry
 
 reg = ToolRegistry()
 reg.register_from_callable(my_function)        # picks up `@tool` markers if present
@@ -163,13 +163,13 @@ The pip wheel installs `zymi` as a console script defined by `[project.scripts]`
 
 ```toml
 [project.scripts]
-zymi = "zymi_core._cli:main"
+zymi = "zymi._cli:main"
 ```
 
-`zymi_core._cli.main(argv)` is a thin shim that dispatches to the embedded Rust CLI. You can call it from Python if you want the CLI's behaviour without shelling out:
+`zymi._cli.main(argv)` is a thin shim that dispatches to the embedded Rust CLI. You can call it from Python if you want the CLI's behaviour without shelling out:
 
 ```python
-from zymi_core._cli import main
+from zymi._cli import main
 main(["run", "chat", "-i", "message=hello"])
 ```
 

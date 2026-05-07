@@ -28,12 +28,12 @@ classifiers = [
 ]
 
 [project.scripts]
-zymi = "zymi_core._cli:main"
+zymi = "zymi._cli:main"
 
 [project.urls]
 Repository = "https://github.com/metravod/zymi-core"
 
 [tool.maturin]
 features = ["python", "cli"]
-module-name = "zymi_core._zymi_core"
+module-name = "zymi._zymi_core"
 python-source = "."

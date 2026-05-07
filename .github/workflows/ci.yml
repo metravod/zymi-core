@@ -41,7 +41,7 @@ jobs:
         working-directory: /tmp
         run: |
           python -c "
-          from zymi_core import Event, EventStore, EventBus, ToolRegistry
+          from zymi import Event, EventStore, EventBus, ToolRegistry
           import tempfile, os
           db = os.path.join(tempfile.mkdtemp(), 'test.db')
           store = EventStore(db)

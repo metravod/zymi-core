@@ -1,0 +1,8 @@
+name: default
+description: "Default agent for __PROJECT_NAME__"
+# model: gpt-4o
+tools:
+  - web_search
+  - read_file
+  - write_memory
+max_iterations: 10

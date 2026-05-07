@@ -172,7 +172,7 @@ zymi schema --all
 The same `pip install zymi-core` exposes a Python API: `Runtime`, `Event`, `EventBus`, `EventStore`, `Subscription`, `ToolRegistry`, plus the `@tool` decorator.
 
 ```python
-from zymi_core import Runtime
+from zymi import Runtime
 
 rt = Runtime.for_project(".", approval="terminal")
 result = rt.run_pipeline("chat", {"message": "hello"})
@@ -185,7 +185,7 @@ print(result.success, result.final_output)
 
 ```python
 import uuid
-from zymi_core import Event, EventBus, EventStore
+from zymi import Event, EventBus, EventStore
 
 store = EventStore(".zymi/events.db")
 bus = EventBus(store)

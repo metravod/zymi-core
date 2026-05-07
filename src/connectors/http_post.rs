@@ -16,6 +16,7 @@ use serde_yml::Value as YamlValue;
 use tokio_util::sync::CancellationToken;
 
 use crate::connectors::context::EventContext;
+use crate::connectors::util::truncate_body;
 use crate::connectors::{ConnectorError, OutboundSink, PluginContext, PluginHandle};
 use crate::plugin::PluginBuilder;
 
@@ -299,7 +300,7 @@ async fn dispatch(
                 log::warn!(
                     "http_post '{name}' attempt {attempt}/{} got HTTP {status}: {}",
                     cfg.retry.attempts,
-                    truncate(&body, 200)
+                    truncate_body(&body, 200)
                 );
                 // 429 is a rate-limit and *is* retryable, unlike other
                 // 4xx. 503 is server-side, already server_error, but it
@@ -376,14 +377,6 @@ fn render(env: &Environment<'static>, name: &str, ctx: &EventContext) -> Result<
     let tmpl = env.get_template(name).map_err(|e| e.to_string())?;
     tmpl.render(minijinja::context! { event => ctx })
         .map_err(|e| e.to_string())
-}
-
-fn truncate(s: &str, n: usize) -> String {
-    if s.len() <= n {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..n])
-    }
 }
 
 #[cfg(test)]

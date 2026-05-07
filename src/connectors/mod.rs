@@ -33,6 +33,7 @@ pub mod http_poll;
 pub mod http_post;
 pub mod registry;
 pub mod stdio;
+pub(crate) mod util;
 
 pub use registry::{
     build_core_connectors, build_core_outputs, spawn_connectors, spawn_outputs, ConnectorStartup,

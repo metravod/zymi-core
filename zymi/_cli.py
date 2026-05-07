@@ -4,7 +4,7 @@ import sys
 
 
 def main() -> None:
-    from zymi_core._zymi_core import cli_main
+    from zymi._zymi_core import cli_main
 
     cli_main(sys.argv)
 
