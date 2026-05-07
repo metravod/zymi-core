@@ -201,50 +201,68 @@ fn draw_graph(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_events(frame: &mut Frame, app: &mut App, area: Rect) {
     let title = format!("Events ({})", app.events.len());
 
-    let items: Vec<ListItem> = app
-        .events
-        .iter()
-        .enumerate()
-        .map(|(idx, event)| {
-            let formatted = format_event(event);
-            let pad = "  ".repeat(formatted.indent as usize);
-            let color = color_to_ratatui(formatted.color);
-            let ts = event.timestamp.with_timezone(&Local).format("%H:%M:%S");
-            let header = Line::from(vec![
-                Span::styled(
-                    format!("{pad}{} ", formatted.icon),
-                    Style::default().fg(color),
-                ),
-                Span::styled(
-                    format!("{ts} "),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(
-                    formatted.label.clone(),
-                    Style::default().add_modifier(Modifier::BOLD).fg(color),
-                ),
-            ]);
+    // Geometry: borders eat 2 cols, the highlight gutter ("» ") another 2.
+    // Detail lines are further indented by the per-event pad + 2 more cols.
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let body_base = inner_width.saturating_sub(2);
 
-            let mut lines = vec![header];
+    let mut items: Vec<ListItem> = Vec::new();
+    let has_load_more = app.event_window_top > 0;
+    if has_load_more {
+        items.push(ListItem::new(Line::from(Span::styled(
+            format!(
+                "« Load earlier ({} more) — Enter",
+                app.event_window_top
+            ),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        ))));
+    }
 
-            let body = if app.expanded_events.contains(&idx) {
-                formatted.full_detail
-            } else {
-                formatted.short_detail
-            };
-            for line in body.lines() {
-                if line.is_empty() {
-                    continue;
-                }
+    for (idx, event) in app.events.iter().enumerate().skip(app.event_window_top) {
+        let formatted = format_event(event);
+        let pad = "  ".repeat(formatted.indent as usize);
+        let color = color_to_ratatui(formatted.color);
+        let ts = event.timestamp.with_timezone(&Local).format("%H:%M:%S");
+        let header = Line::from(vec![
+            Span::styled(
+                format!("{pad}{} ", formatted.icon),
+                Style::default().fg(color),
+            ),
+            Span::styled(
+                format!("{ts} "),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                formatted.label.clone(),
+                Style::default().add_modifier(Modifier::BOLD).fg(color),
+            ),
+        ]);
+
+        let mut lines = vec![header];
+
+        let body = if app.expanded_events.contains(&idx) {
+            formatted.full_detail
+        } else {
+            formatted.short_detail
+        };
+        let pad_len = formatted.indent as usize * 2;
+        let detail_width = body_base.saturating_sub(pad_len + 2).max(10);
+        for line in body.lines() {
+            if line.is_empty() {
+                continue;
+            }
+            for wrapped in wrap_line(line, detail_width) {
                 lines.push(Line::from(Span::styled(
-                    format!("{pad}  {line}"),
+                    format!("{pad}  {wrapped}"),
                     Style::default().fg(Color::DarkGray),
                 )));
             }
+        }
 
-            ListItem::new(lines)
-        })
-        .collect();
+        items.push(ListItem::new(lines));
+    }
 
     let list = List::new(items)
         .block(
@@ -261,10 +279,44 @@ fn draw_events(frame: &mut Frame, app: &mut App, area: Rect) {
         .highlight_symbol("» ");
 
     let mut state = ListState::default();
-    if !app.events.is_empty() {
-        state.select(Some(app.event_cursor));
-    }
+    let head_offset = if has_load_more { 1 } else { 0 };
+    let selected = if app.on_load_earlier {
+        Some(0)
+    } else if !app.events.is_empty() && app.event_cursor >= app.event_window_top {
+        Some(app.event_cursor - app.event_window_top + head_offset)
+    } else {
+        None
+    };
+    state.select(selected);
     frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// Hard-wrap a string at a character boundary, respecting Unicode chars.
+/// Used for event detail lines because `List` items don't auto-wrap. Word
+/// boundaries are not preserved — JSON / paths / tracebacks dominate this
+/// surface and look fine with a column-aligned hard wrap.
+fn wrap_line(s: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![s.to_string()];
+    }
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut count = 0usize;
+    for ch in s.chars() {
+        current.push(ch);
+        count += 1;
+        if count >= width {
+            out.push(std::mem::take(&mut current));
+            count = 0;
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
 }
 
 fn draw_help(frame: &mut Frame, app: &App, area: Rect) {

@@ -15,6 +15,13 @@ use super::super::runs_data::{list_runs, RunSummary};
 use super::data::load_run_events;
 use super::graph::Graph;
 
+/// Initial number of events kept visible in the right panel. Older events are
+/// hidden behind a "Load earlier" row to keep the timeline scannable on long
+/// runs.
+pub const EVENTS_WINDOW: usize = 100;
+/// Step by which the load-earlier row reveals more events.
+pub const EVENTS_WINDOW_GROW: usize = 100;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Runs,
@@ -83,6 +90,11 @@ pub struct App {
     pub events: Vec<Event>,
     pub event_cursor: usize,
     pub expanded_events: Vec<usize>,
+    /// Index of the first visible event in `events`. Older events are hidden
+    /// behind the load-earlier row.
+    pub event_window_top: usize,
+    /// True when the cursor is parked on the synthetic "Load earlier" row.
+    pub on_load_earlier: bool,
 
     pub graph: Option<Graph>,
     pub graph_cursor: usize,
@@ -105,6 +117,8 @@ impl App {
             events: Vec::new(),
             event_cursor: 0,
             expanded_events: Vec::new(),
+            event_window_top: 0,
+            on_load_earlier: false,
             graph: None,
             graph_cursor: 0,
             graph_warning: None,
@@ -211,15 +225,15 @@ impl App {
         };
 
         self.events = load_run_events(self.store.clone(), &run.stream_id).await?;
-        self.event_cursor = 0;
         self.expanded_events.clear();
+        self.event_window_top = self.events.len().saturating_sub(EVENTS_WINDOW);
+        self.on_load_earlier = false;
+        // Cursor lands on the latest visible event so newest is selected by
+        // default; the List widget auto-scrolls to keep it on screen.
+        self.event_cursor = self.events.len().saturating_sub(1);
 
         self.rebuild_graph(&run.pipeline);
         self.graph_cursor = 0;
-
-        if self.follow_tail {
-            self.event_cursor = self.events.len().saturating_sub(1);
-        }
 
         Ok(())
     }
@@ -302,14 +316,62 @@ impl App {
     }
 
     pub fn move_event_cursor(&mut self, delta: i32) {
-        self.event_cursor = clamp_step(self.event_cursor, delta, self.events.len());
+        if self.events.is_empty() || delta == 0 {
+            return;
+        }
+        if delta < 0 {
+            // Moving up: from a real event, walk up; if we hit the top of the
+            // visible window and earlier events exist, park on the load-more
+            // row. From the load-more row, going up does nothing.
+            if self.on_load_earlier {
+                return;
+            }
+            if self.event_cursor <= self.event_window_top {
+                if self.event_window_top > 0 {
+                    self.on_load_earlier = true;
+                }
+                return;
+            }
+            let new = (self.event_cursor as i32 + delta).max(self.event_window_top as i32);
+            self.event_cursor = new as usize;
+        } else {
+            // Moving down: from the load-more row, drop onto the first
+            // visible event. From a real event, walk down to the last.
+            if self.on_load_earlier {
+                self.on_load_earlier = false;
+                self.event_cursor = self.event_window_top;
+                return;
+            }
+            let max = self.events.len() - 1;
+            let new = (self.event_cursor as i32 + delta).min(max as i32);
+            self.event_cursor = new.max(0) as usize;
+        }
     }
 
     pub fn toggle_event_expanded(&mut self) {
+        if self.on_load_earlier {
+            self.load_earlier_events();
+            return;
+        }
         if let Some(pos) = self.expanded_events.iter().position(|&i| i == self.event_cursor) {
             self.expanded_events.remove(pos);
         } else {
             self.expanded_events.push(self.event_cursor);
+        }
+    }
+
+    /// Reveal one more page of older events. When the entire history is
+    /// uncovered, the load-more row goes away and the cursor lands on the
+    /// oldest event.
+    pub fn load_earlier_events(&mut self) {
+        if self.event_window_top == 0 {
+            self.on_load_earlier = false;
+            return;
+        }
+        self.event_window_top = self.event_window_top.saturating_sub(EVENTS_WINDOW_GROW);
+        if self.event_window_top == 0 {
+            self.on_load_earlier = false;
+            self.event_cursor = 0;
         }
     }
 

@@ -207,11 +207,12 @@ async fn handle_key(
             app.load_selected_run().await?;
         }
 
-        // Shift+R on the graph node: open fork-resume confirm popup.
+        // Shift+R: open fork-resume confirm popup for the currently focused
+        // graph node, regardless of which panel has focus. Forking targets the
+        // selected graph node + selected run; requiring Focus::Graph just made
+        // the binding silently no-op from Runs/Events panels.
         (KeyCode::Char('R'), _) => {
-            if matches!(app.focus, Focus::Graph) {
-                app.start_fork_prompt();
-            }
+            app.start_fork_prompt();
         }
 
         (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
