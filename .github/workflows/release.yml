@@ -15,21 +15,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux x86_64 (Docker/manylinux — need explicit -i)
+          # All targets build a single abi3 wheel (cp39+) thanks to the
+          # pyo3 `abi3-py39` feature. No `-i python3.X` needed: maturin
+          # picks up the version-agnostic stable ABI from the crate
+          # features.
           - os: ubuntu-latest
             target: x86_64
-            args-extra: -i python3.11
-          # Linux aarch64 (Docker/QEMU — need explicit -i)
           - os: ubuntu-latest
             target: aarch64
-            args-extra: -i python3.11
-          # macOS x86_64 (Intel, cross-compiled on Apple Silicon)
           - os: macos-14
             target: x86_64
-          # macOS arm64 (Apple Silicon)
           - os: macos-14
             target: aarch64
-          # Windows x86_64
           - os: windows-latest
             target: x86_64
     steps:
@@ -41,7 +38,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist ${{ matrix.args-extra }}
+          args: --release --out dist
           manylinux: auto
           before-script-linux: |
             export CFLAGS_aarch64_unknown_linux_gnu="-march=armv8-a -D__ARM_ARCH=8"
