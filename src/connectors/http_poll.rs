@@ -21,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::connectors::cursor_store::CursorStore;
 use std::sync::Arc as StdArc;
+use crate::connectors::util::{compile_path, first_string, truncate_body};
 use crate::connectors::{ConnectorError, InboundConnector, PluginContext, PluginHandle};
 use crate::events::{Event, EventKind};
 use crate::plugin::PluginBuilder;
@@ -144,12 +145,6 @@ impl Compiled {
             filter,
         })
     }
-}
-
-fn compile_path(path: &str, field: &str) -> Result<JsonPath, ConnectorError> {
-    JsonPath::parse(path).map_err(|e| {
-        ConnectorError::InvalidConfig(format!("{field}: invalid JSONPath '{path}': {e}"))
-    })
 }
 
 pub struct HttpPollBuilder;
@@ -323,7 +318,7 @@ async fn poll_once(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(format!("HTTP {status}: {}", truncate(&body, 200)));
+        return Err(format!("HTTP {status}: {}", truncate_body(&body, 200)));
     }
     let body: JsonValue = resp.json().await.map_err(|e| format!("json: {e}"))?;
 
@@ -451,20 +446,6 @@ fn json_eq(a: &JsonValue, b: &JsonValue) -> bool {
     }
 }
 
-fn first_string(path: &JsonPath, v: &JsonValue) -> Option<String> {
-    path.query(v).all().first().and_then(|v| render_as_string(v))
-}
-
-fn render_as_string(v: &JsonValue) -> Option<String> {
-    match v {
-        JsonValue::String(s) => Some(s.clone()),
-        JsonValue::Number(n) => Some(n.to_string()),
-        JsonValue::Bool(b) => Some(b.to_string()),
-        JsonValue::Null => None,
-        other => Some(other.to_string()),
-    }
-}
-
 fn cursor_value(v: &JsonValue, plus_one: bool) -> Option<String> {
     match v {
         JsonValue::Number(n) => {
@@ -485,14 +466,6 @@ fn cursor_is_greater(a: &str, b: &str) -> bool {
     match (a.parse::<i64>(), b.parse::<i64>()) {
         (Ok(l), Ok(r)) => l > r,
         _ => a > b,
-    }
-}
-
-fn truncate(s: &str, n: usize) -> String {
-    if s.len() <= n {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..n])
     }
 }
 
