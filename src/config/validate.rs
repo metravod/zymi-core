@@ -63,16 +63,21 @@ fn validate_agent_tools(
 /// [`Runtime`](crate::runtime::Runtime) (and therefore a
 /// [`ToolCatalog`](crate::runtime::ToolCatalog)) exists.
 ///
-/// Accepts three sources of tool names:
+/// Accepts four sources of tool names:
 /// 1. Built-ins from [`super::agent::KNOWN_TOOLS`].
 /// 2. Declarative tool names loaded from `tools/*.yml`.
-/// 3. Any `mcp__<server>__<tool>` where `<server>` is declared in
+/// 3. Python tool names auto-discovered from `tools/*.py` (only populated
+///    when the crate is built with the `python` feature; the runtime calls
+///    [`crate::python::auto_discover::discover_python_tools`] later, but
+///    validation runs before runtime, so the resolver needs the names too).
+/// 4. Any `mcp__<server>__<tool>` where `<server>` is declared in
 ///    `project.mcp_servers`. Per-tool name existence is deferred to the
 ///    runtime — the server only advertises its `tools/list` at startup, so
 ///    load-time validation would require spawning subprocesses. Typos in the
 ///    server name are still caught here.
 pub struct ConfigToolNameResolver {
     declarative_names: Vec<String>,
+    python_names: Vec<String>,
     mcp_server_names: Vec<String>,
 }
 
@@ -80,6 +85,7 @@ impl ConfigToolNameResolver {
     pub fn new(declarative_names: Vec<String>) -> Self {
         Self {
             declarative_names,
+            python_names: Vec::new(),
             mcp_server_names: Vec::new(),
         }
     }
@@ -92,12 +98,23 @@ impl ConfigToolNameResolver {
         self.mcp_server_names = names;
         self
     }
+
+    /// Attach the list of Python tool names auto-discovered from
+    /// `tools/*.py`. Mirrors the runtime's
+    /// [`crate::python::auto_discover::discover_python_tools`] pass so that
+    /// `pipelines/*.yml` tool steps and `agents/*.yml` tool lists referring
+    /// to a `@tool`-decorated Python function pass validation.
+    pub fn with_python_names(mut self, names: Vec<String>) -> Self {
+        self.python_names = names;
+        self
+    }
 }
 
 impl ToolNameResolver for ConfigToolNameResolver {
     fn knows(&self, name: &str) -> bool {
         if super::agent::KNOWN_TOOLS.contains(&name)
             || self.declarative_names.iter().any(|n| n == name)
+            || self.python_names.iter().any(|n| n == name)
         {
             return true;
         }
@@ -112,6 +129,7 @@ impl ToolNameResolver for ConfigToolNameResolver {
     fn all_tool_names(&self) -> Vec<&str> {
         let mut names: Vec<&str> = super::agent::KNOWN_TOOLS.to_vec();
         names.extend(self.declarative_names.iter().map(|s| s.as_str()));
+        names.extend(self.python_names.iter().map(|s| s.as_str()));
         // MCP tool names aren't known at load time; surface the server names
         // so the help text hints at the right prefix.
         names.extend(self.mcp_server_names.iter().map(|s| s.as_str()));
@@ -567,6 +585,34 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, ConfigError::Validation { message, .. } if message.contains("ghost_tool")));
+    }
+
+    #[test]
+    fn tool_step_known_python_tool_accepted() {
+        // Python tools are auto-discovered from tools/*.py at load time
+        // (when the `python` feature is on). The resolver must treat them
+        // as a first-class source of names so that pipeline tool steps
+        // referencing a `@tool`-decorated function pass validation.
+        let agents = HashMap::new();
+        let mut pipelines = HashMap::new();
+        let mut p = pipeline_from_steps("p", vec![]);
+        p.steps.push(tool_step("s1", "git_sync", "{}", vec![]));
+        pipelines.insert("p".into(), p);
+
+        let resolver =
+            ConfigToolNameResolver::new(vec![]).with_python_names(vec!["git_sync".into()]);
+        assert!(validate_workspace(&agents, &pipelines, &resolver).is_ok());
+    }
+
+    #[test]
+    fn agent_python_tool_accepted() {
+        // Same guarantee for agent.tools entries.
+        let mut agents = HashMap::new();
+        agents.insert("a".into(), agent("a", vec!["chunk_markdown"]));
+
+        let resolver = ConfigToolNameResolver::new(vec![])
+            .with_python_names(vec!["chunk_markdown".into()]);
+        assert!(validate_workspace(&agents, &HashMap::new(), &resolver).is_ok());
     }
 
     #[test]

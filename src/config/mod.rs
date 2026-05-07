@@ -140,15 +140,24 @@ pub fn load_project_dir(root: &Path) -> Result<WorkspaceConfig, ConfigError> {
     }
 
     // 6. Cross-validate (builtin + declarative tool names from tools/*.yml,
-    //    plus any `mcp__<server>__*` where `<server>` is declared in
-    //    project.mcp_servers — actual MCP tool names resolve at runtime).
+    //    plus auto-discovered Python tools from tools/*.py when the
+    //    `python` feature is on, plus any `mcp__<server>__*` where
+    //    `<server>` is declared in project.mcp_servers — actual MCP tool
+    //    names resolve at runtime).
     let declarative_names: Vec<String> = tools.keys().cloned().collect();
     let mcp_server_names: Vec<String> =
         project.mcp_servers.iter().map(|s| s.name.clone()).collect();
+    // Python tools are discovered a second time at runtime startup
+    // (runtime/mod.rs builds the ToolCatalog from the same scan). The
+    // duplicate import is cheap — a couple of `PyModule::from_code_bound`
+    // calls — and keeps this patch self-contained: we don't need to thread
+    // a DiscoveryOutcome through WorkspaceConfig just to share results.
+    let python_names: Vec<String> = python_tool_names(root);
     validate::validate_workspace(
         &agents,
         &pipelines,
         &validate::ConfigToolNameResolver::new(declarative_names)
+            .with_python_names(python_names)
             .with_mcp_servers(mcp_server_names),
     )?;
 
@@ -158,6 +167,28 @@ pub fn load_project_dir(root: &Path) -> Result<WorkspaceConfig, ConfigError> {
         pipelines,
         tools,
     })
+}
+
+/// Names of `@tool`-decorated functions found in `<root>/tools/*.py`.
+///
+/// Returns an empty vec when the crate is built without the `python`
+/// feature. Discovery errors are deliberately swallowed here — the same
+/// scan runs again in `runtime::Runtime::start` and surfaces failures via
+/// `log::warn!`. We only need the *names* at validation time, so a broken
+/// `tools/foo.py` simply means "this tool isn't registered" and any
+/// pipeline referencing it will get a normal "unknown tool" error.
+#[cfg(feature = "python")]
+fn python_tool_names(root: &Path) -> Vec<String> {
+    crate::python::auto_discover::discover_python_tools(root)
+        .tools
+        .into_iter()
+        .map(|t| t.name)
+        .collect()
+}
+
+#[cfg(not(feature = "python"))]
+fn python_tool_names(_root: &Path) -> Vec<String> {
+    Vec::new()
 }
 
 #[cfg(test)]
