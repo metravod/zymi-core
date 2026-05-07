@@ -10,6 +10,10 @@
 
 <p align="center">
   <a href="https://pypi.org/project/zymi-core/"><img src="https://img.shields.io/pypi/v/zymi-core.svg?logo=pypi&logoColor=white" alt="PyPI" /></a>
+  <a href="https://pypi.org/project/zymi-core/"><img src="https://img.shields.io/pypi/pyversions/zymi-core.svg?logo=python&logoColor=white" alt="Python versions" /></a>
+  <a href="https://github.com/metravod/zymi-core/actions/workflows/ci.yml"><img src="https://github.com/metravod/zymi-core/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT" /></a>
+  <a href="llms.txt"><img src="https://img.shields.io/badge/llms.txt-%E2%9C%93-8A2BE2" alt="llms.txt" /></a>
 </p>
 
 ---
