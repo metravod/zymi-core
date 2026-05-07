@@ -137,6 +137,8 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
     let mut step_outputs: HashMap<String, String> = HashMap::new();
     let mut all_results: HashMap<String, StepResult> = HashMap::new();
     let mut overall_success = true;
+    // ADR-0027: first deterministic-tool-step failure halts the pipeline.
+    let mut halt: Option<String> = None;
 
     if let Some(ctx) = &resume {
         for (step_id, output) in &ctx.frozen_outputs {
@@ -301,6 +303,19 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
 
             if !result.success {
                 overall_success = false;
+                // ADR-0027: deterministic tool steps fail-fast.
+                let is_tool_step = pipeline
+                    .steps
+                    .iter()
+                    .find(|s| s.id == result.step_id)
+                    .map(|s| matches!(s.kind, PipelineStepKind::Tool { .. }))
+                    .unwrap_or(false);
+                if is_tool_step && halt.is_none() {
+                    halt = Some(format!(
+                        "deterministic tool step '{}' failed: {}",
+                        result.step_id, result.output
+                    ));
+                }
             }
 
             step_outputs.insert(result.step_id.clone(), result.output.clone());
@@ -309,6 +324,10 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
 
         if is_local_cli_run {
             println!();
+        }
+
+        if halt.is_some() {
+            break;
         }
     }
 
@@ -368,7 +387,7 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
                 pipeline: pipeline.name.clone(),
                 success: overall_success,
                 final_output: final_output.clone(),
-                error: None,
+                error: halt.clone(),
             },
         )
         .await;
@@ -378,6 +397,10 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
     rt.shell_pool()
         .close_session(&stream_id, "workflow_end")
         .await;
+
+    if let Some(reason) = halt {
+        return Err(reason);
+    }
 
     Ok(PipelineResult {
         pipeline_name: pipeline.name.clone(),
