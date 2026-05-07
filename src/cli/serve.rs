@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,7 +24,8 @@ use super::{describe_backend, resolve_store_backend_for_cli};
 /// [`EventCommandRouter`]; what stays here is just startup wiring,
 /// shutdown signalling, and operator-facing log lines.
 pub fn exec(
-    pipeline_name: &str,
+    pipelines: &[String],
+    all: bool,
     poll_interval_ms: u64,
     approval_mode: Option<&str>,
     callback_url: Option<&str>,
@@ -41,17 +43,49 @@ pub fn exec(
     let workspace =
         load_project_dir(&root).map_err(|e| format!("failed to load project: {e}"))?;
 
-    if !workspace.pipelines.contains_key(pipeline_name) {
-        let available: Vec<&str> = workspace.pipelines.keys().map(|s| s.as_str()).collect();
-        return Err(format!(
-            "pipeline '{pipeline_name}' not found. Available: {}",
-            if available.is_empty() {
-                "(none)".to_string()
-            } else {
-                available.join(", ")
-            }
-        ));
-    }
+    // Resolve the served set:
+    // - `--all`: every pipeline in the workspace (filter stays None on the
+    //   router side, but we still log the names so operators know what's
+    //   being accepted).
+    // - positional names: validate each against the workspace, dedupe.
+    // clap's `conflicts_with` enforces mutual exclusion, so we only need to
+    // catch "neither given" here.
+    let served: Vec<String> = if all {
+        let mut names: Vec<String> = workspace.pipelines.keys().cloned().collect();
+        if names.is_empty() {
+            return Err("--all requires at least one pipeline in the project".to_string());
+        }
+        names.sort();
+        names
+    } else {
+        if pipelines.is_empty() {
+            return Err(
+                "missing pipeline name. Pass one or more pipeline names, or `--all`."
+                    .to_string(),
+            );
+        }
+        let unique: BTreeSet<&str> = pipelines.iter().map(|s| s.as_str()).collect();
+        let unknown: Vec<&str> = unique
+            .iter()
+            .copied()
+            .filter(|p| !workspace.pipelines.contains_key(*p))
+            .collect();
+        if !unknown.is_empty() {
+            let mut available: Vec<&str> =
+                workspace.pipelines.keys().map(|s| s.as_str()).collect();
+            available.sort();
+            return Err(format!(
+                "pipeline(s) not found: {}. Available: {}",
+                unknown.join(", "),
+                if available.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    available.join(", ")
+                }
+            ));
+        }
+        unique.into_iter().map(String::from).collect()
+    };
 
     // Multi-thread runtime: the watcher runs concurrently with pipeline tasks.
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -61,7 +95,8 @@ pub fn exec(
 
     rt.block_on(serve_loop(
         workspace,
-        pipeline_name.to_string(),
+        served,
+        all,
         root,
         poll_interval_ms,
         approval_mode.map(|s| s.to_string()),
@@ -71,7 +106,8 @@ pub fn exec(
 
 async fn serve_loop(
     workspace: crate::config::WorkspaceConfig,
-    pipeline_name: String,
+    served: Vec<String>,
+    all: bool,
     root: PathBuf,
     poll_interval_ms: u64,
     approval_mode: Option<String>,
@@ -107,12 +143,25 @@ async fn serve_loop(
         .spawn();
 
     let backend = resolve_store_backend_for_cli(&root)?;
+    let scope_label = if all {
+        format!("any pipeline (--all): {}", served.join(", "))
+    } else {
+        served.join(", ")
+    };
     println!(
-        "zymi serve: listening for PipelineRequested events targeting '{pipeline_name}'\n  store: {}\n  poll:  {poll_interval_ms}ms\n  press Ctrl+C to stop",
+        "zymi serve: listening for PipelineRequested events targeting {scope_label}\n  store: {}\n  poll:  {poll_interval_ms}ms\n  press Ctrl+C to stop",
         describe_backend(&backend)
     );
 
-    let router = EventCommandRouter::new(Arc::clone(&runtime)).with_pipeline_filter(&pipeline_name);
+    // `--all` accepts every workspace pipeline; positional names use the
+    // whitelist. The router's empty-set branch is never hit here because
+    // exec() guarantees served is non-empty.
+    let router = EventCommandRouter::new(Arc::clone(&runtime));
+    let router = if all {
+        router
+    } else {
+        router.with_pipeline_filters(served.iter().cloned())
+    };
 
     tokio::select! {
         _ = router.run() => {}

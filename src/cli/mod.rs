@@ -136,10 +136,18 @@ enum Command {
         dir: Option<PathBuf>,
     },
 
-    /// Run a pipeline as a long-lived service that reacts to PipelineRequested events
+    /// Run pipelines as a long-lived service that reacts to PipelineRequested events
     Serve {
-        /// Pipeline name to serve
-        pipeline: String,
+        /// Pipeline name(s) to serve. Accepts one or more positional names
+        /// (`zymi serve foo bar`); use `--all` to serve every pipeline in
+        /// the project. Required unless `--all` is given.
+        #[arg(conflicts_with = "all")]
+        pipelines: Vec<String>,
+
+        /// Serve every pipeline declared in the project. Mutually exclusive
+        /// with positional pipeline names.
+        #[arg(long, conflicts_with = "pipelines")]
+        all: bool,
 
         /// Polling interval for the cross-process store watcher (ms)
         #[arg(long, default_value = "100")]
@@ -306,12 +314,20 @@ fn dispatch(cli: Cli) {
             verify::exec(stream.as_deref(), resolve_root(dir.as_deref()))
         }
         Command::Serve {
-            pipeline,
+            pipelines,
+            all,
             poll_interval_ms,
             approval,
             callback_url,
             dir,
-        } => serve::exec(&pipeline, poll_interval_ms, approval.as_deref(), callback_url.as_deref(), resolve_root(dir.as_deref())),
+        } => serve::exec(
+            &pipelines,
+            all,
+            poll_interval_ms,
+            approval.as_deref(),
+            callback_url.as_deref(),
+            resolve_root(dir.as_deref()),
+        ),
         Command::Resume {
             stream,
             from_step,

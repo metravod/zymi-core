@@ -30,6 +30,7 @@
 //! stay in the adapter (`cli/serve.rs` today, future schedulers tomorrow) so
 //! the router can be reused unchanged.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use uuid::Uuid;
@@ -45,17 +46,18 @@ use super::Runtime;
 /// on a [`Runtime`].
 ///
 /// Construct via [`EventCommandRouter::new`], optionally narrow the scope
-/// with [`Self::with_pipeline_filter`], then call [`Self::run`] from a tokio
+/// with [`Self::with_pipeline_filters`], then call [`Self::run`] from a tokio
 /// task. The router owns its own subscription, so callers do not need to
 /// touch [`EventBus::subscribe`] directly.
 #[derive(Clone)]
 pub struct EventCommandRouter {
     runtime: Arc<Runtime>,
-    /// When set, only [`EventKind::PipelineRequested`] events whose
-    /// `pipeline` matches are translated. Mirrors the behaviour of
-    /// `zymi serve <pipeline>`: a serve process is bound to one pipeline so
-    /// it does not race with sibling serves on unrelated requests.
-    pipeline_filter: Option<String>,
+    /// When `Some`, only [`EventKind::PipelineRequested`] events whose
+    /// `pipeline` is in the set are translated. `None` means "accept any
+    /// pipeline known to the workspace" — used by `zymi serve --all`.
+    /// `zymi serve a b c` produces a 3-element set; a single-pipeline
+    /// `zymi serve a` still uses this same path with a one-element set.
+    pipeline_filter: Option<HashSet<String>>,
 }
 
 impl EventCommandRouter {
@@ -66,11 +68,18 @@ impl EventCommandRouter {
         }
     }
 
-    /// Restrict [`EventKind::PipelineRequested`] handling to a specific
-    /// pipeline name. Without a filter the router accepts every requested
-    /// pipeline known to the runtime's workspace.
-    pub fn with_pipeline_filter(mut self, pipeline: impl Into<String>) -> Self {
-        self.pipeline_filter = Some(pipeline.into());
+    /// Restrict [`EventKind::PipelineRequested`] handling to a whitelist of
+    /// pipeline names. Without a filter the router accepts every requested
+    /// pipeline known to the runtime's workspace (`zymi serve --all`).
+    /// Passing an empty iterator disables the filter — callers should
+    /// instead omit the call to make intent obvious.
+    pub fn with_pipeline_filters<I, S>(mut self, pipelines: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let set: HashSet<String> = pipelines.into_iter().map(Into::into).collect();
+        self.pipeline_filter = if set.is_empty() { None } else { Some(set) };
         self
     }
 
@@ -104,7 +113,7 @@ impl EventCommandRouter {
 
     fn pipeline_matches(&self, pipeline: &str) -> bool {
         match &self.pipeline_filter {
-            Some(target) => target == pipeline,
+            Some(set) => set.contains(pipeline),
             None => true,
         }
     }
