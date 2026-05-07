@@ -1,0 +1,27 @@
+name: chat
+description: "Two-step chat loop: assistant drafts, reviewer polishes."
+
+inputs:
+  - name: message
+    required: true
+
+steps:
+  - id: respond
+    agent: assistant
+    task: "${inputs.message}"
+
+  - id: polish
+    agent: reviewer
+    task: |
+      User asked:
+      ${inputs.message}
+
+      Draft answer from the assistant:
+      ${steps.respond.output}
+
+      Decide whether to keep the draft verbatim or write a better version.
+      Output ONLY the final answer the user will see.
+    depends_on: [respond]
+
+output:
+  step: polish

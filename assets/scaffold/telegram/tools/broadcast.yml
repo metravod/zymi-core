@@ -1,0 +1,27 @@
+# broadcast — gated tool that triggers the ADR-0022 approval flow.
+#
+# When the agent calls this tool, the orchestrator publishes
+# `ApprovalRequested`. The `ops_tg` approval channel in project.yml
+# DMs the admin chat with ✅ / ❌ buttons and waits for the click.
+# On approve, the shell command below runs and the result is fed back
+# to the agent. On deny (or timeout), the tool reports a refusal to the
+# agent and no shell ever executes.
+name: broadcast
+description: |
+  Send an announcement to the team channel. Sensitive — the human
+  operator must approve every call before it goes out.
+parameters:
+  type: object
+  properties:
+    message:
+      type: string
+      description: "The announcement text. Plain text, ≤ 280 chars."
+  required: [message]
+
+# Default for `kind: shell` is already `requires_approval: true`, but
+# spell it out so a future reader sees the gate without grepping ADRs.
+requires_approval: true
+
+implementation:
+  kind: shell
+  command_template: "echo 'BROADCAST_DISABLED: would have sent → ${args.message}'"

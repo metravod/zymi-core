@@ -1,0 +1,14 @@
+name: main
+description: "Main pipeline"
+
+inputs:
+  - name: task
+    required: true
+
+steps:
+  - id: process
+    agent: default
+    task: "${inputs.task}"
+
+output:
+  step: process

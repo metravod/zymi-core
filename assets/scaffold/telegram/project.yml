@@ -1,0 +1,121 @@
+name: __PROJECT_NAME__
+version: "0.1"
+
+llm:
+  provider: openai
+  model: gpt-4o-mini
+  api_key: ${env.OPENAI_API_KEY}
+
+defaults:
+  timeout_secs: 60
+  max_iterations: 8
+
+policy:
+  enabled: true
+  # `web_search` / `web_scrape` ship with a `kind: shell` placeholder that
+  # echoes "not configured" when no provider is wired. `broadcast` is a
+  # `kind: shell` tool too; we allow `echo` so all three placeholders run.
+  allow: ["echo *"]
+  deny: ["*"]
+
+# ── Telegram I/O (declarative, no Rust required) ────────────────────────────
+#
+# Edit the `filter:` list below to include your Telegram username (case-
+# sensitive, without the @). Anyone else messaging the bot is silently
+# dropped. Remove the filter block to accept everyone — only do that for a
+# throwaway bot.
+
+connectors:
+  - type: http_poll
+    name: telegram
+    url: "https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getUpdates"
+    method: GET
+    interval_secs: 2
+    extract:
+      items:     "$.result[*]"
+      stream_id: "$.message.chat.id"
+      content:   "$.message.text"
+      user:      "$.message.from.username"
+    cursor:
+      param: offset
+      from_item: "$.update_id"
+      plus_one: true
+      persist: true
+    filter:
+      "$.message.from.username":
+        one_of: ["your_username_here"]
+    # Every accepted update fires `chat` pipeline with `inputs.message`
+    # set to the message text. `zymi serve chat` picks it up.
+    pipeline: chat
+    pipeline_input: message
+
+outputs:
+  - type: http_post
+    name: telegram_reply
+    on: [ResponseReady]
+    url: "https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage"
+    method: POST
+    headers:
+      Content-Type: "application/json"
+    body_template: |
+      {
+        "chat_id": "{{ event.stream_id }}",
+        "text": {{ event.content | tojson }}
+      }
+    retry:
+      attempts: 3
+      backoff_secs: [1, 5, 30]
+
+# ── Human approvals (ADR-0022) ──────────────────────────────────────────────
+#
+# When `tools/broadcast.yml` is invoked the agent publishes
+# `ApprovalRequested`. The `ops_tg` channel below picks it up, DMs the
+# admin chat with an inline ✅ / ❌ keyboard, and the click flows back as
+# `ApprovalGranted` / `ApprovalDenied` on the bus.
+#
+# Telegram needs a public URL to reach `bind:` for the callback. Two
+# common ways to get one on a laptop:
+#   ngrok http 8088            →  https://abc123.ngrok-free.app
+#   cloudflared tunnel --url http://localhost:8088
+# Then point the bot at it once:
+#   curl "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
+#        -d "url=<public-url>/telegram/approval" \
+#        -d "secret_token=${TELEGRAM_WEBHOOK_SECRET}"
+
+default_approval_channel: ops_tg
+
+approvals:
+  - type: telegram
+    name: ops_tg
+    bot_token: "${env.TELEGRAM_BOT_TOKEN}"
+    # The admin chat that receives approval prompts. Often the same chat
+    # the user is in, so they see "approve?" land in their DMs as the
+    # agent thinks. Set in .env (see TELEGRAM_ADMIN_CHAT_ID).
+    chat_id: ${env.TELEGRAM_ADMIN_CHAT_ID}
+    bind: "127.0.0.1:8088"
+    callback_path: /telegram/approval
+    # `secret_token` is enforced via Telegram's
+    # `X-Telegram-Bot-Api-Secret-Token` header. Without it, anyone who
+    # guesses your public URL can forge approvals.
+    secret_token: "${env.TELEGRAM_WEBHOOK_SECRET}"
+
+# ── (optional) MCP server — N tools from one block, no YAML stubs ───────────
+#
+# Uncomment to give the agent read/write access to the local filesystem via
+# the official MCP filesystem server. Tools land in the catalogue prefixed
+# with `mcp__fs__*` (list_directory, read_text_file, write_file, …) — wire
+# them into agents/assistant.yml `tools:` to make them callable.
+#
+# Requires `node` + `npx` on PATH. See ADR-0023 for the full security posture
+# (PATH auto-forward, env-isolation, restart policy).
+#
+# mcp_servers:
+#   - name: fs
+#     command:
+#       - npx
+#       - "-y"
+#       - "@modelcontextprotocol/server-filesystem"
+#       - ./sandbox
+#     allow: [read_text_file, write_file, list_directory]
+#     init_timeout_secs: 15
+#     call_timeout_secs: 30

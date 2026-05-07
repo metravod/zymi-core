@@ -1,0 +1,71 @@
+# ============================================================================
+# web_search — declarative tool example
+#
+# This is a working example of a declarative tool. Out of the box it returns
+# a placeholder message. To connect it to a real search API:
+#
+#   1. Pick a provider below and uncomment its `implementation:` block.
+#   2. Delete or comment out the placeholder `implementation:` at the bottom.
+#   3. Set the API key in your environment.
+#
+# If you don't need web search, just delete this file — nothing will break.
+# ============================================================================
+
+name: web_search
+description: "Search the web for information on a given query"
+parameters:
+  type: object
+  properties:
+    query:
+      type: string
+      description: "Search query"
+  required: [query]
+
+# --- Provider: Brave Search (https://brave.com/search/api/) ---
+#     Free tier: 2000 queries/month
+#
+# implementation:
+#   kind: http
+#   method: GET
+#   url: "https://api.search.brave.com/res/v1/web/search?q=${args.query}&count=5"
+#   headers:
+#     Accept: "application/json"
+#     X-Subscription-Token: "${env.BRAVE_SEARCH_API_KEY}"
+
+# --- Provider: SerpAPI (https://serpapi.com/) ---
+#     Free tier: 100 queries/month
+#
+# implementation:
+#   kind: http
+#   method: GET
+#   url: "https://serpapi.com/search.json?q=${args.query}&num=5&api_key=${env.SERPAPI_KEY}"
+
+# --- Provider: Google Custom Search (https://developers.google.com/custom-search/) ---
+#     Free tier: 100 queries/day
+#
+# implementation:
+#   kind: http
+#   method: GET
+#   url: "https://www.googleapis.com/customsearch/v1?q=${args.query}&key=${env.GOOGLE_API_KEY}&cx=${env.GOOGLE_SEARCH_CX}&num=5"
+
+# --- Provider: Tavily (https://tavily.com/) ---
+#     AI-optimised search — returns clean, LLM-ready content.
+#     Free tier: 1000 queries/month
+#
+# implementation:
+#   kind: http
+#   method: POST
+#   url: "https://api.tavily.com/search"
+#   headers:
+#     Content-Type: "application/json"
+#     Authorization: "Bearer ${env.TAVILY_API_KEY}"
+#   body_template: '{"query": "${args.query}", "max_results": 5}'
+
+# Placeholder — when no provider is wired, the tool's *output* is read by
+# the agent, not the user. So the message is written *to the model* as
+# instructions, not as an admin error. Without this, models read
+# "not configured" as a generic failure and refuse to answer at all.
+# Once you uncomment a real provider above, this whole block goes away.
+implementation:
+  kind: shell
+  command_template: "echo 'WEB_SEARCH_DISABLED: this project has no search provider wired. Answer the user using your own training knowledge. If the question is time-sensitive (current events, weather, prices, news), give your best general or seasonal answer based on training data and add ONE short line acknowledging that you could not check live sources. Do not refuse to answer; do not mention this tool by name.'"
