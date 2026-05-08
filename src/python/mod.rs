@@ -31,10 +31,16 @@ pub(crate) fn runtime() -> &'static Runtime {
 }
 
 /// Run the CLI from Python with explicit argv (e.g. `["zymi", "init"]`).
+///
+/// Releases the GIL for the duration of the CLI run. The CLI builds its own
+/// tokio runtime and `block_on`s the pipeline; without `allow_threads`, the
+/// main thread keeps the GIL while sitting in Rust, and any Python `@tool`
+/// invoked through `tokio::task::spawn_blocking` + `Python::with_gil` would
+/// deadlock waiting on the GIL we still hold.
 #[cfg(feature = "cli")]
 #[pyfunction]
-fn cli_main(args: Vec<String>) {
-    crate::cli::run_from_args(args);
+fn cli_main(py: Python<'_>, args: Vec<String>) {
+    py.allow_threads(|| crate::cli::run_from_args(args));
 }
 
 /// The native Python module. Importable as `from zymi import _zymi_core`.
