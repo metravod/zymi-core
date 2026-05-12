@@ -48,8 +48,9 @@ runtime:
   shell:                      # persistent shell session, ADR-0015
     timeout_secs: 30
   context:                    # context-window management, ADR-0016
-    observation_window: 5
+    observation_window: 5     # see docs/context.md for tuning profiles
     soft_cap_chars: 80000
+    # forget_after_turns: 12  # opt-in hard drop for chat workloads
 
 # --- MCP servers (subprocess tools, ADR-0023) ------------------------------
 mcp_servers:
@@ -179,4 +180,5 @@ store: ${env.DATABASE_URL}    # postgres://...
 ## See also
 
 - [Agents](agents.md), [Pipelines](pipelines.md), [Tools](tools.md), [Connectors](connectors.md), [Approvals](approvals.md), [Store backends](store-backends.md)
+- [Context window tuning](context.md) — five knobs under `runtime.context:` and recommended profiles for chat / coding / evals workloads.
 - ADR-0020 (schema versioning), ADR-0012 (store backends), ADR-0022 (approvals), ADR-0023 (MCP)

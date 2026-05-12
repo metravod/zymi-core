@@ -492,3 +492,33 @@ Per-step sub-streams (`{pipeline_stream_id}:step:{step_id}`) isolate each step's
 `messages.push(response.message)` and `messages.push(ToolResult { .. })` are both gone — the enriched `LlmCallCompleted` and `ToolCallCompleted` events are the records, and the next `build()` reads them back.
 
 **314 tests pass, clippy clean.** 10 new tests (3 enrichment + 7 builder).
+
+## Slice 6 — opt-in hard turn cap (`forget_after_turns`)
+
+**Date:** 2026-05-12
+
+§3 of this ADR rejected "drop old turns entirely" as a default mechanism with the argument that the model needs to know what it already tried — without a placeholder it would re-read the same files and re-run the same commands. That reasoning is correct for the original design target: long coding-agent runs where every past `read_file` or `execute_shell_command` carries trajectory information worth ~20 tokens of placeholder.
+
+Real deployment of zymi as a conversational backend (`zymi-rag-bot` running on a Telegram chat stream, 2026-05-12) revealed the argument **inverts** for chat workloads. A 20-turn-old `"Привет!"` from a user does not carry trajectory information. Holding even a masked placeholder for it is wasted budget. Worse: when each turn pulls a ~16 kB RAG chunk via Pinecone, the masking-only policy still grows the tail roughly linearly until `soft_cap_chars` is hit and an LLM summarization call fires — paying for compression that a hard drop would have made unnecessary.
+
+This slice introduces `forget_after_turns: Option<usize>` to `ContextConfig` / `ContextWindowConfig` as an **opt-in** knob. Default is `None`, which preserves the ADR-0016 §3 behaviour unchanged for every existing project.
+
+### What landed
+
+- `src/runtime/context_window.rs` — `pub(crate) fn forget_old_turns(body, keep_last_turns) -> Vec<Message>` using the existing `identify_segments()` helper. Drops whole `Segment::Turn` ranges from the start; absorbs preceding `Segment::PassThrough` (User messages) that fall before the first kept turn — those are the old user messages whose answers are also being dropped. Pair invariant (`tool_use` adjacent to its `tool_result`) is preserved by operating on segment boundaries, not raw message indices.
+- `src/runtime/context_builder.rs` — `ContextConfig.forget_after_turns: Option<usize>`, applied to the events-derived tail in both `ContextBuilder::build()` and the re-read inside `try_compact()`. Order is: `events_to_messages → forget_old_turns → mask_observations → soft_cap_chars check → hard_cap_chars check`. So when both `forget_after_turns` and `observation_window` are set, forget runs first (smaller input to masking) and the summarization path operates on the already-truncated tail.
+- `src/config/project.rs` — `ContextWindowConfig.forget_after_turns: Option<usize>` with `#[serde(default)]` and schemars annotation. Surfaces in the JSON schema as a nullable integer field.
+- `src/cli/serve.rs` — one-shot info line at `zymi serve` startup when `project.runtime` is `None`, pointing at `docs/context.md`. Does not warn; does not block startup.
+- `docs/context.md` (new) — explains the four-layer model and the five knobs, with three recommended profiles (chat / coding / evals) as full YAML snippets.
+- `assets/scaffold/default/project.yml` — commented `runtime.context:` block emitted by `zymi init` so new projects see the knobs exist.
+- `assets/scaffold/telegram/project.yml` — chat profile values emitted uncommented (`observation_window: 2`, `forget_after_turns: 12`, `soft_cap_chars: 40_000`).
+
+### What stayed out
+
+- **No `forget_after_turns` event type.** Unlike `ContextCompacted`, which is event-sourced because it materially changes the agent's view of history (the summary is itself new content), `forget_after_turns` is a deterministic filter over already-recorded events. Replay with the same config reproduces the same view; replay with a different `forget_after_turns` produces a different view *intentionally* — consistent with how `observation_window` already works.
+- **No session boundary event.** An earlier sketch (`SessionStarted` emitted on idle-timeout / explicit reset / turn-cap) was rejected because the composition of `forget_after_turns + observation_window + soft_cap_chars` gives equivalent UX without a new abstraction. Each composes orthogonally: hard drop, soft mask, fall-back summary.
+- **No per-pipeline override.** All knobs are project-level (`runtime.context:` in `project.yml`). If a project mixes a chat pipeline and a coding pipeline, the conservative choice today is to tune for chat. Per-step overrides can be revisited if a real consumer trips on it.
+
+### Tests
+
+`context_window.rs` gains 5 unit tests (`forget_after_turns_keeps_recent_drops_older`, `_preserves_pair_invariant`, `_drops_orphan_user_messages`, `_noop_when_below_threshold`, `_zero_drops_everything`). `context_builder.rs` gains 2 integration tests (`build_with_forget_after_turns_drops_ancient_turns`, `build_forget_runs_before_soft_cap` — the latter asserts that a properly-sized `forget_after_turns` keeps the soft cap from firing). All existing tests continue to pass with the new field defaulted to `None`.

@@ -18,7 +18,8 @@ use crate::events::store::EventStore;
 use crate::events::{Event, EventKind};
 use crate::llm::{ChatRequest, LlmProvider};
 use crate::runtime::context_window::{
-    approx_chars, identify_segments, mask_observations, Segment, DEFAULT_OBSERVATION_WINDOW,
+    approx_chars, forget_old_turns, identify_segments, mask_observations, Segment,
+    DEFAULT_OBSERVATION_WINDOW,
 };
 use crate::types::Message;
 
@@ -33,6 +34,12 @@ pub struct ContextConfig {
     pub hard_cap_chars: usize,
     /// Minimum recent turns preserved even under compaction pressure.
     pub min_tail_turns: usize,
+    /// Opt-in hard turn cap (ADR-0016 §Slice 6). When `Some(n)`, turns older
+    /// than the last `n` are dropped from the tail entirely **before** masking
+    /// or summarization runs — no placeholder is left behind. Intended for
+    /// conversational workloads where ancient turns carry no trajectory info
+    /// worth preserving. Default `None` keeps existing (ADR-0016 §3) behaviour.
+    pub forget_after_turns: Option<usize>,
 }
 
 impl Default for ContextConfig {
@@ -42,6 +49,7 @@ impl Default for ContextConfig {
             soft_cap_chars: 400_000,
             hard_cap_chars: 600_000,
             min_tail_turns: 4,
+            forget_after_turns: None,
         }
     }
 }
@@ -53,6 +61,7 @@ impl From<crate::config::project::ContextWindowConfig> for ContextConfig {
             soft_cap_chars: c.soft_cap_chars,
             hard_cap_chars: c.hard_cap_chars,
             min_tail_turns: c.min_tail_turns,
+            forget_after_turns: c.forget_after_turns,
         }
     }
 }
@@ -172,6 +181,10 @@ impl ContextBuilder {
             .map_err(ContextError::StoreError)?;
 
         let tail = events_to_messages(&events);
+        let tail = match self.config.forget_after_turns {
+            Some(keep) => forget_old_turns(&tail, keep),
+            None => tail,
+        };
         let masked_tail = mask_observations(&tail, self.config.observation_window);
         messages.extend(masked_tail);
 
@@ -339,6 +352,10 @@ impl ContextBuilder {
             .map_err(ContextError::StoreError)?;
 
         let tail = events_to_messages(&updated_events);
+        let tail = match self.config.forget_after_turns {
+            Some(keep) => forget_old_turns(&tail, keep),
+            None => tail,
+        };
         let masked_tail = mask_observations(&tail, self.config.observation_window);
 
         messages.truncate(prefix_len);
@@ -1193,6 +1210,7 @@ mod tests {
                 soft_cap_chars: 50,
                 hard_cap_chars: 100,
                 min_tail_turns: 0,
+                forget_after_turns: None,
             },
         );
         // No with_compaction() → compaction skipped, hard cap fires.
@@ -1321,6 +1339,7 @@ mod tests {
                 soft_cap_chars: 100, // very low → forces compaction
                 hard_cap_chars: 100_000,
                 min_tail_turns: 2,
+                forget_after_turns: None,
             },
         )
         .with_compaction(Arc::clone(&mock) as Arc<dyn LlmProvider>, bus.clone());
@@ -1366,6 +1385,7 @@ mod tests {
                 soft_cap_chars: 100, // forces compaction
                 hard_cap_chars: 100_000,
                 min_tail_turns: 3,   // preserve 3 most recent
+                forget_after_turns: None,
             },
         )
         .with_compaction(Arc::clone(&mock) as Arc<dyn LlmProvider>, bus.clone());
@@ -1382,6 +1402,99 @@ mod tests {
         assert!(
             assistant_count >= 3,
             "expected at least 3 preserved turns, got {assistant_count}"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_with_forget_after_turns_drops_ancient_turns() {
+        let (store, bus, memory) = setup().await;
+        let stream = "forget-test";
+
+        // 5 turns; forget all but the last 2.
+        emit_turns(&bus, stream, 5, 100).await;
+
+        let builder = ContextBuilder::new(
+            store,
+            memory,
+            stream.into(),
+            "sys".into(),
+            "task".into(),
+            ContextConfig {
+                observation_window: 10, // window > kept turns, so no masking
+                soft_cap_chars: 1_000_000,
+                hard_cap_chars: 2_000_000,
+                min_tail_turns: 0,
+                forget_after_turns: Some(2),
+            },
+        );
+
+        let messages = builder.build().await.unwrap();
+
+        // Prefix (sys + task) + 2 turns × 2 messages = 6 total.
+        let assistant_count = messages
+            .iter()
+            .filter(|m| matches!(m, Message::Assistant { .. }))
+            .count();
+        let tool_count = messages
+            .iter()
+            .filter(|m| matches!(m, Message::ToolResult { .. }))
+            .count();
+        assert_eq!(assistant_count, 2, "only last 2 turns should survive");
+        assert_eq!(tool_count, 2, "only last 2 tool_results should survive");
+
+        // Last surviving assistant should be turn 4 (zero-indexed: step 4).
+        let last_assistant = messages
+            .iter()
+            .filter_map(|m| match m {
+                Message::Assistant { content, .. } => content.as_deref(),
+                _ => None,
+            })
+            .next_back()
+            .unwrap();
+        assert_eq!(last_assistant, "step 4");
+    }
+
+    #[tokio::test]
+    async fn build_forget_runs_before_soft_cap() {
+        let (store, bus, memory) = setup().await;
+        let stream = "forget-before-compact";
+
+        // 5 turns × 5000-char results.
+        emit_turns(&bus, stream, 5, 5000).await;
+
+        // Provider stays unused: with forget_after_turns=2 the surviving
+        // tail (sys + task + 2 turns × 2 ≈ 2 × 5000 chars) sits below the
+        // 50_000 soft cap, so compaction must not fire.
+        let mock = Arc::new(MockProvider::new("UNREACHED"));
+
+        let builder = ContextBuilder::new(
+            store.clone(),
+            memory,
+            stream.into(),
+            "sys".into(),
+            "task".into(),
+            ContextConfig {
+                observation_window: 10,
+                soft_cap_chars: 50_000,
+                hard_cap_chars: 100_000,
+                min_tail_turns: 0,
+                forget_after_turns: Some(2),
+            },
+        )
+        .with_compaction(Arc::clone(&mock) as Arc<dyn LlmProvider>, bus.clone());
+
+        let _ = builder.build().await.unwrap();
+
+        assert_eq!(
+            mock.calls(),
+            0,
+            "forget should shrink tail enough that compaction does not fire"
+        );
+
+        let events = store.read_stream(stream, 0).await.unwrap();
+        assert!(
+            !events.iter().any(|e| e.kind_tag() == "context_compacted"),
+            "no ContextCompacted event should be emitted"
         );
     }
 
@@ -1405,6 +1518,7 @@ mod tests {
                 soft_cap_chars: 100, // would trigger compaction
                 hard_cap_chars: 100_000, // but high enough to not fail
                 min_tail_turns: 2,
+                forget_after_turns: None,
             },
         )
         .with_compaction(failing as Arc<dyn LlmProvider>, bus.clone());
@@ -1435,6 +1549,7 @@ mod tests {
                 soft_cap_chars: 100,
                 hard_cap_chars: 100_000,
                 min_tail_turns: 2,
+                forget_after_turns: None,
             },
         )
         .with_compaction(Arc::clone(&mock) as Arc<dyn LlmProvider>, bus.clone());
@@ -1456,6 +1571,7 @@ mod tests {
                 soft_cap_chars: 100_000, // raise soft cap so it won't trigger
                 hard_cap_chars: 200_000,
                 min_tail_turns: 2,
+                forget_after_turns: None,
             },
         )
         .with_compaction(Arc::clone(&mock) as Arc<dyn LlmProvider>, bus.clone());

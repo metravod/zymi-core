@@ -153,6 +153,15 @@ async fn serve_loop(
         describe_backend(&backend)
     );
 
+    // One-shot hint when the operator hasn't tuned context window knobs —
+    // engine defaults (10 turns / 400k soft / 600k hard) target long
+    // coding-agent runs, not chat. See docs/context.md.
+    if project_for_spawn.runtime.is_none() {
+        println!(
+            "  note:  runtime.context not set — using engine defaults; see docs/context.md for chat/coding profiles"
+        );
+    }
+
     // `--all` accepts every workspace pipeline; positional names use the
     // whitelist. The router's empty-set branch is never hit here because
     // exec() guarantees served is non-empty.

@@ -10,6 +10,18 @@ defaults:
   timeout_secs: 60
   max_iterations: 8
 
+# Context window tuned for conversational use (ADR-0016 chat profile —
+# see docs/context.md). Engine defaults target long coding agents and
+# never trigger masking on normal-length chats; these crank everything
+# down so RAG tool_results compact early and ancient turns drop outright.
+runtime:
+  context:
+    observation_window: 2          # mask tool_results older than 2 turns
+    soft_cap_chars: 40000          # summarize once context approaches ~10k tokens
+    hard_cap_chars: 80000          # fail loud if even summarization can't fit
+    min_tail_turns: 2              # always keep the last 2 turns full
+    forget_after_turns: 12         # drop turns older than 12 entirely
+
 policy:
   enabled: true
   # `web_search` / `web_scrape` ship with a `kind: shell` placeholder that

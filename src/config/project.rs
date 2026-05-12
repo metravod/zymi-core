@@ -321,6 +321,15 @@ pub struct ContextWindowConfig {
     /// Minimum recent turns preserved even under compaction pressure.
     #[serde(default = "default_min_tail_turns")]
     pub min_tail_turns: usize,
+
+    /// Opt-in hard turn cap (ADR-0016 §Slice 6). When set, turns older than
+    /// the last `forget_after_turns` are dropped from the context entirely
+    /// — no placeholder is left behind. Default `null` keeps ADR-0016 §3
+    /// behaviour (mask, never drop). Use for conversational workloads
+    /// (e.g. `runtime.context.forget_after_turns: 12` for a Telegram bot
+    /// where 20-turn-old "Привет!" carries no trajectory info).
+    #[serde(default)]
+    pub forget_after_turns: Option<usize>,
 }
 
 impl Default for ContextWindowConfig {
@@ -330,6 +339,7 @@ impl Default for ContextWindowConfig {
             soft_cap_chars: default_soft_cap_chars(),
             hard_cap_chars: default_hard_cap_chars(),
             min_tail_turns: default_min_tail_turns(),
+            forget_after_turns: None,
         }
     }
 }

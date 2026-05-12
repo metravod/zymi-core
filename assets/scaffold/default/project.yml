@@ -20,3 +20,17 @@ contracts:
   file_write:
     allowed_dirs: ["./output", "./memory"]
     deny_patterns: ["*.env", "*.key"]
+
+# Context window management (ADR-0016).
+# Defaults below match the engine and target long coding-agent runs (50+
+# tool calls per pipeline). For conversational workloads (chat bots, RAG
+# assistants) crank these down — see docs/context.md for tuning profiles.
+#
+# runtime:
+#   context:
+#     observation_window: 10       # turns kept with full tool results; older → placeholders
+#     soft_cap_chars: 400000       # exceed → LLM summarization fires (ContextCompacted)
+#     hard_cap_chars: 600000       # exceed even after summarization → step fails loud
+#     min_tail_turns: 4            # floor — never compact away last N turns
+#     # forget_after_turns: 12     # opt-in: drop turns older than N entirely (no placeholder).
+#                                  # Useful for chat where ancient "Привет!" carries no value.

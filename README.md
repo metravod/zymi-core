@@ -158,7 +158,7 @@ SQLite (default, zero-config) for single-process / dev. Postgres for multi-proce
 
 ### Context window management
 
-The agent's working context is reconstructed from the event log each iteration, not accumulated in a buffer. Older tool observations are masked in-place (~2× cost reduction, no extra LLM calls). When the budget still gets tight, hybrid compaction summarises the oldest masked batch with one fast LLM call. Tunable in `runtime.context:` ([ADR-0016](adr/0016-context-window-management.md)).
+The agent's working context is reconstructed from the event log each iteration, not accumulated in a buffer. Older tool observations are masked in-place (~2× cost reduction, no extra LLM calls). When the budget still gets tight, hybrid compaction summarises the oldest masked batch with one fast LLM call. Tunable in `runtime.context:` — see [docs/context.md](docs/context.md) for recommended chat / coding / evals profiles ([ADR-0016](adr/0016-context-window-management.md)).
 
 ### JSON Schemas for configs
 

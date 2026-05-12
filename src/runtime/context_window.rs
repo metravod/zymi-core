@@ -129,6 +129,47 @@ pub(crate) fn identify_segments(body: &[Message]) -> Vec<Segment> {
     segments
 }
 
+/// Drop the oldest turns from the body, keeping only the last `keep_last_turns`
+/// `Assistant + ToolResult` turns. Any `User` / `UserMultimodal` pass-throughs
+/// positionally before the first kept turn are also dropped — they are user
+/// messages from the forgotten history.
+///
+/// This is the opt-in hard truncation knob (ADR-0016 §Slice 6). Unlike
+/// [`mask_observations`] it does **not** leave a placeholder behind; dropped
+/// turns are gone from the context entirely. Intended for conversational
+/// workloads where trajectory awareness of long-ago messages is pure cost.
+///
+/// **Invariant:** `tool_use` / `tool_result` pairs are never split. Whole
+/// turns are dropped or kept.
+pub(crate) fn forget_old_turns(body: &[Message], keep_last_turns: usize) -> Vec<Message> {
+    let segments = identify_segments(body);
+    let turn_count = segments.iter().filter(|s| s.is_turn()).count();
+    if turn_count <= keep_last_turns {
+        return body.to_vec();
+    }
+
+    let drop_count = turn_count - keep_last_turns;
+    let mut turns_seen = 0;
+    let mut drop_until_idx: usize = 0;
+
+    for seg in &segments {
+        if turns_seen >= drop_count {
+            break;
+        }
+        match seg {
+            Segment::Turn { end, .. } => {
+                drop_until_idx = *end;
+                turns_seen += 1;
+            }
+            Segment::PassThrough(idx) => {
+                drop_until_idx = *idx + 1;
+            }
+        }
+    }
+
+    body[drop_until_idx..].to_vec()
+}
+
 /// Mask a single turn: truncate assistant content, replace tool results
 /// with placeholders.
 fn mask_turn(turn_messages: &[Message]) -> Vec<Message> {
@@ -627,6 +668,121 @@ mod tests {
             Message::ToolResult { content, .. } => assert!(content.contains("4000 chars")),
             _ => unreachable!(),
         }
+    }
+
+    // ── forget_old_turns tests ──────────────────────────────────────────
+
+    #[test]
+    fn forget_after_turns_keeps_recent_drops_older() {
+        // 3 turns; forget all but the last.
+        let body: Vec<Message> = vec![
+            assistant(Some("t1"), vec![tc("a", "read_file", r#"{"path":"a.rs"}"#)]),
+            tool_result("a", "content a"),
+            assistant(Some("t2"), vec![tc("b", "read_file", r#"{"path":"b.rs"}"#)]),
+            tool_result("b", "content b"),
+            assistant(Some("t3"), vec![tc("c", "read_file", r#"{"path":"c.rs"}"#)]),
+            tool_result("c", "content c"),
+        ];
+
+        let kept = forget_old_turns(&body, 1);
+        assert_eq!(kept.len(), 2, "expected last turn only (assistant + tool_result)");
+        match &kept[0] {
+            Message::Assistant { content, .. } => assert_eq!(content.as_deref(), Some("t3")),
+            _ => panic!("expected Assistant, got {:?}", kept[0]),
+        }
+        match &kept[1] {
+            Message::ToolResult { tool_call_id, content } => {
+                assert_eq!(tool_call_id, "c");
+                assert_eq!(content, "content c");
+            }
+            _ => panic!("expected ToolResult"),
+        }
+    }
+
+    #[test]
+    fn forget_after_turns_preserves_pair_invariant() {
+        // Multi-tool turn — must not be split mid-pair.
+        let body: Vec<Message> = vec![
+            // Turn 1
+            assistant(Some("t1"), vec![tc("a", "read_file", r#"{"path":"a.rs"}"#)]),
+            tool_result("a", "content a"),
+            // Turn 2 with TWO tool calls
+            assistant(
+                None,
+                vec![
+                    tc("b1", "read_file", r#"{"path":"b1.rs"}"#),
+                    tc("b2", "read_file", r#"{"path":"b2.rs"}"#),
+                ],
+            ),
+            tool_result("b1", "content b1"),
+            tool_result("b2", "content b2"),
+        ];
+
+        let kept = forget_old_turns(&body, 1);
+        assert_eq!(kept.len(), 3, "expected turn 2 (assistant + 2 results)");
+        // Verify the assistant message's tool_call ids match the surviving tool_results.
+        let ids: Vec<&str> = match &kept[0] {
+            Message::Assistant { tool_calls, .. } => {
+                tool_calls.iter().map(|t| t.id.as_str()).collect()
+            }
+            _ => panic!("expected Assistant"),
+        };
+        assert_eq!(ids, vec!["b1", "b2"]);
+        for (i, expected) in ["b1", "b2"].iter().enumerate() {
+            match &kept[1 + i] {
+                Message::ToolResult { tool_call_id, .. } => assert_eq!(tool_call_id, expected),
+                _ => panic!("expected ToolResult"),
+            }
+        }
+    }
+
+    #[test]
+    fn forget_after_turns_drops_orphan_user_messages() {
+        // Conversational shape: User → Turn → User → Turn → User → Turn.
+        // forget with keep=1 should drop the first two User messages (old)
+        // but keep the third (which prompted the surviving turn).
+        let body: Vec<Message> = vec![
+            Message::User("old1".to_string()),
+            assistant(Some("a1"), vec![tc("a", "x", "{}")]),
+            tool_result("a", "ra"),
+            Message::User("old2".to_string()),
+            assistant(Some("a2"), vec![tc("b", "x", "{}")]),
+            tool_result("b", "rb"),
+            Message::User("current".to_string()),
+            assistant(Some("a3"), vec![tc("c", "x", "{}")]),
+            tool_result("c", "rc"),
+        ];
+
+        let kept = forget_old_turns(&body, 1);
+        // Expect: User("current"), Assistant a3, ToolResult c
+        assert_eq!(kept.len(), 3);
+        assert!(matches!(&kept[0], Message::User(s) if s == "current"));
+        assert!(matches!(&kept[1], Message::Assistant { content, .. } if content.as_deref() == Some("a3")));
+        assert!(matches!(&kept[2], Message::ToolResult { tool_call_id, .. } if tool_call_id == "c"));
+    }
+
+    #[test]
+    fn forget_after_turns_noop_when_below_threshold() {
+        let body: Vec<Message> = vec![
+            assistant(Some("only"), vec![tc("a", "x", "{}")]),
+            tool_result("a", "result"),
+        ];
+
+        let kept = forget_old_turns(&body, 10);
+        assert_eq!(kept.len(), body.len());
+    }
+
+    #[test]
+    fn forget_after_turns_zero_drops_everything() {
+        let body: Vec<Message> = vec![
+            assistant(Some("t1"), vec![tc("a", "x", "{}")]),
+            tool_result("a", "r"),
+            assistant(Some("t2"), vec![tc("b", "x", "{}")]),
+            tool_result("b", "r"),
+        ];
+
+        let kept = forget_old_turns(&body, 0);
+        assert!(kept.is_empty());
     }
 
     #[test]
