@@ -256,6 +256,7 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
                             approval_channel,
                             approval_timeout,
                             context_config,
+                            is_resume,
                         )
                         .await
                     }));
@@ -280,6 +281,7 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
                             &project_root,
                             approval_channel,
                             approval_timeout,
+                            is_resume,
                         )
                         .await
                     }));
@@ -435,6 +437,12 @@ async fn run_agent_step(
     approval_channel: Option<String>,
     approval_timeout: std::time::Duration,
     context_config: ContextConfig,
+    // `true` when this step is being re-executed inside a `zymi resume`
+    // fork (i.e. the parent's `ResumeContext` is in effect). Tools marked
+    // `no_resume: true` in the catalog are shadowed in this mode: the
+    // tool body is not invoked, the orchestrator is skipped, and a
+    // synthetic `ToolCallCompleted{replayed: true}` is emitted instead.
+    is_resume_reexec: bool,
 ) -> Result<StepResult, String> {
     let max_iterations = agent.max_iterations.unwrap_or(default_max_iterations);
     let tool_defs = tool_catalog.definitions_for_agent(&agent.tools);
@@ -597,46 +605,65 @@ async fn run_agent_step(
                     )
                     .await;
 
-                    let intention = tool_catalog.intention(&tc.name, &tc.arguments);
-                    let verdict = orchestrator
-                        .process_intention(
-                            &intention,
-                            stream_id,
-                            correlation_id,
-                            crate::esaa::orchestrator::ApprovalContext {
-                                channel: approval_channel.as_deref(),
-                                timeout: approval_timeout,
-                            },
-                        )
-                        .await;
-
-                    let tool_result = match verdict {
-                        OrchestratorResult::Approved => {
-                            let ctx = ActionContext {
-                                project_root,
-                                memory,
+                    // Shadow side-effects on `zymi resume` re-execution:
+                    // skip the orchestrator (no approvals fired) and the
+                    // action executor entirely, return a synthetic
+                    // placeholder so the LLM's next turn still sees a
+                    // well-formed (tool_use → tool_result) pairing.
+                    let shadow = is_resume_reexec && tool_catalog.no_resume(&tc.name);
+                    let (tool_result, is_error) = if shadow {
+                        let payload = serde_json::json!({
+                            "ok": true,
+                            "replayed": true,
+                            "note": format!(
+                                "side-effect skipped during resume — tool '{}' is marked no_resume",
+                                tc.name
+                            ),
+                        });
+                        (payload.to_string(), false)
+                    } else {
+                        let intention = tool_catalog.intention(&tc.name, &tc.arguments);
+                        let verdict = orchestrator
+                            .process_intention(
+                                &intention,
                                 stream_id,
                                 correlation_id,
-                            };
-                            match action_executor.execute(&tc.name, &tc.arguments, &ctx).await {
-                                Ok(output) => output,
-                                Err(e) => format!("[tool error] {e}"),
+                                crate::esaa::orchestrator::ApprovalContext {
+                                    channel: approval_channel.as_deref(),
+                                    timeout: approval_timeout,
+                                },
+                            )
+                            .await;
+
+                        let result = match verdict {
+                            OrchestratorResult::Approved => {
+                                let ctx = ActionContext {
+                                    project_root,
+                                    memory,
+                                    stream_id,
+                                    correlation_id,
+                                };
+                                match action_executor.execute(&tc.name, &tc.arguments, &ctx).await {
+                                    Ok(output) => output,
+                                    Err(e) => format!("[tool error] {e}"),
+                                }
                             }
-                        }
-                        OrchestratorResult::Denied { reason } => {
-                            format!("[denied by policy] {reason}")
-                        }
-                        OrchestratorResult::HumanRejected => "[rejected by human]".to_string(),
-                        OrchestratorResult::NoApprovalHandler => {
-                            "[requires approval but no approval handler configured]".to_string()
-                        }
+                            OrchestratorResult::Denied { reason } => {
+                                format!("[denied by policy] {reason}")
+                            }
+                            OrchestratorResult::HumanRejected => "[rejected by human]".to_string(),
+                            OrchestratorResult::NoApprovalHandler => {
+                                "[requires approval but no approval handler configured]".to_string()
+                            }
+                        };
+                        let err = result.starts_with("[tool error]")
+                            || result.starts_with("[denied")
+                            || result.starts_with("[rejected")
+                            || result.starts_with("[requires approval");
+                        (result, err)
                     };
 
                     let duration_ms = start.elapsed().as_millis() as u64;
-                    let is_error = tool_result.starts_with("[tool error]")
-                        || tool_result.starts_with("[denied")
-                        || tool_result.starts_with("[rejected")
-                        || tool_result.starts_with("[requires approval");
 
                     // Enriched event: stores full tool result (ADR-0016 §1a).
                     // The next build() reads it back as a ToolResult message.
@@ -650,6 +677,7 @@ async fn run_agent_step(
                             result_preview: truncate(&tool_result, 200).to_string(),
                             is_error,
                             duration_ms,
+                            replayed: shadow,
                         },
                     )
                     .await;
@@ -683,6 +711,11 @@ async fn run_tool_step(
     project_root: &std::path::Path,
     approval_channel: Option<String>,
     approval_timeout: std::time::Duration,
+    // See `run_agent_step::is_resume_reexec`. When a deterministic tool
+    // step's tool is marked `no_resume`, the tool body is skipped and a
+    // `ToolCallCompleted{replayed: true}` placeholder is recorded so
+    // downstream steps that read this step's output get a stable shape.
+    is_resume_reexec: bool,
 ) -> Result<StepResult, String> {
     let bus_ref: &EventBus = &bus;
     let step_stream_id = format!("{stream_id}:step:{step_id}");
@@ -714,45 +747,60 @@ async fn run_tool_step(
     )
     .await;
 
-    let intention = tool_catalog.intention(tool_name, &args_json);
-    let verdict = orchestrator
-        .process_intention(
-            &intention,
-            stream_id,
-            correlation_id,
-            ApprovalContext {
-                channel: approval_channel.as_deref(),
-                timeout: approval_timeout,
-            },
-        )
-        .await;
+    let shadow = is_resume_reexec && tool_catalog.no_resume(tool_name);
 
     let start = Instant::now();
-    let tool_result = match verdict {
-        OrchestratorResult::Approved => {
-            let ctx = ActionContext {
-                project_root,
-                memory,
+    let (tool_result, is_error) = if shadow {
+        let payload = serde_json::json!({
+            "ok": true,
+            "replayed": true,
+            "note": format!(
+                "side-effect skipped during resume — tool '{}' is marked no_resume",
+                tool_name
+            ),
+        });
+        (payload.to_string(), false)
+    } else {
+        let intention = tool_catalog.intention(tool_name, &args_json);
+        let verdict = orchestrator
+            .process_intention(
+                &intention,
                 stream_id,
                 correlation_id,
-            };
-            match action_executor.execute(tool_name, &args_json, &ctx).await {
-                Ok(out) => out,
-                Err(e) => format!("[tool error] {e}"),
+                ApprovalContext {
+                    channel: approval_channel.as_deref(),
+                    timeout: approval_timeout,
+                },
+            )
+            .await;
+
+        let result = match verdict {
+            OrchestratorResult::Approved => {
+                let ctx = ActionContext {
+                    project_root,
+                    memory,
+                    stream_id,
+                    correlation_id,
+                };
+                match action_executor.execute(tool_name, &args_json, &ctx).await {
+                    Ok(out) => out,
+                    Err(e) => format!("[tool error] {e}"),
+                }
             }
-        }
-        OrchestratorResult::Denied { reason } => format!("[denied by policy] {reason}"),
-        OrchestratorResult::HumanRejected => "[rejected by human]".to_string(),
-        OrchestratorResult::NoApprovalHandler => {
-            "[requires approval but no approval handler configured]".to_string()
-        }
+            OrchestratorResult::Denied { reason } => format!("[denied by policy] {reason}"),
+            OrchestratorResult::HumanRejected => "[rejected by human]".to_string(),
+            OrchestratorResult::NoApprovalHandler => {
+                "[requires approval but no approval handler configured]".to_string()
+            }
+        };
+        let err = result.starts_with("[tool error]")
+            || result.starts_with("[denied")
+            || result.starts_with("[rejected")
+            || result.starts_with("[requires approval");
+        (result, err)
     };
 
     let duration_ms = start.elapsed().as_millis() as u64;
-    let is_error = tool_result.starts_with("[tool error]")
-        || tool_result.starts_with("[denied")
-        || tool_result.starts_with("[rejected")
-        || tool_result.starts_with("[requires approval");
 
     emit_event(
         bus_ref,
@@ -764,6 +812,7 @@ async fn run_tool_step(
             result_preview: truncate(&tool_result, 200).to_string(),
             is_error,
             duration_ms,
+            replayed: shadow,
         },
     )
     .await;

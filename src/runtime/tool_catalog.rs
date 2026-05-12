@@ -28,6 +28,11 @@ struct BuiltinEntry {
     /// Build an [`Intention`] from raw JSON arguments.
     to_intention: fn(&str) -> Intention,
     requires_approval: bool,
+    /// See `ToolCatalog::no_resume`. None of the built-ins are
+    /// side-effects to the outside world (shell / file-write live inside
+    /// the project root and are bounded by `contracts:`), so this is
+    /// hard-coded `false` for every built-in.
+    no_resume: bool,
 }
 
 impl std::fmt::Debug for BuiltinEntry {
@@ -35,6 +40,7 @@ impl std::fmt::Debug for BuiltinEntry {
         f.debug_struct("BuiltinEntry")
             .field("definition", &self.definition.name)
             .field("requires_approval", &self.requires_approval)
+            .field("no_resume", &self.no_resume)
             .finish()
     }
 }
@@ -53,6 +59,7 @@ pub(crate) struct McpEntry {
     pub(crate) server: String,
     pub(crate) tool: String,
     pub(crate) requires_approval: bool,
+    pub(crate) no_resume: bool,
 }
 
 /// Entry for an auto-discovered Python tool (ADR-0014 slice 3). Lives
@@ -65,6 +72,7 @@ pub(crate) struct PythonEntry {
     pub(crate) callable: pyo3::Py<pyo3::PyAny>,
     pub(crate) is_async: bool,
     pub(crate) requires_approval: bool,
+    pub(crate) no_resume: bool,
     pub(crate) source: std::path::PathBuf,
 }
 
@@ -75,6 +83,7 @@ impl std::fmt::Debug for PythonEntry {
             .field("name", &self.definition.name)
             .field("is_async", &self.is_async)
             .field("requires_approval", &self.requires_approval)
+            .field("no_resume", &self.no_resume)
             .field("source", &self.source)
             .finish()
     }
@@ -245,11 +254,14 @@ impl ToolCatalog {
     /// reserved `__` separator, or if a generated id collides with an
     /// existing entry. `requires_approval` becomes the default for every
     /// tool from this server (per-server policy lives one layer up).
+    /// `no_resume_tools` lists short tool names from this server that have
+    /// irreversible side-effects and must be shadowed on `zymi resume`.
     pub fn add_mcp_server(
         &mut self,
         server: &str,
         tools: &[McpTool],
         requires_approval: bool,
+        no_resume_tools: &std::collections::HashSet<String>,
     ) -> Result<(), String> {
         mcp::validate_segment(server).map_err(|e| format!("mcp server name: {e}"))?;
         for tool in tools {
@@ -278,6 +290,7 @@ impl ToolCatalog {
                     server: server.to_string(),
                     tool: tool.name.clone(),
                     requires_approval,
+                    no_resume: no_resume_tools.contains(&tool.name),
                 },
             );
         }
@@ -311,6 +324,7 @@ impl ToolCatalog {
                 parameters: tool.parameters.clone(),
             };
             let requires_approval = tool.requires_approval.unwrap_or(default_requires_approval);
+            let no_resume = tool.no_resume.unwrap_or(false);
             self.python.insert(
                 tool.name.clone(),
                 PythonEntry {
@@ -318,6 +332,7 @@ impl ToolCatalog {
                     callable: tool.callable,
                     is_async: tool.is_async,
                     requires_approval,
+                    no_resume,
                     source: tool.source,
                 },
             );
@@ -469,6 +484,31 @@ impl ToolCatalog {
         false
     }
 
+    /// Is this tool marked as having an irreversible side-effect that
+    /// must NOT be re-executed during `zymi resume`? On resume of a step
+    /// in the re-execute set, the dispatcher synthesises a placeholder
+    /// `ToolCallCompleted{replayed: true}` instead of invoking the tool
+    /// body. Has no effect on fresh runs.
+    ///
+    /// Unknown tool names return `false` so the regular "tool not found"
+    /// error path takes over.
+    pub fn no_resume(&self, name: &str) -> bool {
+        if let Some(entry) = self.builtin.get(name) {
+            return entry.no_resume;
+        }
+        if let Some(entry) = self.declarative.get(name) {
+            return entry.config.effective_no_resume();
+        }
+        if let Some(entry) = self.mcp.get(name) {
+            return entry.no_resume;
+        }
+        #[cfg(feature = "python")]
+        if let Some(entry) = self.python.get(name) {
+            return entry.no_resume;
+        }
+        false
+    }
+
     /// All known tool names (for error messages / help text).
     pub fn all_tool_names(&self) -> Vec<&str> {
         let mut names: Vec<&str> = self.builtin.keys().map(|s| s.as_str()).collect();
@@ -509,6 +549,7 @@ fn register_builtin(
             },
             to_intention,
             requires_approval,
+            no_resume: false,
         },
     );
 }
@@ -524,6 +565,7 @@ mod tests {
             description: format!("Test tool {name}"),
             parameters: serde_json::json!({"type": "object", "properties": {}}),
             requires_approval: None,
+            no_resume: None,
             implementation: ImplementationConfig::Http {
                 method: HttpMethod::Post,
                 url: "https://example.com".into(),
@@ -687,6 +729,7 @@ mod tests {
                 "required": ["dir"]
             }),
             requires_approval: None,
+            no_resume: None,
             implementation: ImplementationConfig::Shell {
                 command_template: command_template.to_string(),
                 timeout_secs: Some(60),
@@ -758,7 +801,12 @@ mod tests {
     fn mcp_server_tools_register_with_namespaced_id() {
         let mut catalog = ToolCatalog::builtin_only();
         catalog
-            .add_mcp_server("github", &[mcp_tool("create_issue"), mcp_tool("list_repos")], false)
+            .add_mcp_server(
+                "github",
+                &[mcp_tool("create_issue"), mcp_tool("list_repos")],
+                false,
+                &std::collections::HashSet::new(),
+            )
             .unwrap();
 
         assert!(catalog.knows("mcp__github__create_issue"));
@@ -775,7 +823,7 @@ mod tests {
     fn mcp_route_returns_server_and_original_tool_name() {
         let mut catalog = ToolCatalog::builtin_only();
         catalog
-            .add_mcp_server("postgres", &[mcp_tool("query")], false)
+            .add_mcp_server("postgres", &[mcp_tool("query")], false, &std::collections::HashSet::new())
             .unwrap();
 
         let (server, tool) = catalog.mcp_route("mcp__postgres__query").unwrap();
@@ -787,7 +835,7 @@ mod tests {
     #[test]
     fn mcp_definitions_for_agent_include_full_id() {
         let mut catalog = ToolCatalog::builtin_only();
-        catalog.add_mcp_server("gh", &[mcp_tool("issue")], false).unwrap();
+        catalog.add_mcp_server("gh", &[mcp_tool("issue")], false, &std::collections::HashSet::new()).unwrap();
 
         let defs = catalog.definitions_for_agent(&["mcp__gh__issue".into()]);
         assert_eq!(defs.len(), 1);
@@ -797,7 +845,7 @@ mod tests {
     #[test]
     fn mcp_intention_routes_through_call_custom_with_full_id() {
         let mut catalog = ToolCatalog::builtin_only();
-        catalog.add_mcp_server("gh", &[mcp_tool("issue")], false).unwrap();
+        catalog.add_mcp_server("gh", &[mcp_tool("issue")], false, &std::collections::HashSet::new()).unwrap();
 
         let intention = catalog.intention("mcp__gh__issue", r#"{"title":"x"}"#);
         match intention {
@@ -812,8 +860,8 @@ mod tests {
     #[test]
     fn mcp_requires_approval_uses_per_server_default() {
         let mut catalog = ToolCatalog::builtin_only();
-        catalog.add_mcp_server("safe", &[mcp_tool("read")], false).unwrap();
-        catalog.add_mcp_server("risky", &[mcp_tool("write")], true).unwrap();
+        catalog.add_mcp_server("safe", &[mcp_tool("read")], false, &std::collections::HashSet::new()).unwrap();
+        catalog.add_mcp_server("risky", &[mcp_tool("write")], true, &std::collections::HashSet::new()).unwrap();
 
         assert!(!catalog.requires_approval("mcp__safe__read"));
         assert!(catalog.requires_approval("mcp__risky__write"));
@@ -823,12 +871,12 @@ mod tests {
     fn mcp_double_underscore_in_segment_rejected() {
         let mut catalog = ToolCatalog::builtin_only();
         let err = catalog
-            .add_mcp_server("evil__server", &[mcp_tool("ok")], false)
+            .add_mcp_server("evil__server", &[mcp_tool("ok")], false, &std::collections::HashSet::new())
             .unwrap_err();
         assert!(err.contains("__"), "got: {err}");
 
         let err = catalog
-            .add_mcp_server("ok", &[mcp_tool("nested__name")], false)
+            .add_mcp_server("ok", &[mcp_tool("nested__name")], false, &std::collections::HashSet::new())
             .unwrap_err();
         assert!(err.contains("__"), "got: {err}");
     }
@@ -836,9 +884,9 @@ mod tests {
     #[test]
     fn mcp_id_collision_is_rejected() {
         let mut catalog = ToolCatalog::builtin_only();
-        catalog.add_mcp_server("gh", &[mcp_tool("issue")], false).unwrap();
+        catalog.add_mcp_server("gh", &[mcp_tool("issue")], false, &std::collections::HashSet::new()).unwrap();
         let err = catalog
-            .add_mcp_server("gh", &[mcp_tool("issue")], false)
+            .add_mcp_server("gh", &[mcp_tool("issue")], false, &std::collections::HashSet::new())
             .unwrap_err();
         assert!(err.contains("collides"), "got: {err}");
     }
@@ -851,7 +899,7 @@ mod tests {
             description: None,
             input_schema: serde_json::Value::Null,
         };
-        catalog.add_mcp_server("svc", &[tool], false).unwrap();
+        catalog.add_mcp_server("svc", &[tool], false, &std::collections::HashSet::new()).unwrap();
 
         let def = catalog.definition("mcp__svc__ping").unwrap();
         assert_eq!(def.parameters["type"], "object");

@@ -476,6 +476,7 @@ mod tests {
                 result_preview: "search results".into(),
                 is_error: false,
                 duration_ms: 250,
+                replayed: false,
             },
             Some(corr),
         );
@@ -626,6 +627,7 @@ mod tests {
                 result_preview: "ok".into(),
                 is_error: false,
                 duration_ms: 120,
+                replayed: false,
             },
             Some(corr),
         );

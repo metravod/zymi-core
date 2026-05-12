@@ -655,6 +655,7 @@ mod tests {
                 result_preview: "fn main() { println…".into(),
                 is_error: false,
                 duration_ms: 10,
+                            replayed: false,
             },
         )
         .await;
@@ -720,6 +721,7 @@ mod tests {
                 result_preview: "ok".into(),
                 is_error: false,
                 duration_ms: 5,
+                            replayed: false,
             },
         )
         .await;
@@ -787,6 +789,7 @@ mod tests {
                     result_preview: "x".repeat(200),
                     is_error: false,
                     duration_ms: 10,
+                                    replayed: false,
                 },
             )
             .await;
@@ -865,6 +868,7 @@ mod tests {
                     result_preview: format!("content of {id}"),
                     is_error: false,
                     duration_ms: 5,
+                                    replayed: false,
                 },
             )
             .await;
@@ -979,6 +983,7 @@ mod tests {
                     result_preview: format!("result-{i}"),
                     is_error: false,
                     duration_ms: 5,
+                                    replayed: false,
                 },
             )
             .await;
@@ -1052,6 +1057,7 @@ mod tests {
                     result_preview: format!("r{i}"),
                     is_error: false,
                     duration_ms: 1,
+                                    replayed: false,
                 },
             )
             .await;
@@ -1117,6 +1123,7 @@ mod tests {
                 result_preview: "ok".into(),
                 is_error: false,
                 duration_ms: 1,
+                            replayed: false,
             },
         )
         .await;
@@ -1169,6 +1176,7 @@ mod tests {
                 result_preview: "x".repeat(100),
                 is_error: false,
                 duration_ms: 1,
+                            replayed: false,
             },
         )
         .await;
@@ -1285,6 +1293,7 @@ mod tests {
                     result_preview: "x".repeat(result_size.min(200)),
                     is_error: false,
                     duration_ms: 5,
+                                    replayed: false,
                 },
             )
             .await;

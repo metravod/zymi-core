@@ -605,9 +605,9 @@ impl RuntimeBuilder {
         //    behind the `python` feature).
         let mut catalog = ToolCatalog::with_declarative(&workspace.tools)
             .map_err(|e| format!("tool catalog error: {e}"))?;
-        for (server, (tools, requires_approval)) in &mcp_state.tools_by_server {
+        for (server, (tools, requires_approval, no_resume_tools)) in &mcp_state.tools_by_server {
             catalog
-                .add_mcp_server(server, tools, *requires_approval)
+                .add_mcp_server(server, tools, *requires_approval, no_resume_tools)
                 .map_err(|e| format!("mcp catalog error: {e}"))?;
         }
         #[cfg(feature = "python")]
@@ -692,7 +692,8 @@ impl RuntimeBuilder {
 #[derive(Debug, Default)]
 struct McpStartState {
     registry: Option<Arc<McpRegistry>>,
-    tools_by_server: HashMap<String, (Vec<McpTool>, bool)>,
+    /// (tools, requires_approval, no_resume_short_names)
+    tools_by_server: HashMap<String, (Vec<McpTool>, bool, std::collections::HashSet<String>)>,
 }
 
 /// MCP shutdown grace. Kept local to the runtime: per-server handshake and
@@ -764,7 +765,10 @@ async fn spawn_mcp_servers(
     }
 
     let mut registry = McpRegistry::new().with_bus(bus);
-    let mut tools_by_server: HashMap<String, (Vec<McpTool>, bool)> = HashMap::new();
+    let mut tools_by_server: HashMap<
+        String,
+        (Vec<McpTool>, bool, std::collections::HashSet<String>),
+    > = HashMap::new();
     let mut failures: Vec<FailedServer> = Vec::new();
 
     for cfg in specs {
@@ -826,9 +830,14 @@ async fn spawn_mcp_servers(
             None => registry.insert(cfg.name.clone(), conn),
         }
 
+        let no_resume_set: std::collections::HashSet<String> = cfg
+            .no_resume
+            .as_deref()
+            .map(|names| names.iter().cloned().collect())
+            .unwrap_or_default();
         tools_by_server.insert(
             cfg.name.clone(),
-            (filtered, cfg.requires_approval.unwrap_or(false)),
+            (filtered, cfg.requires_approval.unwrap_or(false), no_resume_set),
         );
     }
 
@@ -982,6 +991,7 @@ mod mcp_tests {
             allow: None,
             deny: None,
             requires_approval: None,
+            no_resume: None,
             init_timeout_secs: Some(1),
             call_timeout_secs: Some(1),
             restart: None,

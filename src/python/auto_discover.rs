@@ -40,6 +40,13 @@ pub struct DiscoveredTool {
     /// Optional override set via `@tool(requires_approval=True)`.
     /// `None` means "follow the project default".
     pub requires_approval: Option<bool>,
+    /// Set via `@tool(no_resume=True)` for tools with irreversible
+    /// side-effects (e.g. sending email). When the agent is running
+    /// under a `ResumeContext` and re-executes a step containing this
+    /// tool, the body is **not** invoked; the dispatcher synthesises a
+    /// placeholder result and emits `ToolCallCompleted{replayed:true}`.
+    /// `None` means "no side-effect" (default).
+    pub no_resume: Option<bool>,
     /// Source file path, kept for diagnostics.
     pub source: PathBuf,
 }
@@ -51,6 +58,7 @@ impl std::fmt::Debug for DiscoveredTool {
             .field("is_async", &self.is_async)
             .field("intention", &self.intention)
             .field("requires_approval", &self.requires_approval)
+            .field("no_resume", &self.no_resume)
             .field("source", &self.source)
             .finish()
     }
@@ -165,6 +173,7 @@ fn build_discovered(
     let desc_override: Option<String> = optional_string(bound, "_zymi_tool_description")?;
     let intention: Option<String> = optional_string(bound, "_zymi_tool_intention")?;
     let requires_approval: Option<bool> = optional_bool(bound, "_zymi_tool_requires_approval")?;
+    let no_resume: Option<bool> = optional_bool(bound, "_zymi_tool_no_resume")?;
 
     let name = name_override.unwrap_or(inferred_name);
     if name != attr_name {
@@ -187,6 +196,7 @@ fn build_discovered(
         is_async,
         intention,
         requires_approval,
+        no_resume,
         source: source.to_path_buf(),
     })
 }

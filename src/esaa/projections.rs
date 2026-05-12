@@ -261,6 +261,7 @@ mod tests {
                 result_preview: "ok".into(),
                 is_error: false,
                 duration_ms: 42,
+                replayed: false,
             },
         ));
 
@@ -272,6 +273,7 @@ mod tests {
                 result_preview: "Tool error: fail".into(),
                 is_error: true,
                 duration_ms: 10,
+                replayed: false,
             },
         ));
 

@@ -52,7 +52,7 @@ pub fn exec(
             fork_at_step: fork_step.to_string(),
         };
         let plan =
-            rt.block_on(resume_pipeline::plan_with(store.as_ref(), &workspace, &cmd))?;
+            rt.block_on(resume_pipeline::plan_with(store.as_ref(), &workspace, None, &cmd))?;
         print_plan(&plan, true);
         return Ok(());
     }
@@ -135,6 +135,21 @@ fn print_plan(plan: &resume_pipeline::ResumePlan, dry_run: bool) {
         plan.re_executed_in_dag_order.len(),
         plan.re_executed_in_dag_order.join(", "),
     );
+    if !plan.shadowed_tools.is_empty() {
+        println!(
+            "  {YELLOW}shadowed on resume ({}):{RESET} no_resume tools in re-execute set —",
+            plan.shadowed_tools.len(),
+        );
+        for w in &plan.shadowed_tools {
+            println!(
+                "    {DIM}·{RESET} {} → {YELLOW}{}{RESET}",
+                w.step_id, w.tool,
+            );
+        }
+        println!(
+            "  {DIM}↳ bodies will NOT run; a synthetic placeholder is recorded with replayed:true{RESET}"
+        );
+    }
     if !dry_run {
         println!();
     }

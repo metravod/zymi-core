@@ -727,6 +727,7 @@ mod tests {
                     input_schema: serde_json::json!({"type": "object"}),
                 }],
                 false,
+                &std::collections::HashSet::new(),
             )
             .unwrap();
 
@@ -768,6 +769,7 @@ mod tests {
                     input_schema: serde_json::json!({}),
                 }],
                 false,
+                &std::collections::HashSet::new(),
             )
             .unwrap();
 
@@ -803,6 +805,7 @@ mod tests {
                     input_schema: serde_json::json!({}),
                 }],
                 false,
+                &std::collections::HashSet::new(),
             )
             .unwrap();
 

@@ -24,6 +24,7 @@ def tool(
     description=None,
     intention=None,
     requires_approval=None,
+    no_resume=None,
 ):
     """Mark a function as a zymi tool for auto-discovery.
 
@@ -46,6 +47,11 @@ def tool(
             \"\"\"Search the web with deep retrieval.\"\"\"
             ...
 
+        @tool(no_resume=True)
+        def send_email(to: str, body: str) -> str:
+            \"\"\"Send an email — irreversible side-effect.\"\"\"
+            ...
+
     The decorator is a marker only — it sets ``_zymi_tool`` and a
     handful of optional ``_zymi_tool_*`` attributes on the function and
     returns the function unchanged. The Rust loader walks the imported
@@ -60,6 +66,12 @@ def tool(
             ``CallCustomTool`` when unset.
         requires_approval: Force human-approval gating regardless of the
             project's defaults. Useful for shell-equivalent power tools.
+        no_resume: Mark this tool as having an irreversible side-effect
+            (e.g. sending an email, charging a card). On ``zymi resume``
+            the tool's body is **not** executed for calls inside the
+            re-executed step set; instead a synthetic placeholder result
+            is returned and the resulting ``ToolCallCompleted`` event
+            carries ``replayed: true``. Has no effect on fresh runs.
     """
 
     def _wrap(f):
@@ -72,6 +84,8 @@ def tool(
             f._zymi_tool_intention = intention
         if requires_approval is not None:
             f._zymi_tool_requires_approval = bool(requires_approval)
+        if no_resume is not None:
+            f._zymi_tool_no_resume = bool(no_resume)
         return f
 
     if func is None:

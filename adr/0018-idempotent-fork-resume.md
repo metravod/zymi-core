@@ -124,3 +124,38 @@ History-only, no state effect on any projection.
 - **Resume from a `Failed` parent run is supported** — only `success=true` for *frozen* steps is required; the failed step itself is in the re-executed set and runs again with current configs.
 - **TUI integration shipped (Shift+R in `zymi observe`).** Same code path as the CLI — the TUI dispatches `resume_pipeline::handle` with the focused graph node as `fork_at_step`. Approval is fail-closed inside the TUI by design.
 - **Resume of a resume works for free.** A forked run is just another stream with `PipelineRequested` and `WorkflowNodeCompleted` events; the algorithm has no special case for it. The `ResumeForked` marker chain is informational only.
+
+## Addendum (2026-05): shadowing `no_resume` tools
+
+Step-granular freeze (above) protects upstream side-effects: tools that ran *before* the fork point are not re-executed because their step's events are copied verbatim. It does **not** protect side-effects inside the re-execute set — if `writer` calls `send_email` and you fork at `writer`, the second email goes out.
+
+To plug this without abandoning the step-granular design (which exists for the turn-pairing reasons above), tools can be marked `no_resume: true`:
+
+- Python: `@tool(no_resume=True)` (see `zymi/__init__.py`).
+- Declarative YAML: `no_resume: true` on a `tools/*.yml` entry.
+- MCP: per-server `no_resume: [tool_short_name, …]` list on the `mcp_servers:` entry in `project.yml`. MCP protocol does not expose this; it's a project-level declaration.
+- Built-ins: hard-coded `false` (none touch the outside world; shell/file-write live inside the project root and are bounded by `contracts:`).
+
+At dispatch time, when `is_resume_reexec` is true (i.e. `ResumeContext` is in effect) **and** `ToolCatalog::no_resume(name)` returns true, both `run_agent_step` and `run_tool_step` skip the orchestrator and the action executor entirely. They synthesise a placeholder JSON result:
+
+```json
+{"ok": true, "replayed": true, "note": "side-effect skipped during resume — tool '<name>' is marked no_resume"}
+```
+
+and emit `ToolCallCompleted { …, replayed: true }`. The agent's next LLM turn sees a well-formed `tool_use → tool_result` pair (no per-tool dedup mid-turn — the original reason for choosing step-granularity), but **no real-world effect** occurs.
+
+### Why not per-tool replay from parent
+
+Considered: when the re-executed step's LLM emits a `send_email` tool call, find the matching `ToolCallCompleted` in the parent stream by `(tool_name, args)` and replay its result. Rejected because the LLM is non-deterministic — after a prompt edit the regenerated args will rarely match byte-for-byte, leading to constant fail-loud aborts and a frustrating UX. A synthetic placeholder is honest: the agent sees `replayed: true` and can be instructed to acknowledge the side-effect skip rather than pretending the parent's result is still valid.
+
+### Plan-time surfacing
+
+`ResumePlan` gained `shadowed_tools: Vec<ShadowedToolWarning>` (one entry per `(step_id, tool_name)` pair). The CLI `zymi resume` (and `--dry-run`) prints a `shadowed on resume (N):` section listing each pair before execution. The sync `plan_with` path (used by `--dry-run` before the LLM is configured) does the lookup against `workspace.tools` only — Python and MCP tools surface only via `plan()` which has the full catalog. TUI Shift+R popup currently does **not** surface this warning; v2.
+
+### Event field
+
+`EventKind::ToolCallCompleted` gained `replayed: bool` (with `#[serde(default)]` so pre-feature events on disk roundtrip unchanged).
+
+### Smoke test
+
+`handlers::resume_pipeline::tests::resume_shadows_no_resume_tools_in_re_execute_set` covers the end-to-end path: pipeline with a deterministic-tool step calling `send_email` (declarative, `no_resume: true`), counting `ActionExecutor` to prove the body isn't invoked, and an assertion on the recorded `ToolCallCompleted{replayed: true}` in the new send sub-stream.

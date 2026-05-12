@@ -684,6 +684,7 @@ mod tests {
                 result_preview: "ok".into(),
                 is_error: false,
                 duration_ms: 10,
+                replayed: false,
             },
         );
         let mut e3 = make_event(

@@ -13,11 +13,12 @@ use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 use crate::commands::{ResumeContext, RunPipeline};
+use crate::config::pipeline::PipelineStepKind;
 use crate::config::{build_execution_plan, PipelineConfig, WorkspaceConfig};
 use crate::events::store::EventStore;
 use crate::events::{Event, EventKind};
 use crate::handlers::run_pipeline::{self, PipelineResult};
-use crate::runtime::Runtime;
+use crate::runtime::{Runtime, ToolCatalog};
 use crate::types::Message;
 
 /// Request to fork-resume a pipeline run.
@@ -52,20 +53,40 @@ pub struct ResumePlan {
     pub frozen_in_dag_order: Vec<String>,
     /// Steps that will re-execute against current configs, in DAG order.
     pub re_executed_in_dag_order: Vec<String>,
+    /// Tools in the re-execute set that are marked `no_resume: true` and
+    /// will be shadowed (body skipped, placeholder result). One entry per
+    /// `(step_id, tool_name)` pair. Best-effort over what the planner can
+    /// see — when `plan_with` is called without a tool catalog (sync
+    /// `--dry-run`), Python and MCP tools are not included.
+    pub shadowed_tools: Vec<ShadowedToolWarning>,
+}
+
+/// One row in `ResumePlan::shadowed_tools` — a tool inside a re-executed
+/// step that will be shadowed on resume.
+#[derive(Debug, Clone)]
+pub struct ShadowedToolWarning {
+    pub step_id: String,
+    pub tool: String,
 }
 
 /// Compute (and validate) the resume plan. Read-only over the store; does
 /// not need a full [`Runtime`] (so `--dry-run` can run before LLM config
 /// even exists).
 pub async fn plan(rt: &Runtime, cmd: &ResumePipeline) -> Result<ResumePlan, String> {
-    plan_with(rt.store().as_ref(), rt.workspace(), cmd).await
+    plan_with(rt.store().as_ref(), rt.workspace(), Some(rt.tool_catalog()), cmd).await
 }
 
 /// Plan variant for callers that have the store + workspace but not a
 /// fully-built [`Runtime`] (e.g. CLI `--dry-run` before LLM is configured).
+///
+/// `tool_catalog` is optional: when provided, the planner consults it to
+/// flag `no_resume` Python and MCP tools in the re-execute set. When
+/// `None` (sync `--dry-run` paths), only declarative `tools/*.yml` tools
+/// are inspected.
 pub async fn plan_with(
     store: &dyn EventStore,
     workspace: &WorkspaceConfig,
+    tool_catalog: Option<&ToolCatalog>,
     cmd: &ResumePipeline,
 ) -> Result<ResumePlan, String> {
     let parent_top = store
@@ -194,6 +215,9 @@ pub async fn plan_with(
         .cloned()
         .collect();
 
+    let shadowed_tools =
+        collect_shadowed_tools(&pipeline, workspace, tool_catalog, &re_executed_in_dag_order);
+
     Ok(ResumePlan {
         pipeline_name,
         parent_stream_id: cmd.parent_stream_id.clone(),
@@ -202,7 +226,55 @@ pub async fn plan_with(
         inputs,
         frozen_in_dag_order,
         re_executed_in_dag_order,
+        shadowed_tools,
     })
+}
+
+/// Scan the re-execute set for tools marked `no_resume` and return one
+/// `ShadowedToolWarning` per (step, tool) pair. When `tool_catalog` is
+/// `Some`, it is the authoritative source (covers builtins / declarative
+/// / Python / MCP); otherwise we fall back to `workspace.tools` and only
+/// catch declarative `tools/*.yml` entries.
+fn collect_shadowed_tools(
+    pipeline: &PipelineConfig,
+    workspace: &WorkspaceConfig,
+    tool_catalog: Option<&ToolCatalog>,
+    re_executed_in_dag_order: &[String],
+) -> Vec<ShadowedToolWarning> {
+    let is_no_resume = |name: &str| -> bool {
+        if let Some(cat) = tool_catalog {
+            return cat.no_resume(name);
+        }
+        workspace
+            .tools
+            .get(name)
+            .map(|t| t.effective_no_resume())
+            .unwrap_or(false)
+    };
+
+    let mut out = Vec::new();
+    for step_id in re_executed_in_dag_order {
+        let Some(step) = pipeline.steps.iter().find(|s| &s.id == step_id) else {
+            continue;
+        };
+        let candidate_tools: Vec<&str> = match &step.kind {
+            PipelineStepKind::Tool { tool, .. } => vec![tool.as_str()],
+            PipelineStepKind::Agent { agent, .. } => workspace
+                .agents
+                .get(agent)
+                .map(|a| a.tools.iter().map(|s| s.as_str()).collect())
+                .unwrap_or_default(),
+        };
+        for tool in candidate_tools {
+            if is_no_resume(tool) {
+                out.push(ShadowedToolWarning {
+                    step_id: step_id.clone(),
+                    tool: tool.to_string(),
+                });
+            }
+        }
+    }
+    out
 }
 
 /// Execute a [`ResumePipeline`] command against the given runtime.
@@ -784,6 +856,174 @@ mod tests {
         assert!(new_top
             .iter()
             .any(|e| matches!(&e.kind, EventKind::PipelineCompleted { .. })));
+    }
+
+    /// `no_resume` tools in the re-execute set must be shadowed: their
+    /// body is not invoked and the recorded `ToolCallCompleted` carries
+    /// `replayed: true`. Cf. the doc-comment on `EventKind::ToolCallCompleted`.
+    #[tokio::test]
+    async fn resume_shadows_no_resume_tools_in_re_execute_set() {
+        use crate::config::tool::{HttpMethod, ImplementationConfig, ToolConfig};
+        use crate::runtime::action_executor::{ActionContext, ActionExecutor};
+        use std::collections::HashSet;
+
+        // Mock executor counts how many times `send_email` was actually
+        // dispatched. The shadow path must bypass it entirely.
+        #[derive(Debug, Default)]
+        struct CountingExecutor {
+            calls: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl ActionExecutor for CountingExecutor {
+            async fn execute(
+                &self,
+                tool_name: &str,
+                _arguments_json: &str,
+                _ctx: &ActionContext<'_>,
+            ) -> Result<String, String> {
+                if tool_name == "send_email" {
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    Ok("{\"sent\": true, \"message_id\": \"msg-1\"}".into())
+                } else {
+                    Err(format!("unexpected tool {tool_name}"))
+                }
+            }
+        }
+
+        let dir = TempDir::new().unwrap();
+        let store = open_store(StoreBackend::Sqlite {
+            path: dir.path().join("events.db"),
+        })
+        .unwrap();
+        let provider = Arc::new(CountingProvider::new("prepared"));
+        let executor = Arc::new(CountingExecutor::default());
+
+        // Workspace: `prep` agent + `send` deterministic tool step. The
+        // tool is declarative with `no_resume: true`.
+        let mut ws = make_workspace();
+        let mut send_tool_cfg = ToolConfig {
+            name: "send_email".into(),
+            description: "Send an email — irreversible side-effect".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "to": {"type": "string"},
+                    "body": {"type": "string"},
+                },
+                "required": ["to", "body"],
+            }),
+            requires_approval: Some(false),
+            no_resume: Some(true),
+            implementation: ImplementationConfig::Http {
+                method: HttpMethod::Post,
+                url: "http://mock.local/send".into(),
+                headers: Default::default(),
+                body_template: None,
+            },
+        };
+        // Borrow-checker pacifier: keep cfg movable.
+        send_tool_cfg.requires_approval = Some(false);
+        ws.tools.insert("send_email".into(), send_tool_cfg);
+
+        // Replace the pipeline with prep -> send (tool step).
+        let mut pipeline = pipe(&[("prep", &[]), ("send", &["prep"])]);
+        pipeline.name = "research".into();
+        for step in &mut pipeline.steps {
+            step.kind = match step.id.as_str() {
+                "prep" => PipelineStepKind::Agent {
+                    agent: "researcher".into(),
+                    task: "prepare".into(),
+                },
+                "send" => PipelineStepKind::Tool {
+                    tool: "send_email".into(),
+                    args: serde_yml::from_str(
+                        "to: user@example.com\nbody: \"${steps.prep.output}\"\n",
+                    )
+                    .unwrap(),
+                },
+                _ => unreachable!(),
+            };
+        }
+        ws.pipelines.insert("research".into(), pipeline);
+
+        let rt = Runtime::builder(ws, dir.path().to_path_buf())
+            .with_store(store.clone())
+            .with_llm_provider(provider.clone() as Arc<dyn LlmProvider>)
+            .with_action_executor(executor.clone() as Arc<dyn ActionExecutor>)
+            .build()
+            .unwrap();
+
+        // 1. Sanity: ResumePlan flags the shadowed tool when forking from
+        //    `send`. Doing this before `run_initial` to keep the assertion
+        //    independent of the actual execution.
+        let plan_only = plan(
+            &rt,
+            &ResumePipeline {
+                parent_stream_id: "irrelevant".into(),
+                fork_at_step: "send".into(),
+            },
+        )
+        .await;
+        // plan() fails because parent stream is missing — that's fine, we
+        // only wanted to confirm types compile. The dry-run path with a
+        // real parent is exercised below.
+        assert!(plan_only.is_err());
+
+        // 2. Initial run: send_email is dispatched once.
+        let parent_stream = run_initial(&rt).await.unwrap();
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+
+        // 3. Resume from `send`. Re-execute set = {send}; the tool is
+        //    marked no_resume so the body must NOT be invoked again.
+        let outcome = handle(
+            &rt,
+            ResumePipeline {
+                parent_stream_id: parent_stream.clone(),
+                fork_at_step: "send".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            executor.calls.load(Ordering::SeqCst),
+            1,
+            "no_resume tool body must be shadowed on resume — counter unchanged"
+        );
+
+        // 4. ResumePlan computed during handle() flagged the shadow.
+        let post_plan = plan(
+            &rt,
+            &ResumePipeline {
+                parent_stream_id: parent_stream.clone(),
+                fork_at_step: "send".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let shadow_set: HashSet<(String, String)> = post_plan
+            .shadowed_tools
+            .iter()
+            .map(|w| (w.step_id.clone(), w.tool.clone()))
+            .collect();
+        assert!(
+            shadow_set.contains(&("send".into(), "send_email".into())),
+            "ResumePlan should flag send→send_email as shadowed, got {shadow_set:?}"
+        );
+
+        // 5. The new stream's send sub-stream carries a
+        //    ToolCallCompleted{replayed:true} event.
+        let send_sub = format!("{}:step:send", outcome.new_stream_id);
+        let new_send_events = store.read_stream(&send_sub, 1).await.unwrap();
+        let replayed_completed = new_send_events
+            .iter()
+            .find(|e| matches!(&e.kind, EventKind::ToolCallCompleted { replayed: true, .. }));
+        assert!(
+            replayed_completed.is_some(),
+            "expected ToolCallCompleted with replayed=true in new send sub-stream, \
+             saw kinds: {:?}",
+            new_send_events.iter().map(|e| e.kind_tag()).collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]

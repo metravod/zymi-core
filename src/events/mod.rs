@@ -158,6 +158,13 @@ pub enum EventKind {
         result_preview: String,
         is_error: bool,
         duration_ms: u64,
+        /// `true` when this completion was synthesised during `zymi resume`
+        /// because the tool was marked `no_resume` (irreversible
+        /// side-effect). The tool body was NOT invoked; `result` is the
+        /// placeholder fed back into the agent's context. Default `false`
+        /// for fresh runs and for pre-feature events on disk.
+        #[serde(default)]
+        replayed: bool,
     },
 
     // -- ESAA intention lifecycle --
@@ -368,6 +375,7 @@ mod tests {
             result_preview: "ok".into(),
             is_error: false,
             duration_ms: 42,
+            replayed: false,
         };
         let json = serde_json::to_string(&kind).unwrap();
         let deserialized: EventKind = serde_json::from_str(&json).unwrap();
@@ -538,6 +546,7 @@ mod tests {
             result_preview: "full output h…".into(),
             is_error: false,
             duration_ms: 42,
+            replayed: false,
         };
         let json = serde_json::to_string(&kind).unwrap();
         let back: EventKind = serde_json::from_str(&json).unwrap();

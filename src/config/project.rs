@@ -122,6 +122,13 @@ pub struct McpServerConfig {
     /// policy engine). Defaults to `false`.
     #[serde(default)]
     pub requires_approval: Option<bool>,
+    /// Short tool names (no `mcp__server__` prefix) from this server
+    /// that have irreversible side-effects and must be shadowed on
+    /// `zymi resume`. Cf. `ToolCatalog::no_resume`. MCP protocol does
+    /// not expose this attribute, so it's declared here per project.
+    /// Empty/absent means no MCP tool from this server is marked.
+    #[serde(default)]
+    pub no_resume: Option<Vec<String>>,
     /// Timeout for the `initialize` handshake. Defaults to 10s.
     #[serde(default)]
     pub init_timeout_secs: Option<u64>,
@@ -741,6 +748,7 @@ mcp_servers:
             allow: None,
             deny: None,
             requires_approval: None,
+            no_resume: None,
             init_timeout_secs: None,
             call_timeout_secs: None,
             restart: None,

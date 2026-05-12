@@ -18,6 +18,14 @@ pub struct ToolConfig {
     /// Defaults depend on implementation kind (see [`ImplementationConfig`]).
     #[serde(default)]
     pub requires_approval: Option<bool>,
+    /// Mark this tool as having an irreversible side-effect (sending an
+    /// email, charging a card, posting to a public channel). When a step
+    /// is re-executed via `zymi resume`, dispatcher returns a synthetic
+    /// placeholder result instead of invoking the tool body, and the
+    /// resulting `ToolCallCompleted` event carries `replayed: true`.
+    /// Has no effect on fresh runs. Default `false`.
+    #[serde(default)]
+    pub no_resume: Option<bool>,
     /// The implementation backend for this tool.
     pub implementation: ImplementationConfig,
 }
@@ -79,6 +87,12 @@ impl ToolConfig {
     /// `true` when this is a `kind: shell` tool.
     pub fn is_shell(&self) -> bool {
         matches!(&self.implementation, ImplementationConfig::Shell { .. })
+    }
+
+    /// Effective `no_resume` value. Default is `false` — only tools
+    /// explicitly marked side-effectful are shadowed on resume.
+    pub fn effective_no_resume(&self) -> bool {
+        self.no_resume.unwrap_or(false)
     }
 }
 
