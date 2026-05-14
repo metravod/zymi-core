@@ -39,7 +39,7 @@ steps:                      # required. One or more steps.
     depends_on: [research, enrich]
 
 output:                     # optional. Declares which step is "the answer".
-  step: write_up
+  step: write_up            # or `any_of: [a, b]` — see "Output resolution"
 
 approval_channel: ops_tg    # optional. Per-pipeline override of project's
                             # `default_approval_channel:`.
@@ -84,6 +84,29 @@ Inside string fields (`task`, `args` values):
 - `${steps.<id>.output>}` — string output of an upstream step. **The referenced step MUST be in this step's `depends_on`** — otherwise the template fails at runtime.
 - `${env.<NAME>}` — environment variable.
 - `${var_name}` — entry from project-level `variables:` (resolved at parse time, not runtime).
+
+## Output resolution
+
+`output:` selects the step whose `output` is treated as "the answer" — the value emitted as `ResponseReady.content` and surfaced as `PipelineCompleted.final_output`. Two shapes (ADR-0029):
+
+```yaml
+output:
+  step: write_up            # single declared terminal (legacy form)
+```
+
+```yaml
+output:
+  any_of: [smalltalk, knowledge]   # routed terminal (ADR-0029)
+```
+
+`any_of:` walks the list **in declared order** and picks the first step that was not skipped. It is the form to use with `when:` (ADR-0028): the router agent decides which branch fires, exactly one survives, and `any_of:` picks the survivor without you having to repeat the routing logic on the output side.
+
+Failure modes:
+
+- `step:` form, declared step was skipped → run fails (`output step 'X' was skipped`). Silently picking another branch would defeat the trace.
+- `any_of:` form, every candidate was skipped → run fails (`all any_of outputs were skipped: [...]`).
+
+Successful resolution emits an `OutputResolved { chosen_step, via }` event between `WorkflowCompleted` and `ResponseReady`, so `zymi observe` / `zymi events` show which branch became the answer.
 
 ## DAG semantics
 

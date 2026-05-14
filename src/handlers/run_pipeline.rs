@@ -27,14 +27,14 @@ use std::time::Instant;
 use uuid::Uuid;
 
 use crate::commands::RunPipeline;
-use crate::config::pipeline::PipelineStepKind;
+use crate::config::pipeline::{PipelineOutput, PipelineStepKind};
 use crate::config::when_expr;
 use crate::config::AgentConfig;
 use crate::engine::tools::{new_memory_store, MemoryStore};
 use crate::esaa::orchestrator::{ApprovalContext, Orchestrator, OrchestratorResult};
 use crate::events::bus::EventBus;
 use crate::events::store::EventStore;
-use crate::events::{Event, EventKind};
+use crate::events::{Event, EventKind, OutputResolutionVia};
 use crate::llm::{ChatRequest, ChatResponse, LlmProvider};
 use crate::runtime::context_builder::{ContextBuilder, ContextConfig};
 use crate::runtime::context_window::approx_chars;
@@ -389,26 +389,26 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
         }
     }
 
-    // ADR-0028: if the declared output step was skipped, treat as hard fail.
-    // Silently returning an empty/fallback output would defeat the point of
-    // making routing decisions traceable.
-    if let Some(o) = &pipeline.output {
-        if skipped.contains(&o.step) && halt.is_none() {
+    // ADR-0028 / ADR-0029: resolve the declared `output:` against the
+    // skipped set. The legacy `step:` shape hard-fails when its single
+    // terminal was skipped; the `any_of:` shape walks the list and picks
+    // the first surviving step, hard-failing only if every candidate was
+    // skipped. Halt set here lets the existing PipelineCompleted /
+    // ResponseReady gating below stay untouched.
+    let resolution = resolve_final_output(pipeline.output.as_ref(), &step_outputs, &skipped);
+    if let Some(reason) = &resolution.halt {
+        if halt.is_none() {
             overall_success = false;
-            halt = Some(format!("output step '{}' was skipped", o.step));
+            halt = Some(reason.clone());
         }
     }
 
-    let final_output = pipeline
-        .output
-        .as_ref()
-        .and_then(|o| step_outputs.get(&o.step).cloned())
-        .or_else(|| {
-            plan.levels
-                .last()
-                .and_then(|level| level.last())
-                .and_then(|step_id| step_outputs.get(step_id).cloned())
-        });
+    let final_output = resolution.output.clone().or_else(|| {
+        plan.levels
+            .last()
+            .and_then(|level| level.last())
+            .and_then(|step_id| step_outputs.get(step_id).cloned())
+    });
 
     emit_event(
         rt.bus(),
@@ -419,6 +419,16 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
         },
     )
     .await;
+
+    if let Some((chosen_step, via)) = resolution.chosen.clone() {
+        emit_event(
+            rt.bus(),
+            &stream_id,
+            correlation_id,
+            EventKind::OutputResolved { chosen_step, via },
+        )
+        .await;
+    }
 
     // ADR-0021: declarative `outputs:` (e.g. http_post) subscribe to
     // `ResponseReady`. Translate a successful pipeline's final output into
@@ -1016,6 +1026,78 @@ fn truncate(s: &str, max: usize) -> &str {
     }
 }
 
+/// Outcome of resolving `pipeline.output` against the live step state.
+///
+/// ADR-0029: a `step:` declaration hard-fails on skip; `any_of:` walks in
+/// declared order and picks the first surviving entry, hard-failing only
+/// when every candidate is skipped. The legacy "fallback to last-plan-level
+/// step" branch is left to the caller so this function stays a pure
+/// function of the declared `output:` and the runtime state.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct OutputResolution {
+    /// Final output content, if a winner was found.
+    pub output: Option<String>,
+    /// `(chosen_step, via)` to emit as `OutputResolved`. `None` when no
+    /// `output:` was declared or resolution failed.
+    pub chosen: Option<(String, OutputResolutionVia)>,
+    /// Halt reason when resolution failed (every `any_of:` skipped, or the
+    /// declared `step:` skipped). Caller sets `overall_success = false`.
+    pub halt: Option<String>,
+}
+
+pub(crate) fn resolve_final_output(
+    output: Option<&PipelineOutput>,
+    step_outputs: &HashMap<String, String>,
+    skipped: &HashSet<String>,
+) -> OutputResolution {
+    let Some(output) = output else {
+        return OutputResolution::default();
+    };
+    match output {
+        PipelineOutput::Step(s) => {
+            if skipped.contains(&s.step) {
+                return OutputResolution {
+                    output: None,
+                    chosen: None,
+                    halt: Some(format!("output step '{}' was skipped", s.step)),
+                };
+            }
+            OutputResolution {
+                output: step_outputs.get(&s.step).cloned(),
+                chosen: Some((s.step.clone(), OutputResolutionVia::Step)),
+                halt: None,
+            }
+        }
+        PipelineOutput::AnyOf(a) => {
+            let mut skipped_prefix: Vec<String> = Vec::new();
+            for id in &a.any_of {
+                if skipped.contains(id) {
+                    skipped_prefix.push(id.clone());
+                    continue;
+                }
+                return OutputResolution {
+                    output: step_outputs.get(id).cloned(),
+                    chosen: Some((
+                        id.clone(),
+                        OutputResolutionVia::AnyOf {
+                            skipped: skipped_prefix,
+                        },
+                    )),
+                    halt: None,
+                };
+            }
+            OutputResolution {
+                output: None,
+                chosen: None,
+                halt: Some(format!(
+                    "all any_of outputs were skipped: [{}]",
+                    a.any_of.join(", ")
+                )),
+            }
+        }
+    }
+}
+
 async fn emit_event(bus: &EventBus, stream_id: &str, correlation_id: Uuid, kind: EventKind) {
     let event = Event::new(stream_id.to_string(), kind, "engine".into())
         .with_correlation(correlation_id);
@@ -1106,5 +1188,156 @@ flag: true
         assert_eq!(json["nested"][0], serde_json::json!("abc123"));
         assert_eq!(json["nested"][1], serde_json::json!(42));
         assert_eq!(json["flag"], serde_json::json!(true));
+    }
+
+    // ADR-0029: output resolution
+    use crate::config::pipeline::{AnyOfOutput, PipelineOutput, StepOutput};
+
+    fn outputs_with(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    fn skip_set(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn resolve_step_form_backcompat() {
+        let out = PipelineOutput::Step(StepOutput {
+            step: "writeup".into(),
+        });
+        let r = resolve_final_output(
+            Some(&out),
+            &outputs_with(&[("writeup", "the answer")]),
+            &skip_set(&[]),
+        );
+        assert_eq!(r.output.as_deref(), Some("the answer"));
+        assert!(r.halt.is_none());
+        assert_eq!(
+            r.chosen,
+            Some(("writeup".to_string(), OutputResolutionVia::Step))
+        );
+    }
+
+    #[test]
+    fn resolve_step_form_skipped_halts() {
+        let out = PipelineOutput::Step(StepOutput {
+            step: "writeup".into(),
+        });
+        let r = resolve_final_output(Some(&out), &HashMap::new(), &skip_set(&["writeup"]));
+        assert!(r.output.is_none());
+        assert!(r.chosen.is_none());
+        assert_eq!(r.halt.as_deref(), Some("output step 'writeup' was skipped"));
+    }
+
+    #[test]
+    fn resolve_any_of_picks_first_surviving() {
+        let out = PipelineOutput::AnyOf(AnyOfOutput {
+            any_of: vec!["smalltalk".into(), "knowledge".into()],
+        });
+        let r = resolve_final_output(
+            Some(&out),
+            &outputs_with(&[("knowledge", "rag answer")]),
+            &skip_set(&["smalltalk"]),
+        );
+        assert_eq!(r.output.as_deref(), Some("rag answer"));
+        assert!(r.halt.is_none());
+        assert_eq!(
+            r.chosen,
+            Some((
+                "knowledge".to_string(),
+                OutputResolutionVia::AnyOf {
+                    skipped: vec!["smalltalk".into()],
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn resolve_any_of_first_entry_wins_no_skipped_prefix() {
+        let out = PipelineOutput::AnyOf(AnyOfOutput {
+            any_of: vec!["smalltalk".into(), "knowledge".into()],
+        });
+        let r = resolve_final_output(
+            Some(&out),
+            &outputs_with(&[("smalltalk", "hi there")]),
+            &skip_set(&["knowledge"]),
+        );
+        assert_eq!(r.output.as_deref(), Some("hi there"));
+        assert_eq!(
+            r.chosen,
+            Some((
+                "smalltalk".to_string(),
+                OutputResolutionVia::AnyOf { skipped: vec![] }
+            ))
+        );
+    }
+
+    #[test]
+    fn resolve_any_of_all_skipped_fails() {
+        let out = PipelineOutput::AnyOf(AnyOfOutput {
+            any_of: vec!["smalltalk".into(), "knowledge".into()],
+        });
+        let r = resolve_final_output(
+            Some(&out),
+            &HashMap::new(),
+            &skip_set(&["smalltalk", "knowledge"]),
+        );
+        assert!(r.output.is_none());
+        assert!(r.chosen.is_none());
+        assert!(r
+            .halt
+            .as_deref()
+            .unwrap()
+            .contains("all any_of outputs were skipped"));
+    }
+
+    #[test]
+    fn resolve_none_declared_returns_empty() {
+        let r = resolve_final_output(None, &HashMap::new(), &HashSet::new());
+        assert!(r.output.is_none());
+        assert!(r.halt.is_none());
+        assert!(r.chosen.is_none());
+    }
+
+    #[test]
+    fn pipeline_output_untagged_step_form_parses() {
+        let yaml = "step: writeup\n";
+        let out: PipelineOutput = serde_yml::from_str(yaml).unwrap();
+        assert!(matches!(out, PipelineOutput::Step(s) if s.step == "writeup"));
+    }
+
+    #[test]
+    fn pipeline_output_untagged_any_of_form_parses() {
+        let yaml = "any_of:\n  - smalltalk\n  - knowledge\n";
+        let out: PipelineOutput = serde_yml::from_str(yaml).unwrap();
+        match out {
+            PipelineOutput::AnyOf(a) => {
+                assert_eq!(a.any_of, vec!["smalltalk".to_string(), "knowledge".into()]);
+            }
+            _ => panic!("expected AnyOf"),
+        }
+    }
+
+    #[test]
+    fn pipeline_output_rejects_both_keys() {
+        let yaml = "step: a\nany_of: [b]\n";
+        let err = serde_yml::from_str::<PipelineOutput>(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("both"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn pipeline_output_rejects_empty_mapping() {
+        let yaml = "other: foo\n";
+        let err = serde_yml::from_str::<PipelineOutput>(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("step:") && msg.contains("any_of:"),
+            "unexpected error: {msg}"
+        );
     }
 }

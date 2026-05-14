@@ -120,7 +120,7 @@ pub fn build_execution_plan(pipeline: &PipelineConfig) -> Result<ExecutionPlan, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::pipeline::{PipelineOutput, PipelineStep, PipelineStepKind};
+    use crate::config::pipeline::{PipelineOutput, PipelineStep, PipelineStepKind, StepOutput};
 
     fn pipeline(name: &str, steps: Vec<(&str, Vec<&str>)>) -> PipelineConfig {
         PipelineConfig {
@@ -288,9 +288,9 @@ mod tests {
                 ("summarize", vec!["analyze"]),
             ],
         );
-        p.output = Some(PipelineOutput {
+        p.output = Some(PipelineOutput::Step(StepOutput {
             step: "summarize".into(),
-        });
+        }));
 
         let plan = build_execution_plan(&p).unwrap();
         // Output step should be in the last level.

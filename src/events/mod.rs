@@ -66,6 +66,18 @@ impl Event {
     }
 }
 
+/// How a pipeline's `output:` was resolved to a concrete step (ADR-0029).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "form", rename_all = "snake_case")]
+pub enum OutputResolutionVia {
+    /// Legacy `output: step: <id>` — single declared terminal.
+    Step,
+    /// `output: any_of: [<id>, ...]` — first non-skipped wins. `skipped`
+    /// is the ordered prefix of `any_of:` entries that were skipped before
+    /// the winner (empty when the first entry won).
+    AnyOf { skipped: Vec<String> },
+}
+
 /// Domain events covering the full lifecycle of agent processing.
 ///
 /// `#[non_exhaustive]`: new variants land in every plugin-expanding slice
@@ -208,6 +220,17 @@ pub enum EventKind {
         /// `"when=false"` | `"ancestor_skipped"`
         reason: String,
     },
+    /// The pipeline's declared `output:` resolved to a concrete step
+    /// (ADR-0029). Emitted between `WorkflowCompleted` and `ResponseReady`
+    /// for runs that had an `output:` and successfully picked a winner.
+    /// Not emitted on resolution failure (e.g. all `any_of:` candidates
+    /// skipped) — that path surfaces via `PipelineCompleted.error`.
+    /// History-only: replay does not re-decide; the recorded `chosen_step`
+    /// is the authoritative answer.
+    OutputResolved {
+        chosen_step: String,
+        via: OutputResolutionVia,
+    },
 
     // -- Memory lifecycle (ADR-0016 §1/§2) --
     /// Agent wrote a key-value pair to workflow memory.
@@ -347,6 +370,7 @@ impl EventKind {
             EventKind::WorkflowNodeCompleted { .. } => "workflow_node_completed",
             EventKind::WorkflowCompleted { .. } => "workflow_completed",
             EventKind::StepSkipped { .. } => "step_skipped",
+            EventKind::OutputResolved { .. } => "output_resolved",
             EventKind::MemoryWritten { .. } => "memory_written",
             EventKind::MemoryDeleted { .. } => "memory_deleted",
             EventKind::ContextCompacted { .. } => "context_compacted",

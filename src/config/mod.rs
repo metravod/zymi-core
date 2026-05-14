@@ -14,7 +14,7 @@ use std::path::Path;
 pub use agent::AgentConfig;
 pub use error::ConfigError;
 pub use dag::{build_execution_plan, ExecutionPlan};
-pub use pipeline::{PipelineConfig, PipelineInput, PipelineOutput, PipelineStep};
+pub use pipeline::{AnyOfOutput, PipelineConfig, PipelineInput, PipelineOutput, PipelineStep, StepOutput};
 pub use project::{ContractsConfig, ContextWindowConfig, DefaultsConfig, LangfuseConfig, LlmConfig, McpRestartConfig, McpServerConfig, ProjectConfig, RuntimeConfig, ServicesConfig, ShellConfig, SCHEMA_VERSION};
 pub use tool::{ToolConfig, ImplementationConfig, HttpMethod};
 

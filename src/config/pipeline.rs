@@ -193,9 +193,86 @@ impl JsonSchema for PipelineStep {
 }
 
 /// Declares which step produces the final pipeline output.
+///
+/// Two shapes (ADR-0029):
+///
+/// - `{ step: <id> }` — single terminal step. Hard-fails if that step was
+///   skipped (ADR-0028 §"Skip semantics").
+/// - `{ any_of: [<id>, ...] }` — routed output: walk the list in order and
+///   take the first id that was not skipped. Hard-fails if every id was
+///   skipped. Designed for concierge / triage pipelines where `when:` on
+///   branches already encodes mutual exclusivity.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(untagged)]
+pub enum PipelineOutput {
+    Step(StepOutput),
+    AnyOf(AnyOfOutput),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct PipelineOutput {
+pub struct StepOutput {
     pub step: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AnyOfOutput {
+    pub any_of: Vec<String>,
+}
+
+impl PipelineOutput {
+    /// Convenience for callers that only care about the legacy single-step
+    /// shape (e.g. DAG plan placement). Returns `None` for `any_of:`.
+    pub fn single_step(&self) -> Option<&str> {
+        match self {
+            PipelineOutput::Step(s) => Some(s.step.as_str()),
+            PipelineOutput::AnyOf(_) => None,
+        }
+    }
+
+    /// All step ids this output declaration can resolve to, in declared
+    /// order. Used by validation and tests.
+    pub fn declared_steps(&self) -> Vec<&str> {
+        match self {
+            PipelineOutput::Step(s) => vec![s.step.as_str()],
+            PipelineOutput::AnyOf(a) => a.any_of.iter().map(String::as_str).collect(),
+        }
+    }
+}
+
+/// Custom deserialise: `#[serde(untagged)]` produces unhelpful "data did not
+/// match any variant" errors on typos. Inspect the YAML mapping ourselves and
+/// route by the present key, with a pointed error otherwise.
+impl<'de> Deserialize<'de> for PipelineOutput {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let value = serde_yml::Value::deserialize(d)?;
+        let map = value
+            .as_mapping()
+            .ok_or_else(|| D::Error::custom("`output:` must be a mapping"))?;
+        let has_step = map.contains_key(serde_yml::Value::String("step".into()));
+        let has_any_of = map.contains_key(serde_yml::Value::String("any_of".into()));
+        match (has_step, has_any_of) {
+            (true, true) => Err(D::Error::custom(
+                "`output:` cannot specify both `step:` and `any_of:` (ADR-0029)",
+            )),
+            (false, false) => {
+                let keys: Vec<String> = map
+                    .keys()
+                    .filter_map(|k| k.as_str().map(String::from))
+                    .collect();
+                Err(D::Error::custom(format!(
+                    "`output:` must specify either `step:` or `any_of:`; found keys: [{}]",
+                    keys.join(", ")
+                )))
+            }
+            (true, false) => StepOutput::deserialize(value)
+                .map(PipelineOutput::Step)
+                .map_err(D::Error::custom),
+            (false, true) => AnyOfOutput::deserialize(value)
+                .map(PipelineOutput::AnyOf)
+                .map_err(D::Error::custom),
+        }
+    }
 }
 
 /// Load and parse a single pipeline YAML file.
@@ -368,7 +445,10 @@ output:
         assert_eq!(config.steps[1].depends_on, vec!["search"]);
         assert_eq!(config.steps[2].depends_on, vec!["analyze"]);
         assert_eq!(config.steps[3].depends_on, vec!["analyze"]);
-        assert_eq!(config.output.unwrap().step, "summarize");
+        assert_eq!(
+            config.output.unwrap().single_step(),
+            Some("summarize")
+        );
     }
 
     #[test]

@@ -71,6 +71,7 @@ pub fn indent_level(kind: &EventKind) -> u8 {
         | EventKind::ResponseReady { .. }
         | EventKind::WorkflowStarted { .. }
         | EventKind::WorkflowCompleted { .. }
+        | EventKind::OutputResolved { .. }
         | EventKind::McpServerConnected { .. }
         | EventKind::McpServerDisconnected { .. }
         | EventKind::OutboundDispatched { .. }
@@ -406,6 +407,34 @@ pub fn format_event(event: &Event) -> FormattedEvent {
             color: EventColor::Dim,
             indent,
         },
+        EventKind::OutputResolved { chosen_step, via } => {
+            let (short, full) = match via {
+                crate::events::OutputResolutionVia::Step => (
+                    format!("→ {chosen_step}"),
+                    format!("chosen: {chosen_step}\nvia: step"),
+                ),
+                crate::events::OutputResolutionVia::AnyOf { skipped } => {
+                    let short = if skipped.is_empty() {
+                        format!("→ {chosen_step} (any_of)")
+                    } else {
+                        format!("→ {chosen_step} (any_of, skipped {})", skipped.len())
+                    };
+                    let full = format!(
+                        "chosen: {chosen_step}\nvia: any_of\nskipped: [{}]",
+                        skipped.join(", ")
+                    );
+                    (short, full)
+                }
+            };
+            FormattedEvent {
+                icon: "↳",
+                label: "Output".into(),
+                short_detail: short,
+                full_detail: full,
+                color: EventColor::Info,
+                indent,
+            }
+        }
 
         EventKind::ShellSessionStarted { stream_id, pid, shell_path } => FormattedEvent {
             icon: "$",

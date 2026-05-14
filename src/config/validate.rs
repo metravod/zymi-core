@@ -287,17 +287,64 @@ fn validate_pipeline_refs(
         }
     }
 
-    // Check output step exists.
+    // Check output step refs exist. ADR-0029 adds the `any_of:` form, which
+    // is validated the same way (every id must reference a declared step) plus
+    // a non-empty / no-duplicates check — duplicates make the ordered-first
+    // semantics either unreachable or a typo, both author errors.
     if let Some(output) = &pipeline.output {
-        if !step_ids.contains(output.step.as_str()) {
-            return Err(ConfigError::Validation {
-                message: format!("output references unknown step `{}`", output.step),
-                help: format!(
-                    "available steps: {}",
-                    step_ids.iter().copied().collect::<Vec<_>>().join(", ")
-                ),
-                path,
-            });
+        match output {
+            super::pipeline::PipelineOutput::Step(s) => {
+                if !step_ids.contains(s.step.as_str()) {
+                    return Err(ConfigError::Validation {
+                        message: format!("output references unknown step `{}`", s.step),
+                        help: format!(
+                            "available steps: {}",
+                            step_ids.iter().copied().collect::<Vec<_>>().join(", ")
+                        ),
+                        path,
+                    });
+                }
+            }
+            super::pipeline::PipelineOutput::AnyOf(a) => {
+                if a.any_of.is_empty() {
+                    return Err(ConfigError::Validation {
+                        message: "output `any_of:` must list at least one step".into(),
+                        help: "add the candidate terminal steps in priority order"
+                            .into(),
+                        path,
+                    });
+                }
+                let mut seen: std::collections::HashSet<&str> =
+                    std::collections::HashSet::new();
+                for id in &a.any_of {
+                    if !step_ids.contains(id.as_str()) {
+                        return Err(ConfigError::Validation {
+                            message: format!(
+                                "output `any_of:` references unknown step `{id}`"
+                            ),
+                            help: format!(
+                                "available steps: {}",
+                                step_ids
+                                    .iter()
+                                    .copied()
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ),
+                            path: path.clone(),
+                        });
+                    }
+                    if !seen.insert(id.as_str()) {
+                        return Err(ConfigError::Validation {
+                            message: format!(
+                                "output `any_of:` lists `{id}` more than once"
+                            ),
+                            help: "ordered-first-wins makes duplicates unreachable; remove the repeat"
+                                .into(),
+                            path: path.clone(),
+                        });
+                    }
+                }
+            }
         }
     }
 
@@ -724,9 +771,11 @@ mod tests {
 
         let mut pipelines = HashMap::new();
         let mut p = pipeline_from_steps("p", vec![("s1", "a", vec![])]);
-        p.output = Some(super::super::pipeline::PipelineOutput {
-            step: "nonexistent".into(),
-        });
+        p.output = Some(super::super::pipeline::PipelineOutput::Step(
+            super::super::pipeline::StepOutput {
+                step: "nonexistent".into(),
+            },
+        ));
         pipelines.insert("p".into(), p);
 
         let err = validate_workspace(&agents, &pipelines, &ConfigToolNameResolver::new(vec![])).unwrap_err();

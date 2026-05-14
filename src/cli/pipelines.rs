@@ -76,7 +76,12 @@ pub fn exec(root: impl AsRef<Path>) -> Result<(), String> {
                     );
                 }
                 if let Some(out) = &cfg.output {
-                    println!("  {DIM}output{RESET}: {}", out.step);
+                    use crate::config::PipelineOutput;
+                    let rendered = match out {
+                        PipelineOutput::Step(s) => s.step.clone(),
+                        PipelineOutput::AnyOf(a) => format!("any_of [{}]", a.any_of.join(", ")),
+                    };
+                    println!("  {DIM}output{RESET}: {rendered}");
                 }
                 println!();
             }
