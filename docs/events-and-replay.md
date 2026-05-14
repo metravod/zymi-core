@@ -88,6 +88,7 @@ Beyond explicit fork-resume, the event store underpins automatic restart safety:
 | `UserMessageReceived` | connector / pipeline | Inbound message from a connector |
 | `PipelineRequested` | pipeline | Connector / CLI asks for a pipeline run |
 | `WorkflowNodeStarted` / `WorkflowNodeCompleted` | pipeline | Pipeline step lifecycle |
+| `StepSkipped` | pipeline | Step did not run — `reason: "when=false"` or `"ancestor_skipped"` (ADR-0028) |
 | `AgentProcessingStarted` / `AgentProcessingCompleted` | pipeline | Agent ReAct turn |
 | `ToolCallRequested` / `ToolCallCompleted` | pipeline | Any tool dispatch (declarative / Python / MCP / builtin) |
 | `ApprovalRequested` / `ApprovalGranted` / `ApprovalDenied` | approval | Human-in-the-loop |

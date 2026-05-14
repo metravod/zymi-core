@@ -20,7 +20,7 @@
 //! construct a `Runtime` once per project and dispatch
 //! [`crate::commands::RunPipeline`] directly.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -28,6 +28,7 @@ use uuid::Uuid;
 
 use crate::commands::RunPipeline;
 use crate::config::pipeline::PipelineStepKind;
+use crate::config::when_expr;
 use crate::config::AgentConfig;
 use crate::engine::tools::{new_memory_store, MemoryStore};
 use crate::esaa::orchestrator::{ApprovalContext, Orchestrator, OrchestratorResult};
@@ -139,6 +140,8 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
     let mut overall_success = true;
     // ADR-0027: first deterministic-tool-step failure halts the pipeline.
     let mut halt: Option<String> = None;
+    // ADR-0028: steps that did not run (when=false or ancestor_skipped).
+    let mut skipped: HashSet<String> = HashSet::new();
 
     if let Some(ctx) = &resume {
         for (step_id, output) in &ctx.frozen_outputs {
@@ -196,6 +199,59 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
                 .iter()
                 .find(|s| &s.id == step_id)
                 .ok_or_else(|| format!("step '{step_id}' not found in pipeline config"))?;
+
+            // ADR-0028: conditional edges. Cascade-skip first (any skipped
+            // ancestor poisons this step), then evaluate `when:` if present.
+            if step.depends_on.iter().any(|d| skipped.contains(d)) {
+                if is_local_cli_run {
+                    println!("    [{step_id}] skipped (ancestor_skipped)");
+                }
+                emit_event(
+                    rt.bus(),
+                    &stream_id,
+                    correlation_id,
+                    EventKind::StepSkipped {
+                        step_id: step_id.clone(),
+                        reason: "ancestor_skipped".to_string(),
+                    },
+                )
+                .await;
+                skipped.insert(step_id.clone());
+                continue;
+            }
+            if let Some(expr_src) = step.when.as_deref() {
+                let resolved = resolve_str_template(expr_src, &cmd.inputs, &step_outputs);
+                let truthy = match when_expr::evaluate(&resolved) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // Treat eval error as a hard pipeline failure — the
+                        // config validator catches syntax at load time, so an
+                        // error here means template substitution produced
+                        // something the parser can't handle. Fail-fast to
+                        // surface the bad shape immediately (ADR-0027 spirit).
+                        return Err(format!(
+                            "step '{step_id}' when-expression eval failed after substitution: {e} (resolved: {resolved:?})"
+                        ));
+                    }
+                };
+                if !truthy {
+                    if is_local_cli_run {
+                        println!("    [{step_id}] skipped (when=false)");
+                    }
+                    emit_event(
+                        rt.bus(),
+                        &stream_id,
+                        correlation_id,
+                        EventKind::StepSkipped {
+                            step_id: step_id.clone(),
+                            reason: "when=false".to_string(),
+                        },
+                    )
+                    .await;
+                    skipped.insert(step_id.clone());
+                    continue;
+                }
+            }
 
             let provider = Arc::clone(rt.provider());
             let orchestrator = Arc::clone(rt.orchestrator());
@@ -330,6 +386,16 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
 
         if halt.is_some() {
             break;
+        }
+    }
+
+    // ADR-0028: if the declared output step was skipped, treat as hard fail.
+    // Silently returning an empty/fallback output would defeat the point of
+    // making routing decisions traceable.
+    if let Some(o) = &pipeline.output {
+        if skipped.contains(&o.step) && halt.is_none() {
+            overall_success = false;
+            halt = Some(format!("output step '{}' was skipped", o.step));
         }
     }
 

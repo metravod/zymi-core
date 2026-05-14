@@ -50,6 +50,11 @@ pub struct PipelineStep {
     pub id: String,
     pub kind: PipelineStepKind,
     pub depends_on: Vec<String>,
+    /// Optional runtime predicate (ADR-0028). When `Some`, the step runs only
+    /// if the expression evaluates to true after dependencies complete.
+    /// `${inputs.*}` / `${steps.*.output}` are substituted first; the parser
+    /// then sees a fully-resolved string. Topology is unaffected.
+    pub when: Option<String>,
 }
 
 /// Step body. The two variants are mutually exclusive at the YAML level.
@@ -93,6 +98,8 @@ struct PipelineStepRaw {
     pub args: Option<serde_yml::Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for PipelineStep {
@@ -141,6 +148,7 @@ impl<'de> Deserialize<'de> for PipelineStep {
             id: raw.id,
             kind,
             depends_on: raw.depends_on,
+            when: raw.when,
         })
     }
 }
@@ -155,6 +163,7 @@ impl Serialize for PipelineStep {
                 tool: None,
                 args: None,
                 depends_on: self.depends_on.clone(),
+                when: self.when.clone(),
             },
             PipelineStepKind::Tool { tool, args } => PipelineStepRaw {
                 id: self.id.clone(),
@@ -163,6 +172,7 @@ impl Serialize for PipelineStep {
                 tool: Some(tool.clone()),
                 args: Some(args.clone()),
                 depends_on: self.depends_on.clone(),
+                when: self.when.clone(),
             },
         };
         raw.serialize(s)
@@ -408,6 +418,30 @@ steps:
         let path = write_file(&dir, "pipeline.yml", yaml);
         let config = load_pipeline(&path, &HashMap::new()).unwrap();
         assert!(config.approval_channel.is_none());
+    }
+
+    #[test]
+    fn pipeline_step_with_when_parses() {
+        let dir = TempDir::new().unwrap();
+        let yaml = r#"
+name: concierge
+steps:
+  - id: router
+    agent: concierge
+    task: "decide"
+  - id: short
+    agent: helper
+    task: "answer"
+    depends_on: [router]
+    when: "${steps.router.output} == 'short'"
+"#;
+        let path = write_file(&dir, "pipeline.yml", yaml);
+        let config = load_pipeline(&path, &HashMap::new()).unwrap();
+        assert!(config.steps[0].when.is_none());
+        assert_eq!(
+            config.steps[1].when.as_deref(),
+            Some("${steps.router.output} == 'short'")
+        );
     }
 
     #[test]

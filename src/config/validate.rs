@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use super::agent::AgentConfig;
 use super::error::ConfigError;
 use super::pipeline::{PipelineConfig, PipelineStepKind};
+use super::when_expr;
 
 /// Validate cross-references and structural invariants across the workspace.
 ///
@@ -235,6 +236,55 @@ fn validate_pipeline_refs(
                 });
             }
         }
+
+        // ADR-0028: validate `when:` predicate.
+        if let Some(expr) = &step.when {
+            if step.depends_on.is_empty() {
+                return Err(ConfigError::Validation {
+                    message: format!(
+                        "step `{}` has `when:` but no `depends_on` — nothing has happened yet to branch on",
+                        step.id
+                    ),
+                    help: "either remove `when:` or add the steps it reads from to `depends_on`".into(),
+                    path: path.clone(),
+                });
+            }
+            if let Err(e) = when_expr::parse_only(expr) {
+                return Err(ConfigError::Validation {
+                    message: format!("step `{}` has invalid `when:` expression: {}", step.id, e),
+                    help: "grammar: VALUE (==|!=) VALUE (&&|\\|\\| VALUE (==|!=) VALUE)*, values are bare tokens or single-quoted strings (ADR-0028)".into(),
+                    path: path.clone(),
+                });
+            }
+            for other in when_expr::collect_step_refs(expr) {
+                if !step_ids.contains(other.as_str()) {
+                    return Err(ConfigError::Validation {
+                        message: format!(
+                            "step `{}` `when:` references unknown step `${{steps.{}.output}}`",
+                            step.id, other
+                        ),
+                        help: format!(
+                            "available steps: {}",
+                            step_ids.iter().copied().collect::<Vec<_>>().join(", ")
+                        ),
+                        path: path.clone(),
+                    });
+                }
+                if !step.depends_on.iter().any(|d| d == &other) {
+                    return Err(ConfigError::Validation {
+                        message: format!(
+                            "step `{}` `when:` references `${{steps.{}.output}}` but `{}` is not in depends_on — would race against an unrelated branch",
+                            step.id, other, other
+                        ),
+                        help: format!(
+                            "add `{}` to step `{}`'s depends_on list",
+                            other, step.id
+                        ),
+                        path: path.clone(),
+                    });
+                }
+            }
+        }
     }
 
     // Check output step exists.
@@ -396,6 +446,7 @@ mod tests {
                         task: "task".into(),
                     },
                     depends_on: deps.into_iter().map(String::from).collect(),
+                    when: None,
                 })
                 .collect(),
             output: None,
@@ -412,6 +463,7 @@ mod tests {
                 args,
             },
             depends_on: deps.into_iter().map(String::from).collect(),
+            when: None,
         }
     }
 
@@ -679,5 +731,119 @@ mod tests {
 
         let err = validate_workspace(&agents, &pipelines, &ConfigToolNameResolver::new(vec![])).unwrap_err();
         assert!(matches!(err, ConfigError::Validation { message, .. } if message.contains("nonexistent")));
+    }
+
+    // -- ADR-0028: when: validation --
+
+    fn agent_step_with_when(
+        id: &str,
+        ag: &str,
+        deps: Vec<&str>,
+        when_expr: Option<&str>,
+    ) -> super::super::pipeline::PipelineStep {
+        super::super::pipeline::PipelineStep {
+            id: id.into(),
+            kind: super::super::pipeline::PipelineStepKind::Agent {
+                agent: ag.into(),
+                task: "t".into(),
+            },
+            depends_on: deps.into_iter().map(String::from).collect(),
+            when: when_expr.map(String::from),
+        }
+    }
+
+    #[test]
+    fn when_with_valid_ancestor_ok() {
+        let mut agents = HashMap::new();
+        agents.insert("a".into(), agent("a", vec![]));
+
+        let mut p = pipeline_from_steps("p", vec![("router", "a", vec![])]);
+        p.steps.push(agent_step_with_when(
+            "branch",
+            "a",
+            vec!["router"],
+            Some("${steps.router.output} == 'go'"),
+        ));
+        let mut pipelines = HashMap::new();
+        pipelines.insert("p".into(), p);
+
+        assert!(validate_workspace(&agents, &pipelines, &ConfigToolNameResolver::new(vec![])).is_ok());
+    }
+
+    #[test]
+    fn when_without_depends_on_rejected() {
+        let mut agents = HashMap::new();
+        agents.insert("a".into(), agent("a", vec![]));
+
+        let mut p = pipeline_from_steps("p", vec![]);
+        p.steps.push(agent_step_with_when("solo", "a", vec![], Some("'a' == 'a'")));
+        let mut pipelines = HashMap::new();
+        pipelines.insert("p".into(), p);
+
+        let err = validate_workspace(&agents, &pipelines, &ConfigToolNameResolver::new(vec![])).unwrap_err();
+        assert!(matches!(err, ConfigError::Validation { message, .. } if message.contains("no `depends_on`")));
+    }
+
+    #[test]
+    fn when_syntax_error_rejected() {
+        let mut agents = HashMap::new();
+        agents.insert("a".into(), agent("a", vec![]));
+
+        let mut p = pipeline_from_steps("p", vec![("router", "a", vec![])]);
+        p.steps.push(agent_step_with_when(
+            "branch",
+            "a",
+            vec!["router"],
+            Some("'a' =="),
+        ));
+        let mut pipelines = HashMap::new();
+        pipelines.insert("p".into(), p);
+
+        let err = validate_workspace(&agents, &pipelines, &ConfigToolNameResolver::new(vec![])).unwrap_err();
+        assert!(matches!(err, ConfigError::Validation { message, .. } if message.contains("invalid `when:`")));
+    }
+
+    #[test]
+    fn when_references_non_ancestor_rejected() {
+        let mut agents = HashMap::new();
+        agents.insert("a".into(), agent("a", vec![]));
+
+        // `branch` reads from `other` but only depends on `router`.
+        let mut p = pipeline_from_steps(
+            "p",
+            vec![("router", "a", vec![]), ("other", "a", vec![])],
+        );
+        p.steps.push(agent_step_with_when(
+            "branch",
+            "a",
+            vec!["router"],
+            Some("${steps.other.output} == 'x'"),
+        ));
+        let mut pipelines = HashMap::new();
+        pipelines.insert("p".into(), p);
+
+        let err = validate_workspace(&agents, &pipelines, &ConfigToolNameResolver::new(vec![])).unwrap_err();
+        assert!(matches!(err, ConfigError::Validation { message, .. } if message.contains("not in depends_on")));
+    }
+
+    #[test]
+    fn when_references_unknown_step_rejected() {
+        let mut agents = HashMap::new();
+        agents.insert("a".into(), agent("a", vec![]));
+
+        let mut p = pipeline_from_steps("p", vec![("router", "a", vec![])]);
+        p.steps.push(agent_step_with_when(
+            "branch",
+            "a",
+            vec!["router", "ghost"],
+            Some("${steps.ghost.output} == 'x'"),
+        ));
+        let mut pipelines = HashMap::new();
+        pipelines.insert("p".into(), p);
+
+        // The `depends_on: ghost` check fires first — either error is acceptable
+        // as proof we don't accept the config.
+        let err = validate_workspace(&agents, &pipelines, &ConfigToolNameResolver::new(vec![])).unwrap_err();
+        assert!(matches!(err, ConfigError::Validation { .. }));
     }
 }

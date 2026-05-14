@@ -6,6 +6,7 @@ pub mod project;
 pub mod template;
 pub mod tool;
 pub mod validate;
+pub mod when_expr;
 
 use std::collections::HashMap;
 use std::path::Path;

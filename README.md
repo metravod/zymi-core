@@ -89,6 +89,20 @@ steps:
     depends_on: [fetch]
 ```
 
+**Conditional branches** ([ADR-0028](adr/0028-conditional-dag-edges.md)) — a step can gate on an upstream output. Skipped branches cascade to descendants and emit `StepSkipped` events, so routing decisions land in the trace, not in the LLM's head:
+
+```yaml
+- id: router
+  agent: concierge
+  task: "Pick: ${inputs.q}"   # calls route('short' | 'rag')
+
+- id: rag_lookup
+  tool: pinecone_query
+  args: { query: "${inputs.q}" }
+  depends_on: [router]
+  when: "${steps.router.output} == 'rag'"
+```
+
 Schema, examples, gotchas → [docs/pipelines.md](docs/pipelines.md).
 
 ### Tools — four kinds, one catalogue

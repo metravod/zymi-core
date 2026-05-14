@@ -199,6 +199,15 @@ pub enum EventKind {
     WorkflowCompleted {
         success: bool,
     },
+    /// A pipeline step was skipped at runtime (ADR-0028). Either its `when:`
+    /// predicate evaluated false, or a `depends_on` ancestor was skipped
+    /// (cascade). The step's body never ran; no `StepResult` is recorded.
+    /// History-only: replay does not re-evaluate, it honours the original skip.
+    StepSkipped {
+        step_id: String,
+        /// `"when=false"` | `"ancestor_skipped"`
+        reason: String,
+    },
 
     // -- Memory lifecycle (ADR-0016 §1/§2) --
     /// Agent wrote a key-value pair to workflow memory.
@@ -337,6 +346,7 @@ impl EventKind {
             EventKind::WorkflowNodeStarted { .. } => "workflow_node_started",
             EventKind::WorkflowNodeCompleted { .. } => "workflow_node_completed",
             EventKind::WorkflowCompleted { .. } => "workflow_completed",
+            EventKind::StepSkipped { .. } => "step_skipped",
             EventKind::MemoryWritten { .. } => "memory_written",
             EventKind::MemoryDeleted { .. } => "memory_deleted",
             EventKind::ContextCompacted { .. } => "context_compacted",

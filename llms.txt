@@ -11,7 +11,7 @@
 
 - [Project YAML](docs/project-yaml.md): `project.yml` schema (llm, defaults, policy, contracts, variables, store, connectors, outputs, approvals, mcp_servers, default_approval_channel)
 - [Agents](docs/agents.md): `agents/<name>.yml` schema and the ReAct loop
-- [Pipelines](docs/pipelines.md): `pipelines/<name>.yml` schema, agent steps and deterministic tool steps (ADR-0024), DAG semantics, `${inputs.*}` / `${steps.<id>.output}` interpolation
+- [Pipelines](docs/pipelines.md): `pipelines/<name>.yml` schema, agent steps and deterministic tool steps (ADR-0024), DAG semantics, conditional edges via `when:` (ADR-0028), `${inputs.*}` / `${steps.<id>.output}` interpolation
 - [Tools](docs/tools.md): four tool kinds — declarative HTTP/shell, Python `@tool`, MCP, builtin
 - [Connectors](docs/connectors.md): inbound (`http_inbound`, `http_poll`, `cron`, `file_read`, `stdin`) and outbound (`http_post`, `file_append`, `stdout`)
 - [Approvals](docs/approvals.md): event-sourced human-in-the-loop, channels (`terminal`, `http`, `telegram`), restart-safe replay (ADR-0022)

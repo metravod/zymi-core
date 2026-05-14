@@ -136,6 +136,7 @@ mod tests {
                         task: "t".into(),
                     },
                     depends_on: deps.into_iter().map(String::from).collect(),
+                    when: None,
                 })
                 .collect(),
             output: None,

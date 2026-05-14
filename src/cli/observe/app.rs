@@ -291,6 +291,7 @@ impl App {
                 } else {
                     vec![seen[i - 1].clone()]
                 },
+                when: None,
             })
             .collect();
 

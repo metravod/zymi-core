@@ -55,6 +55,7 @@ tools/<name>.py             # Python tools with @tool decorator
 | Add a new agent | `agents/<name>.yml` | docs/agents.md |
 | Add a pipeline | `pipelines/<name>.yml` | docs/pipelines.md |
 | Add a non-LLM (deterministic) step | In a pipeline step use `tool: <name>` instead of `agent: <name>` | docs/pipelines.md#tool-steps |
+| Make a step run conditionally (branching) | Add `when: "${steps.<router>.output} == 'label'"` on the step; needs `depends_on` | docs/pipelines.md#conditional-branching |
 | Add an HTTP tool | `tools/<name>.yml` with `kind: http` | docs/tools.md#declarative-http |
 | Add a shell tool | `tools/<name>.yml` with `kind: shell` | docs/tools.md#declarative-shell |
 | Add a Python tool | `tools/<name>.py` with `@tool` from `zymi` | docs/tools.md#python |
@@ -82,6 +83,20 @@ tools/<name>.py             # Python tools with @tool decorator
 **Templates** (in `body_template`, `command_template`): MiniJinja, e.g.
 `{{ event.content }}` or `{{ event.content | tojson }}`. Standard Jinja2
 syntax; `tojson` is provided.
+
+**Conditional steps** (`when:` on a pipeline step, ADR-0028): a step with
+`when:` runs only if the predicate evaluates true after dependencies
+complete. If skipped, the step's body never runs, no `StepResult` is
+recorded, and a `StepSkipped` event is appended. Skips cascade — any
+descendant with the skipped step in its `depends_on` is also skipped
+without re-evaluating its own `when:`. Use this for agent-driven
+routing: have the router agent call a tool whose return value is the
+branch label, then gate downstream steps on
+`${steps.<router>.output} == 'label'`. Grammar: `VALUE (==|!=) VALUE`
+joined by `&&` / `||` (equal precedence, left-to-right); values are
+single-quoted strings or bare tokens; no parens, no regex, no `in [...]`.
+`when:` requires non-empty `depends_on`, and every `${steps.X.output}`
+it reads must be a declared ancestor.
 
 **Naming:**
 
