@@ -78,6 +78,7 @@ pub fn indent_level(kind: &EventKind) -> u8 {
 
         EventKind::WorkflowNodeStarted { .. }
         | EventKind::WorkflowNodeCompleted { .. }
+        | EventKind::StepSkipped { .. }
         | EventKind::AgentProcessingStarted { .. }
         | EventKind::AgentProcessingCompleted { .. }
         | EventKind::ShellSessionStarted { .. }
@@ -395,6 +396,14 @@ pub fn format_event(event: &Event) -> FormattedEvent {
             short_detail: if *success { "ok".into() } else { "FAIL".into() },
             full_detail: format!("success: {success}"),
             color: if *success { EventColor::Success } else { EventColor::Failure },
+            indent,
+        },
+        EventKind::StepSkipped { step_id, reason } => FormattedEvent {
+            icon: "⊘",
+            label: format!("WF:{step_id}"),
+            short_detail: format!("skipped ({reason})"),
+            full_detail: format!("step: {step_id}\nreason: {reason}"),
+            color: EventColor::Dim,
             indent,
         },
 
