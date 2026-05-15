@@ -36,6 +36,7 @@ use crate::events::bus::EventBus;
 use crate::events::store::EventStore;
 use crate::events::{Event, EventKind, OutputResolutionVia};
 use crate::llm::{ChatRequest, ChatResponse, LlmProvider};
+use crate::config::pipeline::StepContextMode;
 use crate::runtime::context_builder::{ContextBuilder, ContextConfig};
 use crate::runtime::context_window::approx_chars;
 use crate::runtime::ToolCatalog;
@@ -291,6 +292,11 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
                         .clone();
                     let task = resolve_task_template(raw_task, &cmd.inputs, &step_outputs);
                     let context = build_step_context(step_id, &step.depends_on, &step_outputs);
+                    let context_mode = step
+                        .context
+                        .as_ref()
+                        .map(|c| c.mode)
+                        .unwrap_or_default();
 
                     handles.push(tokio::spawn(async move {
                         run_agent_step(
@@ -312,6 +318,7 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
                             approval_channel,
                             approval_timeout,
                             context_config,
+                            context_mode,
                             is_resume,
                         )
                         .await
@@ -513,6 +520,11 @@ async fn run_agent_step(
     approval_channel: Option<String>,
     approval_timeout: std::time::Duration,
     context_config: ContextConfig,
+    // ADR-0031 per-step context policy. `Fresh` causes Layer C of the
+    // ContextBuilder to drop events from prior runs of this same
+    // `step_stream_id`. `Inherit` (or absent) preserves ADR-0016 §4
+    // behaviour.
+    context_mode: StepContextMode,
     // `true` when this step is being re-executed inside a `zymi resume`
     // fork (i.e. the parent's `ResumeContext` is in effect). Tools marked
     // `no_resume: true` in the catalog are shadowed in this mode: the
@@ -540,7 +552,7 @@ async fn run_agent_step(
 
     // The ContextBuilder reads from the event store and reconstructs the
     // conversation on every iteration — no mutable Vec<Message>.
-    let context_builder = ContextBuilder::new(
+    let mut context_builder = ContextBuilder::new(
         Arc::clone(store),
         memory.clone(),
         step_stream_id.clone(),
@@ -549,6 +561,14 @@ async fn run_agent_step(
         context_config,
     )
     .with_compaction(Arc::clone(&provider), Arc::clone(&bus));
+
+    // ADR-0031: capture the cutoff before the first iteration runs. Any
+    // events recorded for this `step_stream_id` from prior runs predate
+    // this instant; within-step ReAct iterations record events after it,
+    // so they remain visible.
+    if matches!(context_mode, StepContextMode::Fresh) {
+        context_builder = context_builder.with_fresh_after(chrono::Utc::now());
+    }
 
     // Reborrow for the rest of the function (emit_event expects &EventBus).
     let bus: &EventBus = &bus;

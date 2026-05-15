@@ -84,6 +84,37 @@ runtime:
 
 For non-interactive evaluation runs (`zymi eval`, batch processing). Tighter than coding-agent defaults so failing runs don't burn a full context budget before timing out, but still keeps enough trajectory for typical eval prompts.
 
+## Per-step `context.mode: fresh` (ADR-0031)
+
+The five knobs above run on every agent step uniformly. That's right for conversational steps — smalltalk should remember the last turn — and wrong for retrieval / analytical steps. In a chat router pipeline where every turn lands in the same `stream_id` (the chat id), the `retrieve` step's sub-stream piles up across runs: yesterday's question-and-chunks polluting today's retrieval.
+
+Opt out per step:
+
+```yaml
+steps:
+  - id: smalltalk
+    agent: chat
+    task: ${inputs.user_message}
+    # context: omitted → inherit (conversational tail, the default)
+
+  - id: retrieve
+    agent: researcher
+    task: ${inputs.user_message}
+    context:
+      mode: fresh    # drop prior runs' tail from Layer C
+```
+
+Semantics:
+
+- `mode: inherit` (default, absent block ≡ this): no change. The full sub-stream is reconstructed as Layer C.
+- `mode: fresh`: at the top of the step, `ContextBuilder` captures `step_start = now()` and filters Layer C to events with `timestamp >= step_start`. Within the step, ReAct iterations still see each other's tool calls (their events timestamp after the cutoff). Across runs, the previous run's events are dropped.
+
+What is **not** changed:
+
+- `step_stream_id` stays `{stream_id}:step:{step_id}`. The events still land in the same sub-stream — `zymi observe` and `zymi events` see them. `zymi resume` keeps working.
+- Layer A (system + task) and Layer B (memory snapshot) are untouched.
+- Tool steps (`kind: Tool`) build no context; the block is accepted on tool steps but inert.
+
 ## What happens if you skip the block
 
 When `project.yml` has no `runtime.context:` section (or no `runtime:` block at all), the engine uses defaults and `zymi serve` prints one info-line on startup:
@@ -107,5 +138,6 @@ The knobs are surfaced in two event streams you can replay or `zymi events` agai
 ## See also
 
 - **ADR-0016** — original design (`adr/0016-context-window-management.md`), including §3 (observation masking) and §Slice 6 (the `forget_after_turns` rationale for conversational use).
+- **ADR-0031** — per-step `context.mode: fresh` opt-out (`adr/0031-step-context-mode-fresh.md`).
 - **`docs/project-yaml.md`** — full `runtime:` block schema alongside `connectors:`, `outputs:`, `approvals:`.
 - **`docs/events-and-replay.md`** — how `ContextCompacted` works during replay and forks.

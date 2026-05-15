@@ -55,6 +55,33 @@ pub struct PipelineStep {
     /// `${inputs.*}` / `${steps.*.output}` are substituted first; the parser
     /// then sees a fully-resolved string. Topology is unaffected.
     pub when: Option<String>,
+    /// Optional per-step context policy (ADR-0031). Defaults to inherit
+    /// (full sub-stream reconstruction, ADR-0016 §4 behaviour).
+    pub context: Option<StepContextConfig>,
+}
+
+/// Per-step context construction policy (ADR-0031). The block is accepted
+/// on every step shape but only takes effect on agent steps — tool steps
+/// build no context.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct StepContextConfig {
+    #[serde(default)]
+    pub mode: StepContextMode,
+}
+
+/// Context construction modes for [`StepContextConfig`] (ADR-0031).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum StepContextMode {
+    /// Default. ContextBuilder reads the full sub-stream — ADR-0016 §4
+    /// behaviour, suited to conversational steps.
+    #[default]
+    Inherit,
+    /// Layer C is filtered to events with `timestamp >= step_start`.
+    /// Prior runs' events for the same `step_stream_id` are dropped.
+    /// Suited to retrieval / analytical steps that should treat each run
+    /// as an independent task.
+    Fresh,
 }
 
 /// Step body. The two variants are mutually exclusive at the YAML level.
@@ -100,6 +127,8 @@ struct PipelineStepRaw {
     pub depends_on: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub when: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<StepContextConfig>,
 }
 
 impl<'de> Deserialize<'de> for PipelineStep {
@@ -149,6 +178,7 @@ impl<'de> Deserialize<'de> for PipelineStep {
             kind,
             depends_on: raw.depends_on,
             when: raw.when,
+            context: raw.context,
         })
     }
 }
@@ -164,6 +194,7 @@ impl Serialize for PipelineStep {
                 args: None,
                 depends_on: self.depends_on.clone(),
                 when: self.when.clone(),
+                context: self.context.clone(),
             },
             PipelineStepKind::Tool { tool, args } => PipelineStepRaw {
                 id: self.id.clone(),
@@ -173,6 +204,7 @@ impl Serialize for PipelineStep {
                 args: Some(args.clone()),
                 depends_on: self.depends_on.clone(),
                 when: self.when.clone(),
+                context: self.context.clone(),
             },
         };
         raw.serialize(s)
@@ -521,6 +553,49 @@ steps:
         assert_eq!(
             config.steps[1].when.as_deref(),
             Some("${steps.router.output} == 'short'")
+        );
+    }
+
+    #[test]
+    fn step_context_mode_fresh_parses() {
+        let dir = TempDir::new().unwrap();
+        let yaml = r#"
+name: test
+steps:
+  - id: retrieve
+    agent: researcher
+    task: "find"
+    context:
+      mode: fresh
+  - id: smalltalk
+    agent: chat
+    task: "hi"
+"#;
+        let path = write_file(&dir, "pipeline.yml", yaml);
+        let config = load_pipeline(&path, &HashMap::new()).unwrap();
+        assert_eq!(
+            config.steps[0].context.as_ref().map(|c| c.mode),
+            Some(StepContextMode::Fresh)
+        );
+        assert!(config.steps[1].context.is_none());
+    }
+
+    #[test]
+    fn step_context_mode_inherit_is_default_when_unspecified() {
+        let dir = TempDir::new().unwrap();
+        let yaml = r#"
+name: test
+steps:
+  - id: chat
+    agent: a
+    task: "hi"
+    context: {}
+"#;
+        let path = write_file(&dir, "pipeline.yml", yaml);
+        let config = load_pipeline(&path, &HashMap::new()).unwrap();
+        assert_eq!(
+            config.steps[0].context.as_ref().map(|c| c.mode),
+            Some(StepContextMode::Inherit)
         );
     }
 

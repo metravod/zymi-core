@@ -558,6 +558,7 @@ mod tests {
                     },
                     depends_on: deps.iter().map(|s| (*s).into()).collect(),
                     when: None,
+                    context: None,
                 })
                 .collect(),
             output: None,
@@ -1083,6 +1084,7 @@ mod tests {
             },
             depends_on: vec![],
             when: None,
+            context: None,
         });
         if let Some(sum) = p.steps.iter_mut().find(|s| s.id == "summarize") {
             sum.depends_on.push("extra".into());

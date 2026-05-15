@@ -494,6 +494,7 @@ mod tests {
                     },
                     depends_on: deps.into_iter().map(String::from).collect(),
                     when: None,
+                    context: None,
                 })
                 .collect(),
             output: None,
@@ -511,6 +512,7 @@ mod tests {
             },
             depends_on: deps.into_iter().map(String::from).collect(),
             when: None,
+            context: None,
         }
     }
 
@@ -798,6 +800,7 @@ mod tests {
             },
             depends_on: deps.into_iter().map(String::from).collect(),
             when: when_expr.map(String::from),
+            context: None,
         }
     }
 

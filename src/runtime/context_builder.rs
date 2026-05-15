@@ -12,6 +12,8 @@
 
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
+
 use crate::engine::tools::MemoryStore;
 use crate::events::bus::EventBus;
 use crate::events::store::EventStore;
@@ -111,6 +113,11 @@ pub struct ContextBuilder {
     provider: Option<Arc<dyn LlmProvider>>,
     /// Optional: required for emitting compaction events.
     bus: Option<Arc<EventBus>>,
+    /// ADR-0031 `context.mode: fresh`. When set, Layer C is filtered to
+    /// events with `timestamp >= fresh_after`. Used by retrieval / analytical
+    /// agent steps that should not carry prior runs' tail across the same
+    /// `step_stream_id`. `None` preserves ADR-0016 §4 behaviour.
+    fresh_after: Option<DateTime<Utc>>,
 }
 
 impl ContextBuilder {
@@ -131,6 +138,7 @@ impl ContextBuilder {
             config,
             provider: None,
             bus: None,
+            fresh_after: None,
         }
     }
 
@@ -142,6 +150,14 @@ impl ContextBuilder {
     ) -> Self {
         self.provider = Some(provider);
         self.bus = Some(bus);
+        self
+    }
+
+    /// ADR-0031 `context.mode: fresh`. Filter Layer C to events newer than
+    /// `cutoff`. Used by run_pipeline.rs at the top of an agent step whose
+    /// config declares `context.mode: fresh`.
+    pub fn with_fresh_after(mut self, cutoff: DateTime<Utc>) -> Self {
+        self.fresh_after = Some(cutoff);
         self
     }
 
@@ -179,6 +195,18 @@ impl ContextBuilder {
             .read_stream(&self.stream_id, 0)
             .await
             .map_err(ContextError::StoreError)?;
+
+        // ADR-0031: drop events that predate this step's start when
+        // `context.mode: fresh` is in effect. The cutoff is captured by
+        // the caller before the first iteration, so within-step ReAct
+        // iterations stay visible (their events timestamp after the cutoff).
+        let events: Vec<Event> = match self.fresh_after {
+            Some(cutoff) => events
+                .into_iter()
+                .filter(|e| e.timestamp >= cutoff)
+                .collect(),
+            None => events,
+        };
 
         let tail = events_to_messages(&events);
         let tail = match self.config.forget_after_turns {
@@ -967,6 +995,84 @@ mod tests {
         let messages = builder.build().await.unwrap();
         // Only prefix: sys + task. All noise events excluded.
         assert_eq!(messages.len(), 2);
+    }
+
+    // ── ADR-0031 fresh_after filter ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn fresh_after_drops_events_before_cutoff() {
+        let (store, bus, memory) = setup().await;
+        let stream = "fresh-test";
+
+        // Batch 1 — prior run's tail. Should be filtered out.
+        let assistant_old = assistant_msg(
+            Some("old"),
+            vec![tc("old-tc", "read_file", r#"{"path":"a"}"#)],
+        );
+        emit(
+            &bus,
+            stream,
+            EventKind::LlmCallCompleted {
+                response_message: Some(assistant_old),
+                has_tool_calls: true,
+                usage: None,
+                content_preview: None,
+            },
+        )
+        .await;
+        emit(
+            &bus,
+            stream,
+            EventKind::ToolCallCompleted {
+                call_id: "old-tc".into(),
+                result: "old-result".into(),
+                result_preview: "old-result".into(),
+                is_error: false,
+                duration_ms: 1,
+                replayed: false,
+            },
+        )
+        .await;
+
+        // Ensure the cutoff falls strictly between batches.
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let cutoff = Utc::now();
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+
+        // Batch 2 — current run. Survives.
+        let assistant_new = assistant_msg(Some("new"), vec![]);
+        emit(
+            &bus,
+            stream,
+            EventKind::LlmCallCompleted {
+                response_message: Some(assistant_new),
+                has_tool_calls: false,
+                usage: None,
+                content_preview: None,
+            },
+        )
+        .await;
+
+        let builder = ContextBuilder::new(
+            store,
+            memory,
+            stream.into(),
+            "sys".into(),
+            "task".into(),
+            ContextConfig::default(),
+        )
+        .with_fresh_after(cutoff);
+
+        let messages = builder.build().await.unwrap();
+
+        // Prefix (sys + user task) + 1 assistant from batch 2 = 3.
+        assert_eq!(messages.len(), 3);
+        match &messages[2] {
+            Message::Assistant { content, .. } => {
+                assert_eq!(content.as_deref(), Some("new"));
+            }
+            other => panic!("expected new Assistant, got {other:?}"),
+        }
     }
 
     // ── ContextCompacted tests ──────────────────────────────────────────
