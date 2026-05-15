@@ -52,8 +52,8 @@ fn draw_runs(frame: &mut Frame, app: &App, area: Rect) {
         .map(run_list_item)
         .collect();
 
-    let title = if app.follow_tail {
-        format!("Runs ({}) · follow", app.runs.len())
+    let title = if app.frozen {
+        format!("Runs ({}) · frozen", app.runs.len())
     } else {
         format!("Runs ({})", app.runs.len())
     };
@@ -320,9 +320,9 @@ fn wrap_line(s: &str, width: usize) -> Vec<String> {
 }
 
 fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
-    let follow = if app.follow_tail { "on" } else { "off" };
+    let state = if app.frozen { "frozen" } else { "live" };
     let text = format!(
-        "q quit  Tab cycle  ↑↓ nav  Enter expand/focus  f follow={follow}  r refresh  R fork-resume"
+        "q quit  Tab cycle  ↑↓ nav  Enter expand/focus  f freeze ({state})  r refresh  R fork-resume"
     );
     let paragraph =
         Paragraph::new(text).style(Style::default().fg(Color::DarkGray));

@@ -101,7 +101,10 @@ pub struct App {
     pub graph_warning: Option<String>,
 
     pub focus: Focus,
-    pub follow_tail: bool,
+    /// When `true`, the runs list and selected-run events stop auto-reloading.
+    /// Default is `false` (live): toggle with `f` to freeze the view while
+    /// inspecting a row.
+    pub frozen: bool,
     pub should_quit: bool,
 
     pub fork_prompt: Option<ForkPrompt>,
@@ -123,7 +126,7 @@ impl App {
             graph_cursor: 0,
             graph_warning: None,
             focus: Focus::Runs,
-            follow_tail: true,
+            frozen: false,
             should_quit: false,
             fork_prompt: None,
         }

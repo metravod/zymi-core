@@ -121,7 +121,7 @@ async fn run_loop(
                 }
             }
             _ = refresh_tick.tick() => {
-                if app.follow_tail {
+                if !app.frozen {
                     if let Err(e) = app.reload_runs().await {
                         break Err(e);
                     }
@@ -201,7 +201,7 @@ async fn handle_key(
         (KeyCode::Tab, _) => app.focus = app.focus.next(),
         (KeyCode::BackTab, _) => app.focus = app.focus.prev(),
 
-        (KeyCode::Char('f'), _) => app.follow_tail = !app.follow_tail,
+        (KeyCode::Char('f'), _) => app.frozen = !app.frozen,
         (KeyCode::Char('r'), _) => {
             app.reload_runs().await?;
             app.load_selected_run().await?;
