@@ -772,11 +772,16 @@ async fn spawn_mcp_servers(
     let mut failures: Vec<FailedServer> = Vec::new();
 
     for cfg in specs {
+        let cwd = match cfg.cwd.as_ref() {
+            Some(p) if p.is_absolute() => p.clone(),
+            Some(p) => project_root.join(p),
+            None => project_root.to_path_buf(),
+        };
         let spec = McpServerSpec {
             name: cfg.name.clone(),
             command: cfg.command.clone(),
             env: cfg.env.clone(),
-            cwd: Some(project_root.to_path_buf()),
+            cwd: Some(cwd),
         };
         let init_timeout = Duration::from_secs(cfg.effective_init_timeout_secs());
         let call_timeout = Duration::from_secs(cfg.effective_call_timeout_secs());
@@ -995,6 +1000,7 @@ mod mcp_tests {
             init_timeout_secs: Some(1),
             call_timeout_secs: Some(1),
             restart: None,
+            cwd: None,
         }
     }
 

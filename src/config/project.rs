@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -141,6 +141,14 @@ pub struct McpServerConfig {
     /// down until the runtime is restarted.
     #[serde(default)]
     pub restart: Option<McpRestartConfig>,
+    /// Working directory for the subprocess. Relative paths resolve
+    /// against the project root. Absent → the project root itself,
+    /// preserving prior behaviour. The MCP spec already allows a
+    /// per-server `cwd`; some servers (e.g. filesystem) resolve their
+    /// own arguments relative to it, so a per-server override is the
+    /// right granularity.
+    #[serde(default)]
+    pub cwd: Option<PathBuf>,
 }
 
 /// Per-server restart policy (ADR-0023 §Lifecycle). Reactive: a crash is
@@ -720,6 +728,24 @@ mcp_servers:
     }
 
     #[test]
+    fn mcp_server_cwd_parses_optional() {
+        let dir = TempDir::new().unwrap();
+        let yaml = r#"
+name: test
+mcp_servers:
+  - name: fs_sub
+    command: ["mcp-fs"]
+    cwd: ./sandbox
+  - name: fs_root
+    command: ["mcp-fs"]
+"#;
+        let path = write_file(&dir, "project.yml", yaml);
+        let config = load_project(&path).unwrap();
+        assert_eq!(config.mcp_servers[0].cwd.as_deref(), Some(Path::new("./sandbox")));
+        assert!(config.mcp_servers[1].cwd.is_none());
+    }
+
+    #[test]
     fn mcp_server_timeouts_and_restart_parse() {
         let dir = TempDir::new().unwrap();
         let yaml = r#"
@@ -762,6 +788,7 @@ mcp_servers:
             init_timeout_secs: None,
             call_timeout_secs: None,
             restart: None,
+            cwd: None,
         };
         assert_eq!(cfg.effective_init_timeout_secs(), 10);
         assert_eq!(cfg.effective_call_timeout_secs(), 60);

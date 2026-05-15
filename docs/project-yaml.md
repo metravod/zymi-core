@@ -62,6 +62,7 @@ mcp_servers:
     restart:
       max_restarts: 2
       backoff_secs: [1, 5]
+    # cwd: ./sandbox          # default: project root. Relative paths resolve against it.
 
 # --- Inbound connectors (event sources) -----------------------------------
 connectors:

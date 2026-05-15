@@ -120,6 +120,7 @@ mcp_servers:
       max_restarts: 2
       backoff_secs: [1, 5]
     requires_approval: false         # default. Set true to gate every tool.
+    # cwd: ./sandbox                 # default: project root. Relative paths resolve against it.
 ```
 
 Then in an agent:
