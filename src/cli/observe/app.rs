@@ -123,7 +123,7 @@ impl App {
             graph_cursor: 0,
             graph_warning: None,
             focus: Focus::Runs,
-            follow_tail: false,
+            follow_tail: true,
             should_quit: false,
             fork_prompt: None,
         }
