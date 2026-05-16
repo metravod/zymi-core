@@ -30,7 +30,7 @@ Most agent frameworks are imperative Python: write a script that makes LLM calls
 
 Bring a useful agent online in minutes without writing code. A year later, still answer *exactly what this agent did* on any past run.
 
-📚 **AI-assistant friendly out of the box.** Every `zymi init` scaffold drops an `AGENTS.md` into the user's project — vocabulary, file map, task→file routing. Claude Code / Cursor / Aider read it automatically; the YAML they help you write gets noticeably more correct.
+📚 **AI-assistant friendly out of the box.** Every `zymi init` scaffold drops an `AGENTS.md` into the user's project — vocabulary, file map, task→file routing. Claude Code / Cursor / Aider read it automatically; the YAML they help you write gets noticeably more correct. For agents that *build* zymi projects (rather than work inside one), install [zymi-skill](https://github.com/metravod/zymi-skill) into your assistant — opinionated Agent Skill with activation rules + progressive disclosure references, so the assistant produces zymi-native YAML instead of generic agent advice.
 
 ---
 

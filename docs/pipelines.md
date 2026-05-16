@@ -25,9 +25,9 @@ steps:                      # required. One or more steps.
     when: "..."             # optional. Conditional edge (ADR-0028).
 
   - id: enrich              # tool step (ADR-0024): direct dispatch, no LLM.
-    tool: get_weather
+    tool: get_weather       # any tool defined in tools/ (declarative or Python @tool)
     args:
-      city: "${steps.research.output | extract_city}"
+      city: "${inputs.topic}"   # ${…} substitution only — no Jinja filters here
     depends_on: [research]
 
   - id: write_up
@@ -64,11 +64,15 @@ The agent runs its ReAct loop bounded by its `max_iterations`. The step's `outpu
 
 ```yaml
 - id: fetch
-  tool: http_get            # any tool the catalog knows
+  tool: get_user            # any tool in the catalog: builtin
+                            # (read_file, write_file, execute_shell_command,
+                            # write_memory, spawn_sub_agent), a declarative
+                            # tools/*.yml, a Python @tool, or an MCP tool
+                            # (mcp__<server>__<name>). There is no implicit
+                            # http_get — define a kind: http tool in
+                            # tools/get_user.yml or write a Python @tool.
   args:
-    url: "https://api.example.com/v1/${inputs.id}"
-    headers:
-      Authorization: "Bearer ${env.API_KEY}"
+    id: "${inputs.id}"
   depends_on: []
 ```
 
@@ -250,6 +254,11 @@ output:
 
 **Mixed pipeline (deterministic + agent):**
 
+Assumes you have defined `tools/fetch_ticket.yml` (kind: http) and
+`tools/slack_post.yml` (kind: http) — there are no built-in `http_get`
+or `slack_post` tools, the tool step dispatches whatever is in the
+catalog.
+
 ```yaml
 name: triage
 inputs:
@@ -257,9 +266,9 @@ inputs:
 
 steps:
   - id: fetch_ticket           # deterministic — no LLM
-    tool: http_get
+    tool: fetch_ticket         # → tools/fetch_ticket.yml (kind: http)
     args:
-      url: "https://api.example.com/tickets/${inputs.ticket_id}"
+      ticket_id: "${inputs.ticket_id}"
 
   - id: classify               # LLM
     agent: classifier
@@ -267,7 +276,7 @@ steps:
     depends_on: [fetch_ticket]
 
   - id: notify                 # deterministic
-    tool: slack_post
+    tool: slack_post           # → tools/slack_post.yml (kind: http)
     args:
       channel: "#triage"
       text: "Ticket ${inputs.ticket_id} → ${steps.classify.output}"

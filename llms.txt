@@ -24,6 +24,10 @@
 
 - [ADR index](adr/): one file per decision; canonical context for design tradeoffs
 
+## For AI assistants building with zymi
+
+- [zymi-skill](https://github.com/metravod/zymi-skill): opinionated Agent Skill (SKILL.md + references/) for Claude Code / Codex / any agent-skills-compatible harness. Activates on mentions of `zymi`, edits to `project.yml` / `pipelines/*.yml` / `tools/*.py`, or working directories containing `.zymi/`. Drop it in `~/.claude/skills/` (or the equivalent for your tool) and the assistant produces zymi-native YAML instead of translating from generic agent advice.
+
 ## Optional
 
 - [CONTRIBUTING](CONTRIBUTING.md): contributor flow, build matrix, release process

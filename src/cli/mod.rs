@@ -68,7 +68,7 @@ enum Command {
         #[arg(short, long)]
         name: Option<String>,
 
-        /// Scaffold from a built-in example (e.g. "research")
+        /// Scaffold from a built-in example. Currently only "telegram".
         #[arg(long)]
         example: Option<String>,
     },
