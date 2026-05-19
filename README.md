@@ -39,20 +39,27 @@ Bring a useful agent online in minutes without writing code. A year later, still
 This is the canonical demo — a real chat bot, wired declaratively.
 
 ```bash
-pip install zymi-core
+uv tool install zymi-core    # one-time; puts `zymi` on PATH globally
 
 mkdir telegram-agent && cd telegram-agent
 zymi init --example telegram
 
 # 1. Create a bot via @BotFather in Telegram; copy the token.
 # 2. Fill .env:
-cp .env.example .env       # edit TELEGRAM_BOT_TOKEN + OPENAI_API_KEY
+cp .env.example .env         # edit TELEGRAM_BOT_TOKEN + OPENAI_API_KEY
 # 3. Open project.yml, replace "your_username_here" with your actual
 #    Telegram username (no @). Keeps strangers out of the bot.
 
-set -a; source .env; set +a
-zymi serve chat
+zymi fetch                   # uv sync — builds ./.venv from pyproject.toml
+zymi serve chat              # .env is auto-loaded; pipeline runs in ./.venv
 ```
+
+> **Why `uv tool install` and `zymi fetch`?** `zymi` is a global CLI; your
+> project keeps its own `pyproject.toml` + `.venv` for any Python deps your
+> `@tool` files import. `zymi fetch` wraps `uv sync` to build that venv, and
+> pipeline-run commands transparently re-exec inside it ([ADR-0032](adr/0032-install-ux-fetch.md)).
+> Don't have `uv` yet? `curl -LsSf https://astral.sh/uv/install.sh | sh`
+> (macOS/Linux) or `irm https://astral.sh/uv/install.ps1 | iex` (Windows).
 
 Message the bot. It replies in seconds. Every inbound message, LLM call, approval decision, and outbound reply is in `.zymi/events.db`; watch live with `zymi observe`.
 
@@ -187,7 +194,10 @@ zymi schema --all
 
 ## Python embedding
 
-The same `pip install zymi-core` exposes a Python API: `Runtime`, `Event`, `EventBus`, `EventStore`, `Subscription`, `ToolRegistry`, plus the `@tool` decorator.
+When `zymi-core` is in your project's venv (`uv add zymi-core` in a uv
+project, or `pip install zymi-core` in a traditional venv), the same wheel
+exposes a Python API: `Runtime`, `Event`, `EventBus`, `EventStore`,
+`Subscription`, `ToolRegistry`, plus the `@tool` decorator.
 
 ```python
 from zymi import Runtime
@@ -230,8 +240,9 @@ Full surface → [docs/python-api.md](docs/python-api.md).
 ## CLI cheatsheet
 
 ```bash
-zymi init [--example telegram]              # scaffold a project
-zymi run <pipeline> -i key=value …          # one-shot run
+zymi init [--example telegram]              # scaffold a project (writes pyproject.toml too)
+zymi fetch                                  # uv sync — build ./.venv from pyproject.toml
+zymi run <pipeline> -i key=value …          # one-shot run (re-execs in ./.venv if present)
 zymi serve <pipeline>                       # long-running: react to PipelineRequested
 
 zymi runs                                   # list pipeline runs

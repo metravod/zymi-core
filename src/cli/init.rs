@@ -4,6 +4,8 @@ use std::path::Path;
 const KNOWN_EXAMPLES: &[&str] = &["telegram"];
 
 const PROJECT_NAME_PLACEHOLDER: &str = "__PROJECT_NAME__";
+const ZYMI_VERSION_PLACEHOLDER: &str = "__ZYMI_VERSION__";
+const ZYMI_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // ---------------------------------------------------------------------------
 // Scaffold templates — kept as plain .yml/.md/.py files under
@@ -16,6 +18,8 @@ const PROJECT_NAME_PLACEHOLDER: &str = "__PROJECT_NAME__";
 const WEB_SEARCH_TOOL: &str = include_str!("../../assets/scaffold/shared/web_search.yml");
 const WEB_SCRAPE_TOOL: &str = include_str!("../../assets/scaffold/shared/web_scrape.yml");
 const AGENTS_DOC: &str = include_str!("../../assets/scaffold/shared/AGENTS.md");
+const SHARED_PYPROJECT_TOML: &str = include_str!("../../assets/scaffold/shared/pyproject.toml");
+const SHARED_PYTHON_VERSION: &str = include_str!("../../assets/scaffold/shared/.python-version");
 
 // Default scaffold.
 const DEFAULT_PROJECT_YML: &str = include_str!("../../assets/scaffold/default/project.yml");
@@ -34,6 +38,30 @@ const TG_ENV_EXAMPLE: &str = include_str!("../../assets/scaffold/telegram/.env.e
 
 fn render(template: &str, project_name: &str) -> String {
     template.replace(PROJECT_NAME_PLACEHOLDER, project_name)
+}
+
+fn render_pyproject(template: &str, project_name: &str) -> String {
+    render(template, project_name).replace(ZYMI_VERSION_PLACEHOLDER, ZYMI_VERSION)
+}
+
+/// Idempotently append lines to `.gitignore`.
+fn ensure_gitignore(root: &Path, lines: &[&str]) -> Result<(), String> {
+    let path = root.join(".gitignore");
+    let current = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut updated = current.clone();
+    for line in lines {
+        if !updated.lines().any(|l| l.trim() == *line) {
+            if !updated.is_empty() && !updated.ends_with('\n') {
+                updated.push('\n');
+            }
+            updated.push_str(line);
+            updated.push('\n');
+        }
+    }
+    if updated != current {
+        write_file(&path, &updated)?;
+    }
+    Ok(())
 }
 
 pub fn exec(name: Option<String>, example: Option<&str>) -> Result<(), String> {
@@ -83,6 +111,12 @@ fn scaffold_default(root: &Path, project_name: &str) -> Result<(), String> {
     write_file(&root.join("tools/web_search.yml"), WEB_SEARCH_TOOL)?;
     write_file(&root.join("tools/web_scrape.yml"), WEB_SCRAPE_TOOL)?;
     write_file(&root.join("AGENTS.md"), AGENTS_DOC)?;
+    write_file(
+        &root.join("pyproject.toml"),
+        &render_pyproject(SHARED_PYPROJECT_TOML, project_name),
+    )?;
+    write_file(&root.join(".python-version"), SHARED_PYTHON_VERSION)?;
+    ensure_gitignore(root, &[".venv/", ".zymi/", "__pycache__/"])?;
 
     println!("Initialized zymi project '{project_name}'");
     println!();
@@ -92,10 +126,16 @@ fn scaffold_default(root: &Path, project_name: &str) -> Result<(), String> {
     println!("  tools/web_search.yml     — web search tool (configure your provider)");
     println!("  tools/web_scrape.yml     — web scrape tool (configure your provider)");
     println!("  AGENTS.md                — guide for AI assistants editing this project");
+    println!("  pyproject.toml           — Python deps (zymi-core + your @tool deps)");
+    println!("  .python-version          — pinned Python minor for uv (3.12)");
     println!("  .zymi/                   — runtime data (events.db)");
     println!();
-    println!("Next: configure your LLM provider in project.yml, then run:");
-    println!("  zymi run main");
+    println!("Next:");
+    println!("  1. Configure your LLM provider in project.yml.");
+    println!("  2. zymi fetch                # builds ./.venv from pyproject.toml (uv sync)");
+    println!("  3. zymi run main             # or `zymi serve main` for long-lived service");
+    println!();
+    println!("If `zymi` is not on PATH yet:  uv tool install zymi-core");
 
     Ok(())
 }
@@ -116,23 +156,12 @@ fn scaffold_telegram(root: &Path, project_name: &str) -> Result<(), String> {
     write_file(&root.join("tools/translate.py"), TG_TRANSLATE_PY)?;
     write_file(&root.join("AGENTS.md"), AGENTS_DOC)?;
     write_file(&root.join(".env.example"), TG_ENV_EXAMPLE)?;
-
-    // Ensure `.env` never gets committed by accident.
-    let gitignore_path = root.join(".gitignore");
-    let current = std::fs::read_to_string(&gitignore_path).unwrap_or_default();
-    let mut updated = current.clone();
-    for line in [".env", ".zymi/"] {
-        if !updated.lines().any(|l| l.trim() == line) {
-            if !updated.is_empty() && !updated.ends_with('\n') {
-                updated.push('\n');
-            }
-            updated.push_str(line);
-            updated.push('\n');
-        }
-    }
-    if updated != current {
-        write_file(&gitignore_path, &updated)?;
-    }
+    write_file(
+        &root.join("pyproject.toml"),
+        &render_pyproject(SHARED_PYPROJECT_TOML, project_name),
+    )?;
+    write_file(&root.join(".python-version"), SHARED_PYTHON_VERSION)?;
+    ensure_gitignore(root, &[".env", ".venv/", ".zymi/", "__pycache__/"])?;
 
     println!("Initialized zymi project '{project_name}' with telegram example");
     println!();
@@ -143,9 +172,11 @@ fn scaffold_telegram(root: &Path, project_name: &str) -> Result<(), String> {
     println!("  tools/web_search.yml     — declarative search tool (configure a provider)");
     println!("  tools/web_scrape.yml     — declarative scrape tool (configure a provider)");
     println!("  tools/broadcast.yml      — gated `requires_approval: true` tool (ADR-0022)");
-    println!("  tools/get_weather.py     — sync @tool (auto-discovered, requires pip-installed zymi)");
-    println!("  tools/translate.py       — async @tool (auto-discovered, requires pip-installed zymi)");
+    println!("  tools/get_weather.py     — sync @tool (auto-discovered, runs in project .venv)");
+    println!("  tools/translate.py       — async @tool (auto-discovered, runs in project .venv)");
     println!("  AGENTS.md                — guide for AI assistants editing this project");
+    println!("  pyproject.toml           — Python deps (zymi-core + your @tool deps)");
+    println!("  .python-version          — pinned Python minor for uv (3.12)");
     println!("  .env.example             — token placeholders");
     println!("  .zymi/                   — runtime data (events.db, connectors.db)");
     println!();
@@ -166,8 +197,10 @@ fn scaffold_telegram(root: &Path, project_name: &str) -> Result<(), String> {
     println!("     (Brave / Tavily / SerpAPI / Google) + set its API key in .env.");
     println!("     Without this the bot still works — it just answers from its own");
     println!("     knowledge instead of searching the web.");
-    println!("  6. set -a; source .env; set +a   # export vars to child processes");
-    println!("     ~/.../target/release/zymi serve chat   # or your installed `zymi`");
+    println!("  6. zymi fetch                # builds ./.venv from pyproject.toml (uv sync)");
+    println!("     zymi serve chat           # launches the bot");
+    println!();
+    println!("If `zymi` is not on PATH yet:  uv tool install zymi-core");
     println!();
     println!("Tip: once running, message the bot on Telegram — you should see an agent");
     println!("     reply within a couple of seconds. The DAG (respond → polish) is");

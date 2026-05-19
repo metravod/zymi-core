@@ -1,5 +1,6 @@
 mod event_fmt;
 mod events;
+mod fetch;
 mod init;
 mod mcp;
 mod observe;
@@ -10,6 +11,7 @@ mod runs;
 mod runs_data;
 mod schema;
 mod serve;
+mod venv;
 mod verify;
 
 use std::path::{Path, PathBuf};
@@ -56,6 +58,12 @@ enum McpCommand {
 #[derive(Parser)]
 #[command(name = "zymi", version, about)]
 pub struct Cli {
+    /// Skip the per-project `.venv` re-exec on pipeline-run commands
+    /// (ADR-0032). Useful for contributor workflows where the global
+    /// `zymi` binary already lives in the right Python env.
+    #[arg(long = "no-venv", global = true)]
+    no_venv: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -169,6 +177,18 @@ enum Command {
         dir: Option<PathBuf>,
     },
 
+    /// Sync the project's `.venv` from `pyproject.toml` (wraps `uv sync`).
+    ///
+    /// Pipeline-run commands (`run`, `serve`, `resume`) automatically
+    /// re-exec inside `./.venv/bin/python` when it exists, so user
+    /// `@tool` imports resolve against the project's deps. `zymi fetch`
+    /// is what creates / refreshes that `.venv`.
+    Fetch {
+        /// Project root directory (defaults to cwd)
+        #[arg(short = 'd', long)]
+        dir: Option<PathBuf>,
+    },
+
     /// List pipelines defined in the project
     Pipelines {
         /// Project root directory
@@ -261,12 +281,16 @@ enum Command {
 
 /// Run the CLI. Called from the binary entry point.
 pub fn run() {
-    dispatch(Cli::parse());
+    let cli = Cli::parse();
+    venv::maybe_reexec(&cli);
+    dispatch(cli);
 }
 
 /// Run the CLI with explicit arguments (used by the Python entry point).
 pub fn run_from_args(args: impl IntoIterator<Item = String>) {
-    dispatch(Cli::parse_from(args));
+    let cli = Cli::parse_from(args);
+    venv::maybe_reexec(&cli);
+    dispatch(cli);
 }
 
 fn dispatch(cli: Cli) {
@@ -295,6 +319,7 @@ fn dispatch(cli: Cli) {
             verbose,
             resolve_root(dir.as_deref()),
         ),
+        Command::Fetch { dir } => fetch::exec(resolve_root(dir.as_deref())),
         Command::Pipelines { dir } => pipelines::exec(resolve_root(dir.as_deref())),
         Command::Runs {
             pipeline,
@@ -379,6 +404,7 @@ fn command_dir(cmd: &Command) -> Option<&Path> {
         | Command::Verify { dir, .. }
         | Command::Serve { dir, .. }
         | Command::Resume { dir, .. } => dir.as_deref(),
+        Command::Fetch { dir } => dir.as_deref(),
         Command::Init { .. } | Command::Mcp { .. } | Command::Schema { .. } => None,
     }
 }

@@ -44,9 +44,31 @@ agents/<name>.yml           # one file per agent
 pipelines/<name>.yml        # one file per pipeline
 tools/<name>.yml            # declarative tools (HTTP / shell)
 tools/<name>.py             # Python tools with @tool decorator
+pyproject.toml              # Python deps for this project — zymi-core plus any
+                            # libraries imported by tools/*.py. `zymi fetch` runs
+                            # `uv sync` against this file to build ./.venv.
+.python-version             # pinned Python minor for uv (defaults to 3.12).
+.venv/                      # per-project venv built by `zymi fetch`; pipeline-run
+                            # commands transparently re-exec inside it. Gitignored.
 .zymi/                      # runtime data — events.db, connectors.db. DO NOT edit.
 .env                        # secrets — gitignored. Auto-loaded by zymi.
 ```
+
+## Project lifecycle
+
+```bash
+zymi init [--example telegram]   # scaffold (writes pyproject.toml too)
+zymi fetch                       # uv sync — build ./.venv from pyproject.toml.
+                                 # Run this once after init, and again whenever
+                                 # you add a Python @tool dep (or edit pyproject.toml).
+zymi run <pipeline> -i k=v       # one-shot run — re-execs in ./.venv if present
+zymi serve <pipeline>            # long-running service — same re-exec behaviour
+```
+
+When you add a new Python `@tool` that imports a third-party library
+(`pandas`, `httpx`, …), append the dep to `pyproject.toml`'s
+`dependencies = [...]` list and rerun `zymi fetch` so `./.venv` picks it up.
+ADR-0032 explains the install model in full.
 
 ## Task → file routing
 
@@ -121,6 +143,9 @@ it reads must be a declared ancestor.
 ## Quick command reference
 
 ```bash
+# Sync the project venv (after init or pyproject.toml changes)
+zymi fetch
+
 # One-shot run with explicit inputs
 zymi run <pipeline> -i key=value [-i key=value …]
 

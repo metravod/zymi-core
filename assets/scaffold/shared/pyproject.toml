@@ -1,0 +1,14 @@
+[project]
+name = "__PROJECT_NAME__"
+version = "0.1.0"
+description = "zymi agent project"
+requires-python = ">=3.9"
+dependencies = [
+    "zymi-core>=__ZYMI_VERSION__",
+]
+
+[tool.uv]
+# `zymi fetch` runs `uv sync` against this file and builds the project's
+# own `.venv/`. Any Python deps that your custom `@tool` files import
+# (pandas, httpx, …) belong in `dependencies` above so they are part of
+# the lockfile (`uv.lock`) and reproducible on the deploy host.
