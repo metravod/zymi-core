@@ -281,15 +281,22 @@ enum Command {
 
 /// Run the CLI. Called from the binary entry point.
 pub fn run() {
-    let cli = Cli::parse();
-    venv::maybe_reexec(&cli);
+    let argv: Vec<String> = std::env::args().collect();
+    let cli = Cli::parse_from(&argv);
+    venv::maybe_reexec(&cli, argv.get(1..).unwrap_or(&[]));
     dispatch(cli);
 }
 
 /// Run the CLI with explicit arguments (used by the Python entry point).
+/// The forwarded argv for any potential `.venv` re-exec is derived from
+/// `args` (not `std::env::args()`): when this entry point is reached
+/// through the wheel's `zymi = zymi._cli:main` console script, the
+/// OS-level args include the Python interpreter path inserted by the
+/// shebang, which would leak into the child as a bogus subcommand.
 pub fn run_from_args(args: impl IntoIterator<Item = String>) {
-    let cli = Cli::parse_from(args);
-    venv::maybe_reexec(&cli);
+    let argv: Vec<String> = args.into_iter().collect();
+    let cli = Cli::parse_from(&argv);
+    venv::maybe_reexec(&cli, argv.get(1..).unwrap_or(&[]));
     dispatch(cli);
 }
 

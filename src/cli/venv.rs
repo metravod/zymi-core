@@ -29,10 +29,15 @@ fn pipeline_run_dir(cli: &Cli) -> Option<Option<&Path>> {
 }
 
 /// Entry point — call once at process start, after clap parsing, before
-/// any other work. Returns normally if no re-exec was performed;
-/// otherwise replaces (Unix) or wraps (Windows) the current process and
-/// exits.
-pub fn maybe_reexec(cli: &Cli) {
+/// any other work. `forward_args` is the user-intent argv *without*
+/// argv[0]: when invoked through the Python entry-point (the wheel's
+/// `zymi = zymi._cli:main` console script) it must come from the argv
+/// that `cli_main` received, not from `std::env::args()` — the latter
+/// includes the Python interpreter path inserted by the shebang, which
+/// would leak into the child as a bogus subcommand. Returns normally
+/// if no re-exec was performed; otherwise replaces (Unix) or wraps
+/// (Windows) the current process and exits.
+pub fn maybe_reexec(cli: &Cli, forward_args: &[String]) {
     if cli.no_venv {
         return;
     }
@@ -68,7 +73,7 @@ pub fn maybe_reexec(cli: &Cli) {
         }
     }
 
-    reexec(&target);
+    reexec(&target, forward_args);
 }
 
 fn venv_zymi_path(root: &Path) -> PathBuf {
@@ -80,14 +85,13 @@ fn venv_zymi_path(root: &Path) -> PathBuf {
 }
 
 #[cfg(unix)]
-fn reexec(target: &Path) -> ! {
+fn reexec(target: &Path, args: &[String]) -> ! {
     use std::os::unix::process::CommandExt;
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
     let target_str = target.to_string_lossy().to_string();
 
     let err = std::process::Command::new(target)
-        .args(&args)
+        .args(args)
         .env("ZYMI_VENV_REEXEC", &target_str)
         .exec();
     // `exec` only returns on failure.
@@ -100,12 +104,11 @@ fn reexec(target: &Path) -> ! {
 }
 
 #[cfg(not(unix))]
-fn reexec(target: &Path) -> ! {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+fn reexec(target: &Path, args: &[String]) -> ! {
     let target_str = target.to_string_lossy().to_string();
 
     let status = std::process::Command::new(target)
-        .args(&args)
+        .args(args)
         .env("ZYMI_VENV_REEXEC", &target_str)
         .status();
     match status {
