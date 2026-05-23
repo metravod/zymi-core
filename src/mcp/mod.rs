@@ -9,7 +9,11 @@
 
 pub mod connection;
 pub mod registry;
+#[cfg(feature = "runtime")]
+pub mod server;
 
 pub use crate::plugin::transport::{Transport, TransportError};
 pub use connection::{McpCallResult, McpError, McpServerConnection, McpServerSpec, McpTool};
 pub use registry::{make_id, parse_id, validate_segment, McpRegistry, RestartPolicy, MCP_PREFIX};
+#[cfg(feature = "runtime")]
+pub use server::{serve as serve_mcp, PipelineFilter, ServerConfig};

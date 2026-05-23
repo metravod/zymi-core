@@ -52,6 +52,31 @@ enum McpCommand {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
+
+    /// Serve this project's pipelines as MCP tools over stdio (ADR-0033).
+    ///
+    /// Pipelines opt in by declaring `expose.mcp:` in their YAML. Sync
+    /// mode only in v1 — async-mode pipelines parse but are skipped from
+    /// `tools/list` until Slice 2 (SEP-1686 Tasks).
+    ///
+    /// Example: wire into Claude Desktop via
+    ///   { "command": "zymi", "args": ["mcp", "serve", "--dir", "/path/to/project"] }
+    Serve {
+        /// Only expose pipelines whose name matches one of these globs
+        /// (`*`, `?`). When omitted, every pipeline that has `expose.mcp:`
+        /// is exposed.
+        #[arg(long = "include", value_name = "GLOB")]
+        include: Vec<String>,
+
+        /// Hide pipelines whose name matches one of these globs. Applied
+        /// after `--include`.
+        #[arg(long = "exclude", value_name = "GLOB")]
+        exclude: Vec<String>,
+
+        /// Project directory (defaults to the current working directory).
+        #[arg(short = 'd', long)]
+        dir: Option<PathBuf>,
+    },
 }
 
 /// zymi — event-sourced agent engine CLI
@@ -383,6 +408,11 @@ fn dispatch(cli: Cli) {
                 call_timeout_secs,
                 command,
             } => mcp::exec_probe(&name, &command, &env, init_timeout_secs, call_timeout_secs),
+            McpCommand::Serve {
+                include,
+                exclude,
+                dir,
+            } => mcp::exec_serve(&include, &exclude, resolve_root(dir.as_deref())),
         },
         Command::Schema { kind, all } => schema::exec(kind.as_deref(), all),
     };
@@ -412,7 +442,11 @@ fn command_dir(cmd: &Command) -> Option<&Path> {
         | Command::Serve { dir, .. }
         | Command::Resume { dir, .. } => dir.as_deref(),
         Command::Fetch { dir } => dir.as_deref(),
-        Command::Init { .. } | Command::Mcp { .. } | Command::Schema { .. } => None,
+        Command::Mcp { command } => match command {
+            McpCommand::Serve { dir, .. } => dir.as_deref(),
+            McpCommand::Probe { .. } => None,
+        },
+        Command::Init { .. } | Command::Schema { .. } => None,
     }
 }
 

@@ -127,6 +127,7 @@ mod tests {
             name: name.into(),
             description: None,
             inputs: vec![],
+            expose: None,
             steps: steps
                 .into_iter()
                 .map(|(id, deps)| PipelineStep {

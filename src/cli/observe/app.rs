@@ -306,6 +306,7 @@ impl App {
             steps,
             output: None,
             approval_channel: None,
+            expose: None,
         };
 
         Graph::build(&cfg, &self.events)
