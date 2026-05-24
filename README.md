@@ -133,6 +133,40 @@ def get_weather(city: str) -> str:
 
 Schema and the four kinds in detail → [docs/tools.md](docs/tools.md).
 
+### zymi as an MCP server — pipelines as tools for any agent
+
+The mirror of the MCP *client* above: `zymi mcp serve` exposes your pipelines as MCP tools over stdio, so **any** MCP host (Claude Code, Claude Desktop, Cursor, the OpenAI Agents / LangGraph / OpenHands runtimes via their MCP adapters) can call a zymi pipeline as a single tool — no per-runtime glue ([ADR-0033](adr/0033-mcp-server-pipelines-as-tools.md)).
+
+This is the **priority direction for zymi**: own the auditable, event-sourced *back* of the agent stack rather than competing on the front. A pipeline is a tool whose every step is hash-chained, replayable, and resumable — which is exactly what an agent's tool catalogue is missing.
+
+Exposure is opt-in per pipeline (so internal/cron pipelines never leak into agent tool catalogues):
+
+```yaml
+# pipelines/research.yml
+expose:
+  mcp:
+    name: research            # tool name (defaults to file stem)
+    mode: sync | async        # async hints the caller to task-augment (SEP-1686)
+    description: "Deep-research a topic and return a brief."
+```
+
+```bash
+zymi mcp serve                              # serve all expose:-d pipelines over stdio
+zymi mcp serve --include 'research_*' --exclude '*_internal'
+```
+
+- **Sync** — `tools/call` blocks until the pipeline finishes; works on every MCP client today. Tool input schema is auto-generated from the pipeline's `inputs:`.
+- **Async** — a client that augments the call with a [SEP-1686](https://modelcontextprotocol.io/seps/1686-tasks) task gets a `CreateTaskResult` immediately and polls `tasks/get` / `tasks/result` / `tasks/list`; `tasks/cancel` and `notifications/cancelled` cancel it. The pipeline runs in the background and stays fully observable in the event store.
+
+**Current limitations (honest list — the surface is ahead of client adoption):**
+
+- **Human approvals over MCP aren't interactive yet.** A pipeline that trips an [approval](#approvals--event-sourced-restart-safe) doesn't pause for the agent's user; it waits on the configured approval channel and otherwise times out (auto-deny). Mapping approvals to the agent's own prompt (SEP-1686 `input_required` via server-initiated `elicitation/create`) is built only once a host ships tasks-with-elicitation correlation — most don't yet. **Pipelines that don't trip approvals are unaffected.**
+- **Cancellation is best-effort:** the task is aborted, but pipeline steps already in flight (and their side effects) may run to completion.
+- **Arguments cross the boundary as strings** — pipelines expecting string `inputs:` are fine; richly typed inputs are stringified.
+- Async mode needs a SEP-1686-capable client; `zymi mcp serve` is Unix-only for now (stdio); tasks live for the server process lifetime (no TTL eviction).
+
+Design, wire shapes, and the deferred approval bridge → [ADR-0033](adr/0033-mcp-server-pipelines-as-tools.md).
+
 ### Connectors and outputs
 
 Inbound: `http_inbound` (webhook), `http_poll` (long-poll), `cron`, `file_read`, `stdin`.
@@ -251,7 +285,8 @@ zymi verify [--stream ID]                   # hash-chain integrity check
 zymi observe [--run ID]                     # interactive TUI
 zymi resume <run-id> --from-step <id>       # fork-resume
 
-zymi mcp probe <name> -- <cmd> [args …]     # smoke an MCP server
+zymi mcp probe <name> -- <cmd> [args …]     # smoke a third-party MCP server
+zymi mcp serve [--include G] [--exclude G]  # serve expose:-d pipelines as MCP tools
 zymi schema {project|agent|pipeline|tool|--all}
 ```
 

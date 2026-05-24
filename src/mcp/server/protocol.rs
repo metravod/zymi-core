@@ -6,9 +6,104 @@
 //! requests and demultiplexing responses.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 pub const JSONRPC_VERSION: &str = "2.0";
+
+/// SEP-1686 `_meta` key a requestor uses to augment a request with a task
+/// (`{ taskId, ttl? }`). The `taskId` is **client-generated** — the server
+/// maps it onto an internal run.
+pub const TASK_META_KEY: &str = "modelcontextprotocol.io/task";
+
+/// SEP-1686 `_meta` key that ties every task-associated message back to its
+/// task (§4.7). Present on `tasks/*` responses and `notifications/tasks/*`.
+pub const RELATED_TASK_META_KEY: &str = "modelcontextprotocol.io/related-task";
+
+/// Task lifecycle state (SEP-1686 `TaskStatus`). `submitted`/`unknown` from
+/// the SEP prose are absent from the `2025-11-25` schema enum, so they are
+/// absent here too — a freshly spawned pipeline starts `Working`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    Working,
+    InputRequired,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl TaskStatus {
+    pub fn is_terminal(self) -> bool {
+        matches!(self, TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled)
+    }
+}
+
+/// SEP-1686 `Task` (schema `2025-11-25`). Field names follow the schema
+/// (`ttl`/`pollInterval`), not the SEP prose (`keepAlive`/`pollFrequency`).
+#[derive(Debug, Clone, Serialize)]
+pub struct Task {
+    #[serde(rename = "taskId")]
+    pub task_id: String,
+    pub status: TaskStatus,
+    #[serde(rename = "statusMessage", skip_serializing_if = "Option::is_none")]
+    pub status_message: Option<String>,
+    #[serde(rename = "createdAt")]
+    pub created_at: String,
+    #[serde(rename = "lastUpdatedAt")]
+    pub last_updated_at: String,
+    /// `null` ⇒ retained for the process lifetime (we do not evict in 2a).
+    pub ttl: Option<i64>,
+    #[serde(rename = "pollInterval", skip_serializing_if = "Option::is_none")]
+    pub poll_interval: Option<i64>,
+}
+
+/// `{ "modelcontextprotocol.io/related-task": { "taskId": … } }` — the
+/// `_meta` block every task-associated response must carry (§4.7).
+pub fn related_task_meta(task_id: &str) -> Value {
+    json!({ RELATED_TASK_META_KEY: { "taskId": task_id } })
+}
+
+/// A server→client JSON-RPC notification (no `id`).
+#[derive(Debug)]
+pub struct Notification {
+    pub method: String,
+    pub params: Value,
+}
+
+/// Outcome of handling a request: the JSON-RPC `result` plus any
+/// notifications to emit alongside it (e.g. `notifications/tasks/created`,
+/// which SEP-1686 requires right after task creation).
+#[derive(Debug)]
+pub struct MethodOutcome {
+    pub result: Value,
+    pub notifications: Vec<Notification>,
+}
+
+impl MethodOutcome {
+    pub fn just(result: Value) -> Self {
+        Self {
+            result,
+            notifications: Vec::new(),
+        }
+    }
+}
+
+/// Task augmentation a requestor attached to a request, if any. Pulled from
+/// `params._meta["modelcontextprotocol.io/task"]`.
+#[derive(Debug, Clone)]
+pub struct TaskAugmentation {
+    pub task_id: String,
+    pub ttl: Option<i64>,
+}
+
+/// Extract a [`TaskAugmentation`] from a request's `params`. Returns `None`
+/// when the request is not task-augmented (the common sync path).
+pub fn task_augmentation(params: &Value) -> Option<TaskAugmentation> {
+    let task = params.get("_meta")?.get(TASK_META_KEY)?;
+    let task_id = task.get("taskId")?.as_str()?.to_string();
+    let ttl = task.get("ttl").and_then(Value::as_i64);
+    Some(TaskAugmentation { task_id, ttl })
+}
 
 // Standard JSON-RPC 2.0 error codes.
 pub const ERR_PARSE: i64 = -32700;

@@ -1,7 +1,9 @@
 //! `zymi mcp` subcommands. Two today:
 //! - `probe` — spawn an MCP server, handshake, list its tools, shut down.
 //! - `serve` — run zymi *as* an MCP server, exposing pipelines that
-//!   opt in via `expose.mcp:` (ADR-0033 Slice 1, sync only).
+//!   opt in via `expose.mcp:` (ADR-0033). Plain calls block until the
+//!   pipeline terminates; task-augmented calls (SEP-1686, Slice 2a) run in
+//!   the background and are polled via `tasks/get` / `tasks/result`.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -64,7 +66,7 @@ pub fn exec_probe(
     })
 }
 
-/// Run zymi as an MCP server over stdio (ADR-0033 Slice 1).
+/// Run zymi as an MCP server over stdio (ADR-0033).
 ///
 /// Pipelines that declare `expose.mcp:` are exposed as MCP tools. `--include`
 /// and `--exclude` further filter the exposed set by name glob.

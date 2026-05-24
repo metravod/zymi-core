@@ -11,16 +11,22 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use chrono::Utc;
 use serde_json::{json, Map, Value};
+use tokio::sync::Mutex;
+use uuid::Uuid;
 
 use crate::commands::RunPipeline;
-use crate::config::pipeline::{McpExposeMode, PipelineConfig};
+use crate::config::pipeline::PipelineConfig;
+use crate::events::{Event, EventKind};
 use crate::handlers::run_pipeline;
 use crate::runtime::Runtime;
 
 use super::protocol::{
-    RpcError, ERR_INTERNAL, ERR_INVALID_PARAMS, ERR_METHOD_NOT_FOUND,
+    related_task_meta, task_augmentation, MethodOutcome, Notification, RpcError, Task, TaskStatus,
+    ERR_INTERNAL, ERR_INVALID_PARAMS, ERR_METHOD_NOT_FOUND,
 };
+use super::tasks::{TaskHandle, TaskState, TaskStore};
 
 /// Server-side protocol version advertised in `initialize`. Tracks the
 /// 2025-11-25 MCP spec (the version with SEP-1686 accepted); the v1
@@ -32,11 +38,21 @@ pub const PROTOCOL_VERSION: &str = "2025-11-25";
 pub const SERVER_NAME: &str = "zymi";
 
 /// `initialize` result: capabilities + server info + protocol version.
+///
+/// Declares the SEP-1686 `tasks` capability: any `tools/call` may be
+/// task-augmented (`_meta["modelcontextprotocol.io/task"]`), and we support
+/// `tasks/list` and cancellation. The shape mirrors the `2025-11-25` schema
+/// (`tasks: { list, cancel, requests: { tools: { call } } }`).
 pub fn handle_initialize() -> Value {
     json!({
         "protocolVersion": PROTOCOL_VERSION,
         "capabilities": {
-            "tools": {}
+            "tools": {},
+            "tasks": {
+                "list": {},
+                "cancel": {},
+                "requests": { "tools": { "call": {} } }
+            }
         },
         "serverInfo": {
             "name": SERVER_NAME,
@@ -46,7 +62,13 @@ pub fn handle_initialize() -> Value {
 }
 
 /// Enumerate exposed pipelines (`expose.mcp:` opt-in, ADR-0033 §2) as
-/// MCP tool descriptors. Async-mode pipelines are skipped in Slice 1.
+/// MCP tool descriptors.
+///
+/// Since Slice 2a, async-mode pipelines are listed alongside sync ones:
+/// task execution is driven by the client augmenting `tools/call` with
+/// `_meta.task` (SEP-1686), not by the exposure mode. `mode: async` is now
+/// a hint that callers SHOULD task-augment the call; the tool descriptor is
+/// identical either way.
 ///
 /// `filter` decides which pipeline names are exposed at boot time
 /// (`--include` / `--exclude` glob filters); it's applied *before* the
@@ -64,12 +86,7 @@ where
             continue;
         }
         let config = &runtime.workspace().pipelines[name];
-        let Some(exposure) = config.mcp_exposure() else {
-            continue;
-        };
-        // Slice 1 is sync-only. Async pipelines are declared but not
-        // served until Slice 2 (SEP-1686) ships.
-        if exposure.mode == McpExposeMode::Async {
+        if config.mcp_exposure().is_none() {
             continue;
         }
         let mut tool = Map::new();
@@ -87,17 +104,29 @@ where
     json!({ "tools": tools })
 }
 
-/// Invoke an exposed pipeline. Blocks until the pipeline terminates.
+/// Invoke an exposed pipeline.
+///
+/// Two modes, decided by whether the client task-augmented the call
+/// (`_meta["modelcontextprotocol.io/task"]`, SEP-1686):
+///
+/// - **No augmentation (sync):** block until the pipeline terminates and
+///   return the `CallToolResult` directly (the Slice 1 path).
+/// - **Augmented (async):** spawn the pipeline as a tracked task, return
+///   `CreateTaskResult { task }` immediately, and emit a
+///   `notifications/tasks/created`. The result is later fetched via
+///   `tasks/result`.
 ///
 /// Per MCP convention, pipeline failures surface inside the tool result
-/// (`isError: true` with text content) rather than as a JSON-RPC error.
-/// JSON-RPC errors are reserved for protocol-level problems: unknown
-/// tool name, malformed arguments, not-exposed pipeline.
+/// (`isError: true`) rather than as a JSON-RPC error. JSON-RPC errors are
+/// reserved for protocol-level problems: unknown tool name, malformed
+/// arguments, duplicate `taskId`.
 pub async fn handle_tools_call<F>(
     runtime: &Arc<Runtime>,
+    store: &Arc<TaskStore>,
+    request_id: &Value,
     params: &Value,
     filter: F,
-) -> Result<Value, RpcError>
+) -> Result<MethodOutcome, RpcError>
 where
     F: Fn(&str) -> bool,
 {
@@ -111,25 +140,276 @@ where
         .cloned()
         .unwrap_or_else(|| Value::Object(Map::new()));
 
-    let (pipeline_name, config) = resolve_exposed_pipeline(runtime, name, filter)
+    let (pipeline_name, _config) = resolve_exposed_pipeline(runtime, name, filter)
         .ok_or_else(|| RpcError::new(ERR_METHOD_NOT_FOUND, format!("unknown tool `{name}`")))?;
-
-    if config.mcp_exposure().map(|m| m.mode) == Some(McpExposeMode::Async) {
-        // Defensive: filter excludes async in `tools/list`, but a
-        // pre-fetched stale name could still hit `tools/call`.
-        return Err(RpcError::new(
-            ERR_METHOD_NOT_FOUND,
-            format!("tool `{name}` is declared async; Slice 2 (SEP-1686) not yet shipped"),
-        ));
-    }
 
     let inputs = coerce_arguments(&arguments)
         .map_err(|e| RpcError::new(ERR_INVALID_PARAMS, e))?;
 
-    let cmd = RunPipeline::new(pipeline_name.clone(), inputs);
-    match run_pipeline::handle(runtime, cmd).await {
-        Ok(pr) => Ok(tool_call_result(pr.success, pr.final_output.as_deref(), None)),
-        Err(err) => Ok(tool_call_result(false, None, Some(err.as_str()))),
+    match task_augmentation(params) {
+        Some(aug) => {
+            // §4.2.3: a re-used taskId is a protocol error.
+            if store.contains(&aug.task_id).await {
+                return Err(RpcError::new(
+                    ERR_INVALID_PARAMS,
+                    format!("taskId `{}` is already in use", aug.task_id),
+                ));
+            }
+            let task = spawn_pipeline_task(
+                runtime,
+                store,
+                request_id,
+                pipeline_name,
+                inputs,
+                aug.ttl,
+                aug.task_id.clone(),
+            )
+            .await;
+            let result = json!({
+                "task": task,
+                "_meta": related_task_meta(&aug.task_id),
+            });
+            // SEP-1686 §3.4: signal the task exists so polling can begin
+            // without racing creation.
+            let created = Notification {
+                method: "notifications/tasks/created".to_string(),
+                params: json!({ "_meta": related_task_meta(&aug.task_id) }),
+            };
+            Ok(MethodOutcome {
+                result,
+                notifications: vec![created],
+            })
+        }
+        None => {
+            let cmd = RunPipeline::new(pipeline_name.clone(), inputs);
+            let result = match run_pipeline::handle(runtime, cmd).await {
+                Ok(pr) => tool_call_result(pr.success, pr.final_output.as_deref(), None),
+                Err(err) => tool_call_result(false, None, Some(err.as_str())),
+            };
+            Ok(MethodOutcome::just(result))
+        }
+    }
+}
+
+/// Spawn a pipeline as a backgrounded task and register it. Returns the
+/// initial `working` [`Task`] snapshot. The spawned wrapper writes the
+/// terminal outcome into the task's shared state and emits a
+/// `PipelineCompleted` envelope so `zymi runs` / `zymi observe` see a
+/// complete run.
+async fn spawn_pipeline_task(
+    runtime: &Arc<Runtime>,
+    store: &Arc<TaskStore>,
+    request_id: &Value,
+    pipeline_name: String,
+    inputs: HashMap<String, String>,
+    ttl: Option<i64>,
+    task_id: String,
+) -> Task {
+    let correlation_id = Uuid::new_v4();
+    let stream_id = format!("mcp-task-{task_id}");
+    let now = Utc::now();
+
+    // Observability marker (run_pipeline with a pre-bound stream skips its
+    // own PipelineRequested; we emit it here, like the serve router does).
+    let req_ev = Event::new(
+        stream_id.clone(),
+        EventKind::PipelineRequested {
+            pipeline: pipeline_name.clone(),
+            inputs: inputs.clone(),
+        },
+        "mcp".into(),
+    )
+    .with_correlation(correlation_id);
+    let _ = runtime.bus().publish(req_ev).await;
+
+    let state = Arc::new(Mutex::new(TaskState {
+        status: TaskStatus::Working,
+        status_message: None,
+        result: None,
+        last_updated_at: now,
+    }));
+
+    let cmd = RunPipeline::from_request(
+        pipeline_name.clone(),
+        inputs,
+        correlation_id,
+        stream_id.clone(),
+    );
+
+    let rt = Arc::clone(runtime);
+    let state_for_task = Arc::clone(&state);
+    let pipeline_for_task = pipeline_name.clone();
+    let join = tokio::spawn(async move {
+        let res = run_pipeline::handle(&rt, cmd).await;
+
+        let (success, final_output, error) = match &res {
+            Ok(pr) => (pr.success, pr.final_output.clone(), None),
+            Err(e) => (false, None, Some(e.clone())),
+        };
+        let done_ev = Event::new(
+            stream_id,
+            EventKind::PipelineCompleted {
+                pipeline: pipeline_for_task,
+                success,
+                final_output,
+                error,
+            },
+            "mcp".into(),
+        )
+        .with_correlation(correlation_id);
+        let _ = rt.bus().publish(done_ev).await;
+
+        let mut s = state_for_task.lock().await;
+        // A concurrent cancel wins — don't overwrite a terminal cancel.
+        if s.status == TaskStatus::Cancelled {
+            return;
+        }
+        s.last_updated_at = Utc::now();
+        // A business failure (Ok{success:false} or Err) is still a
+        // lifecycle-`completed` task whose CallToolResult carries
+        // `isError: true` — mirrors the sync path. `failed` lifecycle is
+        // reserved for task-machinery errors, which this path can't hit.
+        match res {
+            Ok(pr) => {
+                s.status = TaskStatus::Completed;
+                if !pr.success {
+                    s.status_message = Some("pipeline reported failure".into());
+                }
+                s.result = Some(tool_call_result(
+                    pr.success,
+                    pr.final_output.as_deref(),
+                    None,
+                ));
+            }
+            Err(e) => {
+                s.status = TaskStatus::Completed;
+                s.status_message = Some(e.clone());
+                s.result = Some(tool_call_result(false, None, Some(&e)));
+            }
+        }
+    });
+
+    let handle = Arc::new(TaskHandle {
+        task_id,
+        pipeline: pipeline_name,
+        request_id: request_id.clone(),
+        ttl,
+        created_at: now,
+        abort: join.abort_handle(),
+        state,
+    });
+    let snapshot = handle.snapshot().await;
+    store.register(handle).await;
+    snapshot
+}
+
+/// `tasks/get` → `GetTaskResult` (`Result & Task`: the Task fields at the
+/// top level plus a related-task `_meta`).
+pub async fn handle_tasks_get(store: &Arc<TaskStore>, params: &Value) -> Result<Value, RpcError> {
+    let task_id = require_task_id(params)?;
+    let handle = store
+        .get(&task_id)
+        .await
+        .ok_or_else(|| RpcError::new(ERR_INVALID_PARAMS, format!("unknown taskId `{task_id}`")))?;
+    let task = handle.snapshot().await;
+    let mut v = serde_json::to_value(&task).map_err(internal_error)?;
+    if let Value::Object(ref mut m) = v {
+        m.insert("_meta".into(), related_task_meta(&task_id));
+    }
+    Ok(v)
+}
+
+/// `tasks/result` → the original `CallToolResult`. §4.6: MUST error unless
+/// the task is `completed`.
+pub async fn handle_tasks_result(
+    store: &Arc<TaskStore>,
+    params: &Value,
+) -> Result<Value, RpcError> {
+    let task_id = require_task_id(params)?;
+    let handle = store
+        .get(&task_id)
+        .await
+        .ok_or_else(|| RpcError::new(ERR_INVALID_PARAMS, format!("unknown taskId `{task_id}`")))?;
+    let s = handle.state.lock().await;
+    if s.status != TaskStatus::Completed {
+        return Err(RpcError::new(
+            ERR_INVALID_PARAMS,
+            format!(
+                "task `{task_id}` is not completed (status: {})",
+                status_str(s.status)
+            ),
+        ));
+    }
+    let mut result = s
+        .result
+        .clone()
+        .unwrap_or_else(|| tool_call_result(true, None, None));
+    if let Value::Object(ref mut m) = result {
+        m.insert("_meta".into(), related_task_meta(&task_id));
+    }
+    Ok(result)
+}
+
+/// `tasks/list` → all tasks, single page (2a does not paginate).
+pub async fn handle_tasks_list(store: &Arc<TaskStore>) -> Value {
+    json!({ "tasks": store.list().await })
+}
+
+/// `tasks/cancel` (capability-gated explicit cancel). Idempotent ack.
+pub async fn handle_tasks_cancel(
+    store: &Arc<TaskStore>,
+    params: &Value,
+) -> Result<Value, RpcError> {
+    let task_id = require_task_id(params)?;
+    let handle = store
+        .get(&task_id)
+        .await
+        .ok_or_else(|| RpcError::new(ERR_INVALID_PARAMS, format!("unknown taskId `{task_id}`")))?;
+    cancel_handle(&handle).await;
+    Ok(json!({ "_meta": related_task_meta(&task_id) }))
+}
+
+/// Cancel a task by the JSON-RPC id of its originating request — the path
+/// taken for `notifications/cancelled { requestId }` (§4.8.1). No-op if no
+/// task maps to that id (the cancel may target a non-task request).
+pub async fn cancel_by_request_id(store: &Arc<TaskStore>, request_id: &Value) {
+    if let Some(handle) = store.find_by_request_id(request_id).await {
+        cancel_handle(&handle).await;
+    }
+}
+
+/// Best-effort cancel: flip to `cancelled` (unless already terminal, §4.8.3)
+/// and abort the spawned wrapper. Inner step tasks already spawned by the
+/// engine are detached and may run on — a real engine-level cancellation
+/// token is deferred (see ADR-0033 addendum §5).
+async fn cancel_handle(handle: &Arc<TaskHandle>) {
+    {
+        let mut s = handle.state.lock().await;
+        if s.status.is_terminal() {
+            return;
+        }
+        s.status = TaskStatus::Cancelled;
+        s.status_message = Some("cancelled by requestor".into());
+        s.last_updated_at = Utc::now();
+    }
+    handle.abort.abort();
+}
+
+fn require_task_id(params: &Value) -> Result<String, RpcError> {
+    params
+        .get("taskId")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| RpcError::new(ERR_INVALID_PARAMS, "missing `taskId`"))
+}
+
+fn status_str(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Working => "working",
+        TaskStatus::InputRequired => "input_required",
+        TaskStatus::Completed => "completed",
+        TaskStatus::Failed => "failed",
+        TaskStatus::Cancelled => "cancelled",
     }
 }
 

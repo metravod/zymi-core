@@ -20,9 +20,26 @@ use crate::runtime::Runtime;
 
 pub mod handlers;
 pub mod protocol;
+pub mod tasks;
 
-use handlers::{handle_initialize, handle_tools_call, handle_tools_list, internal_error, unknown_method};
-use protocol::{RpcError, RpcRequest, RpcResponse, ERR_INVALID_REQUEST, ERR_PARSE, JSONRPC_VERSION};
+use handlers::{
+    cancel_by_request_id, handle_initialize, handle_tasks_cancel, handle_tasks_get,
+    handle_tasks_list, handle_tasks_result, handle_tools_call, handle_tools_list, internal_error,
+    unknown_method,
+};
+use protocol::{
+    MethodOutcome, Notification, RpcError, RpcRequest, RpcResponse, ERR_INVALID_REQUEST, ERR_PARSE,
+    JSONRPC_VERSION,
+};
+use tasks::TaskStore;
+
+/// A single frame the server writes to the wire: either a response to an
+/// inbound request, or a server-initiated notification (e.g.
+/// `notifications/tasks/created`).
+enum Outbound {
+    Response(RpcResponse),
+    Notification(Notification),
+}
 
 /// Configuration for a single MCP server boot. Cheap to construct; the
 /// glob filters are compiled to regexes once at construction so the hot
@@ -106,12 +123,14 @@ where
     W: AsyncWrite + Unpin,
 {
     let filter = PipelineFilter::from_config(&config)?;
-    serve_loop(runtime, filter, reader, writer).await
+    let store = Arc::new(TaskStore::new());
+    serve_loop(runtime, filter, store, reader, writer).await
 }
 
 async fn serve_loop<R, W>(
     runtime: Arc<Runtime>,
     filter: PipelineFilter,
+    store: Arc<TaskStore>,
     mut reader: R,
     mut writer: W,
 ) -> Result<(), String>
@@ -133,29 +152,31 @@ where
             continue;
         }
 
-        let response = dispatch_line(&runtime, &filter, trimmed).await;
-        if let Some(resp) = response {
-            write_response(&mut writer, &resp).await?;
+        for frame in dispatch_line(&runtime, &filter, &store, trimmed).await {
+            write_frame(&mut writer, &frame).await?;
         }
     }
 }
 
-/// Dispatch a single JSON-RPC line. Returns `None` for notifications
-/// (no `id`) — those expect no response per the JSON-RPC 2.0 spec.
+/// Dispatch a single JSON-RPC line into zero or more outbound frames.
+/// Notifications (no `id`) produce no response, but may have side effects
+/// (e.g. `notifications/cancelled`). A task-augmented `tools/call` produces
+/// a `notifications/tasks/created` frame plus its `CreateTaskResult`.
 async fn dispatch_line(
     runtime: &Arc<Runtime>,
     filter: &PipelineFilter,
+    store: &Arc<TaskStore>,
     line: &str,
-) -> Option<RpcResponse> {
+) -> Vec<Outbound> {
     let parsed: Result<RpcRequest, _> = serde_json::from_str(line);
     let request = match parsed {
         Ok(r) => r,
         Err(e) => {
             // Parse failure — id is unknown, spec says respond with id: null.
-            return Some(RpcResponse::err(
+            return vec![Outbound::Response(RpcResponse::err(
                 Value::Null,
                 RpcError::new(ERR_PARSE, format!("invalid json: {e}")),
-            ));
+            ))];
         }
     };
 
@@ -163,66 +184,106 @@ async fn dispatch_line(
     let is_notification = request.id.is_none();
 
     if request.jsonrpc.as_deref() != Some(JSONRPC_VERSION) {
-        return notification_or_error(
-            is_notification,
-            request.id.clone(),
+        if is_notification {
+            log::debug!("mcp serve: notification with bad jsonrpc field, ignored");
+            return Vec::new();
+        }
+        return vec![Outbound::Response(RpcResponse::err(
+            request.id.clone().unwrap_or(Value::Null),
             RpcError::new(ERR_INVALID_REQUEST, "missing or wrong `jsonrpc` field"),
-        );
+        ))];
     }
 
     if is_notification {
-        // We accept `notifications/initialized` and similar as no-ops.
-        log::debug!("mcp serve: notification `{}` (no response)", request.method);
-        return None;
+        handle_notification(store, &request).await;
+        return Vec::new();
     }
 
     let id = request.id.clone().unwrap_or(Value::Null);
-    let response = handle_method(runtime, filter, &request).await;
-    match response {
-        Ok(result) => Some(RpcResponse::ok(id, result)),
-        Err(err) => Some(RpcResponse::err(id, err)),
+    match handle_method(runtime, filter, store, &request).await {
+        Ok(outcome) => {
+            let mut frames: Vec<Outbound> = outcome
+                .notifications
+                .into_iter()
+                .map(Outbound::Notification)
+                .collect();
+            frames.push(Outbound::Response(RpcResponse::ok(id, outcome.result)));
+            frames
+        }
+        Err(err) => vec![Outbound::Response(RpcResponse::err(id, err))],
     }
 }
 
-fn notification_or_error(
-    is_notification: bool,
-    id: Option<Value>,
-    err: RpcError,
-) -> Option<RpcResponse> {
-    if is_notification {
-        log::debug!("mcp serve: notification with rpc error: {}", err.message);
-        None
+/// Inbound notifications (no `id`, no response). `notifications/cancelled`
+/// carries `{ requestId }` referencing the originating task-augmented
+/// request (§4.8.1); everything else (e.g. `notifications/initialized`) is
+/// a no-op.
+async fn handle_notification(store: &Arc<TaskStore>, request: &RpcRequest) {
+    if request.method == "notifications/cancelled" {
+        if let Some(request_id) = request.params.as_ref().and_then(|p| p.get("requestId")) {
+            cancel_by_request_id(store, request_id).await;
+        }
     } else {
-        Some(RpcResponse::err(id.unwrap_or(Value::Null), err))
+        log::debug!("mcp serve: notification `{}` (no response)", request.method);
     }
 }
 
 async fn handle_method(
     runtime: &Arc<Runtime>,
     filter: &PipelineFilter,
+    store: &Arc<TaskStore>,
     request: &RpcRequest,
-) -> Result<Value, RpcError> {
+) -> Result<MethodOutcome, RpcError> {
+    let require_params = || {
+        request
+            .params
+            .as_ref()
+            .ok_or_else(|| RpcError::new(protocol::ERR_INVALID_PARAMS, "missing params"))
+    };
     match request.method.as_str() {
-        "initialize" => Ok(handle_initialize()),
-        "tools/list" => Ok(handle_tools_list(runtime, |name| filter.matches(name))),
+        "initialize" => Ok(MethodOutcome::just(handle_initialize())),
+        "tools/list" => Ok(MethodOutcome::just(handle_tools_list(runtime, |name| {
+            filter.matches(name)
+        }))),
         "tools/call" => {
-            let params = request.params.as_ref().ok_or_else(|| {
-                RpcError::new(protocol::ERR_INVALID_PARAMS, "missing params")
-            })?;
-            handle_tools_call(runtime, params, |name| filter.matches(name)).await
+            let params = require_params()?;
+            let id = request.id.clone().unwrap_or(Value::Null);
+            handle_tools_call(runtime, store, &id, params, |name| filter.matches(name)).await
         }
+        "tasks/get" => handle_tasks_get(store, require_params()?)
+            .await
+            .map(MethodOutcome::just),
+        "tasks/result" => handle_tasks_result(store, require_params()?)
+            .await
+            .map(MethodOutcome::just),
+        "tasks/list" => Ok(MethodOutcome::just(handle_tasks_list(store).await)),
+        "tasks/cancel" => handle_tasks_cancel(store, require_params()?)
+            .await
+            .map(MethodOutcome::just),
         // `ping` is part of every MCP spec rev; handle as no-op {} for
         // keepalive purposes. Cheap and harmless.
-        "ping" => Ok(serde_json::json!({})),
+        "ping" => Ok(MethodOutcome::just(serde_json::json!({}))),
         other => Err(unknown_method(other)),
     }
 }
 
-async fn write_response<W>(writer: &mut W, response: &RpcResponse) -> Result<(), String>
+async fn write_frame<W>(writer: &mut W, frame: &Outbound) -> Result<(), String>
 where
     W: AsyncWrite + Unpin,
 {
-    let mut line = serde_json::to_vec(response).map_err(|e| internal_error(e).message)?;
+    let mut line = match frame {
+        Outbound::Response(resp) => {
+            serde_json::to_vec(resp).map_err(|e| internal_error(e).message)?
+        }
+        Outbound::Notification(n) => {
+            let envelope = serde_json::json!({
+                "jsonrpc": JSONRPC_VERSION,
+                "method": n.method,
+                "params": n.params,
+            });
+            serde_json::to_vec(&envelope).map_err(|e| internal_error(e).message)?
+        }
+    };
     line.push(b'\n');
     writer
         .write_all(&line)
@@ -503,6 +564,11 @@ mod tests {
         client_w.write_all(&bytes).await.unwrap();
         client_w.flush().await.unwrap();
 
+        read_json_line(client_r).await
+    }
+
+    /// Read a single newline-delimited JSON frame from the server.
+    async fn read_json_line(client_r: &mut BufReader<tokio::io::DuplexStream>) -> Value {
         let mut line = String::new();
         AsyncBufReadExt::read_line(client_r, &mut line)
             .await
@@ -538,18 +604,22 @@ mod tests {
         assert_eq!(init["result"]["serverInfo"]["name"], "zymi");
         assert!(init["result"]["capabilities"]["tools"].is_object());
 
-        // 2. tools/list — only web_search should appear.
+        // 2. tools/list — web_search (sync) and long_task (async) both
+        // appear since Slice 2a; hidden_cron (not exposed) does not.
         let listed = rpc_roundtrip(&mut client_w, &mut client_r, "tools/list", 2, None).await;
         let tools = listed["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 1, "got tools: {tools:?}");
-        let tool = &tools[0];
-        assert_eq!(tool["name"], "web_search");
-        assert_eq!(tool["description"], "search the web");
-        assert_eq!(tool["inputSchema"]["type"], "object");
-        assert_eq!(
-            tool["inputSchema"]["properties"]["query"]["type"],
-            "string"
-        );
+        assert_eq!(tools.len(), 2, "got tools: {tools:?}");
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"web_search"), "got: {names:?}");
+        assert!(names.contains(&"long_task"), "got: {names:?}");
+        let web = tools.iter().find(|t| t["name"] == "web_search").unwrap();
+        assert_eq!(web["description"], "search the web");
+        assert_eq!(web["inputSchema"]["type"], "object");
+        assert_eq!(web["inputSchema"]["properties"]["query"]["type"], "string");
+
+        // initialize advertises the SEP-1686 tasks capability.
+        assert!(init["result"]["capabilities"]["tasks"].is_object());
+        assert!(init["result"]["capabilities"]["tasks"]["requests"]["tools"]["call"].is_object());
 
         // 3. tools/call — happy path. The mock LLM returns "search-result-stub".
         let called = rpc_roundtrip(
@@ -586,6 +656,118 @@ mod tests {
         drop(client_w);
         let server_result = server_task.await.unwrap();
         assert!(server_result.is_ok(), "server exited with: {server_result:?}");
+    }
+
+    // ── Async tasks (SEP-1686, Slice 2a) ─────────────────────────────
+    //
+    // A task-augmented `tools/call` returns `CreateTaskResult` + a
+    // `notifications/tasks/created`, then the result is fetched via
+    // `tasks/get` (poll to `completed`) and `tasks/result`.
+    #[tokio::test]
+    async fn async_task_create_poll_result_list() {
+        let dir = TempDir::new().unwrap();
+        let runtime = build_runtime(build_workspace(), &dir);
+
+        let (client_to_server, server_in) = tokio::io::duplex(8192);
+        let (server_out, client_from_server) = tokio::io::duplex(8192);
+        let runtime_for_task = runtime.clone();
+        let server_task = tokio::spawn(async move {
+            serve(
+                runtime_for_task,
+                ServerConfig::default(),
+                BufReader::new(server_in),
+                server_out,
+            )
+            .await
+        });
+
+        let mut client_w = client_to_server;
+        let mut client_r = BufReader::new(client_from_server);
+
+        let task_id = "task-abc";
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "tools/call",
+            "params": {
+                "name": "web_search",
+                "arguments": { "query": "async" },
+                "_meta": {
+                    "modelcontextprotocol.io/task": { "taskId": task_id, "ttl": 60000 }
+                }
+            }
+        });
+        let mut bytes = serde_json::to_vec(&req).unwrap();
+        bytes.push(b'\n');
+        client_w.write_all(&bytes).await.unwrap();
+        client_w.flush().await.unwrap();
+
+        // Frame 1: notifications/tasks/created (no id), related-task meta.
+        let created = read_json_line(&mut client_r).await;
+        assert_eq!(created["method"], "notifications/tasks/created");
+        assert_eq!(
+            created["params"]["_meta"]["modelcontextprotocol.io/related-task"]["taskId"],
+            task_id
+        );
+
+        // Frame 2: CreateTaskResult echoing the client taskId.
+        let create_resp = read_json_line(&mut client_r).await;
+        assert_eq!(create_resp["id"], 10);
+        assert_eq!(create_resp["result"]["task"]["taskId"], task_id);
+        assert_eq!(create_resp["result"]["task"]["ttl"], 60000);
+        let status = create_resp["result"]["task"]["status"].as_str().unwrap();
+        assert!(status == "working" || status == "completed", "got: {status}");
+
+        // Poll tasks/get until terminal.
+        let mut final_status = String::new();
+        for _ in 0..50 {
+            let got = rpc_roundtrip(
+                &mut client_w,
+                &mut client_r,
+                "tasks/get",
+                11,
+                Some(json!({ "taskId": task_id })),
+            )
+            .await;
+            final_status = got["result"]["status"].as_str().unwrap().to_string();
+            if final_status == "completed" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(final_status, "completed", "task never completed");
+
+        // tasks/result returns the CallToolResult (mock LLM stub output).
+        let result = rpc_roundtrip(
+            &mut client_w,
+            &mut client_r,
+            "tasks/result",
+            12,
+            Some(json!({ "taskId": task_id })),
+        )
+        .await;
+        assert_eq!(result["result"]["isError"], false, "got: {result}");
+        assert_eq!(result["result"]["content"][0]["text"], "search-result-stub");
+
+        // tasks/list shows the one task.
+        let listed = rpc_roundtrip(&mut client_w, &mut client_r, "tasks/list", 13, None).await;
+        let tasks = listed["result"]["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["taskId"], task_id);
+
+        // tasks/get on an unknown id is a protocol error (-32602).
+        let unknown = rpc_roundtrip(
+            &mut client_w,
+            &mut client_r,
+            "tasks/get",
+            14,
+            Some(json!({ "taskId": "nope" })),
+        )
+        .await;
+        assert_eq!(unknown["error"]["code"], super::protocol::ERR_INVALID_PARAMS);
+
+        drop(client_w);
+        server_task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
