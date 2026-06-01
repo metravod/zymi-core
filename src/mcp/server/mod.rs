@@ -18,7 +18,10 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::runtime::Runtime;
 
+pub mod elicitation;
 pub mod handlers;
+pub mod link;
+pub mod observability;
 pub mod protocol;
 pub mod tasks;
 
@@ -27,19 +30,13 @@ use handlers::{
     handle_tasks_list, handle_tasks_result, handle_tools_call, handle_tools_list, internal_error,
     unknown_method,
 };
+use link::{McpClientLink, Outbound};
+use observability::SharedObservability;
 use protocol::{
-    MethodOutcome, Notification, RpcError, RpcRequest, RpcResponse, ERR_INVALID_REQUEST, ERR_PARSE,
-    JSONRPC_VERSION,
+    parse_client_caps, MethodOutcome, RpcError, RpcRequest, RpcResponse, ERR_INVALID_REQUEST,
+    ERR_PARSE, JSONRPC_VERSION,
 };
 use tasks::TaskStore;
-
-/// A single frame the server writes to the wire: either a response to an
-/// inbound request, or a server-initiated notification (e.g.
-/// `notifications/tasks/created`).
-enum Outbound {
-    Response(RpcResponse),
-    Notification(Notification),
-}
 
 /// Configuration for a single MCP server boot. Cheap to construct; the
 /// glob filters are compiled to regexes once at construction so the hot
@@ -109,9 +106,11 @@ fn glob_to_regex(pattern: &str) -> Result<Regex, regex::Error> {
     Regex::new(&out)
 }
 
-/// Serve MCP over the given reader/writer pair. Returns when the reader
-/// reaches EOF (the canonical "client disconnected" signal for stdio
-/// MCP servers).
+/// Serve MCP over the given reader/writer pair, creating a fresh
+/// [`McpClientLink`] internally. Used by callers that don't need the
+/// server→client side-channel (the elicitation approval bridge); see
+/// [`serve_with_link`] for the full path. Returns when the reader reaches
+/// EOF (the canonical "client disconnected" signal for stdio MCP servers).
 pub async fn serve<R, W>(
     runtime: Arc<Runtime>,
     config: ServerConfig,
@@ -120,31 +119,54 @@ pub async fn serve<R, W>(
 ) -> Result<(), String>
 where
     R: AsyncBufRead + Unpin,
-    W: AsyncWrite + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
 {
-    let filter = PipelineFilter::from_config(&config)?;
-    let store = Arc::new(TaskStore::new());
-    serve_loop(runtime, filter, store, reader, writer).await
+    let (link, outbound_rx) = McpClientLink::new();
+    serve_with_link(runtime, config, reader, writer, link, outbound_rx, None).await
 }
 
-async fn serve_loop<R, W>(
+/// Serve MCP over a bidirectional, concurrent loop (ADR-0033 2b-sync).
+///
+/// Unlike the original serial loop, this:
+/// - drains all outbound frames through a single **writer task** fed by an
+///   mpsc, so server-side tasks (the elicitation approval channel holding a
+///   clone of `link`) can push `elicitation/create` requests without owning
+///   the wire;
+/// - **spawns** each inbound request handler instead of awaiting it inline,
+///   so the read loop keeps pumping while a synchronous `tools/call` is parked
+///   on an approval — that's how the client's elicitation *response* gets read.
+///
+/// `link` and `outbound_rx` are paired (`McpClientLink::new`). Callers that
+/// want the elicitation bridge construct the pair, start an
+/// [`elicitation::McpElicitationApprovalChannel`] with a clone of `link`, then
+/// hand both here.
+pub async fn serve_with_link<R, W>(
     runtime: Arc<Runtime>,
-    filter: PipelineFilter,
-    store: Arc<TaskStore>,
+    config: ServerConfig,
     mut reader: R,
-    mut writer: W,
+    writer: W,
+    link: Arc<McpClientLink>,
+    outbound_rx: tokio::sync::mpsc::UnboundedReceiver<Outbound>,
+    observability: SharedObservability,
 ) -> Result<(), String>
 where
     R: AsyncBufRead + Unpin,
-    W: AsyncWrite + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
 {
+    let filter = Arc::new(PipelineFilter::from_config(&config)?);
+    let store = Arc::new(TaskStore::new());
+
+    // The writer task owns the wire; everyone emits frames via the mpsc.
+    let writer_task = tokio::spawn(writer_loop(writer, outbound_rx));
+
+    let outbound = link.outbound();
     let mut buf = String::new();
-    loop {
+    let result = loop {
         buf.clear();
         match reader.read_line(&mut buf).await {
-            Ok(0) => return Ok(()), // EOF — client closed.
+            Ok(0) => break Ok(()), // EOF — client closed.
             Ok(_) => {}
-            Err(e) => return Err(format!("mcp serve: read error: {e}")),
+            Err(e) => break Err(format!("mcp serve: read error: {e}")),
         }
 
         let trimmed = buf.trim();
@@ -152,31 +174,87 @@ where
             continue;
         }
 
-        for frame in dispatch_line(&runtime, &filter, &store, trimmed).await {
-            write_frame(&mut writer, &frame).await?;
+        dispatch_inbound(&runtime, &filter, &store, &link, &observability, &outbound, trimmed);
+    };
+
+    // Client gone: stop writing. Any in-flight response was already flushed
+    // (the client reads each before sending the next or closing).
+    writer_task.abort();
+    result
+}
+
+/// Drain outbound frames onto the wire, in order, until the channel closes.
+async fn writer_loop<W>(mut writer: W, mut rx: tokio::sync::mpsc::UnboundedReceiver<Outbound>)
+where
+    W: AsyncWrite + Unpin,
+{
+    while let Some(frame) = rx.recv().await {
+        if let Err(e) = write_frame(&mut writer, &frame).await {
+            log::error!("mcp serve: {e}");
+            break;
         }
     }
 }
 
-/// Dispatch a single JSON-RPC line into zero or more outbound frames.
-/// Notifications (no `id`) produce no response, but may have side effects
-/// (e.g. `notifications/cancelled`). A task-augmented `tools/call` produces
-/// a `notifications/tasks/created` frame plus its `CreateTaskResult`.
-async fn dispatch_line(
+/// Route a single inbound JSON-RPC line. Three shapes:
+/// - a **response** to one of our server-initiated requests (no `method`,
+///   has `id`) → delivered to the waiting [`McpClientLink::request`];
+/// - a **notification** (`method`, no `id`) → handled inline (cheap);
+/// - a **request** (`method` + `id`) → spawned, so the read loop keeps
+///   reading (a synchronous `tools/call` may park on an approval whose
+///   elicitation response arrives on this same loop).
+#[allow(clippy::too_many_arguments)]
+fn dispatch_inbound(
     runtime: &Arc<Runtime>,
-    filter: &PipelineFilter,
+    filter: &Arc<PipelineFilter>,
     store: &Arc<TaskStore>,
+    link: &Arc<McpClientLink>,
+    observability: &SharedObservability,
+    outbound: &tokio::sync::mpsc::UnboundedSender<Outbound>,
     line: &str,
-) -> Vec<Outbound> {
-    let parsed: Result<RpcRequest, _> = serde_json::from_str(line);
-    let request = match parsed {
-        Ok(r) => r,
+) {
+    let value: Value = match serde_json::from_str(line) {
+        Ok(v) => v,
         Err(e) => {
             // Parse failure — id is unknown, spec says respond with id: null.
-            return vec![Outbound::Response(RpcResponse::err(
+            let _ = outbound.send(Outbound::Response(RpcResponse::err(
                 Value::Null,
                 RpcError::new(ERR_PARSE, format!("invalid json: {e}")),
-            ))];
+            )));
+            return;
+        }
+    };
+
+    // No `method` ⇒ this is a response to a request *we* issued.
+    if value.get("method").is_none() {
+        if let Some(id) = value.get("id") {
+            let payload = match value.get("error") {
+                Some(err) => Err(err
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("client error")
+                    .to_string()),
+                None => Ok(value.get("result").cloned().unwrap_or(Value::Null)),
+            };
+            let id = id.clone();
+            let link = Arc::clone(link);
+            tokio::spawn(async move {
+                link.deliver_response(&id, payload).await;
+            });
+        } else {
+            log::debug!("mcp serve: inbound frame with neither method nor id, ignored");
+        }
+        return;
+    }
+
+    let request: RpcRequest = match serde_json::from_value(value) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = outbound.send(Outbound::Response(RpcResponse::err(
+                Value::Null,
+                RpcError::new(ERR_PARSE, format!("invalid request: {e}")),
+            )));
+            return;
         }
     };
 
@@ -186,32 +264,57 @@ async fn dispatch_line(
     if request.jsonrpc.as_deref() != Some(JSONRPC_VERSION) {
         if is_notification {
             log::debug!("mcp serve: notification with bad jsonrpc field, ignored");
-            return Vec::new();
+            return;
         }
-        return vec![Outbound::Response(RpcResponse::err(
+        let _ = outbound.send(Outbound::Response(RpcResponse::err(
             request.id.clone().unwrap_or(Value::Null),
             RpcError::new(ERR_INVALID_REQUEST, "missing or wrong `jsonrpc` field"),
-        ))];
+        )));
+        return;
     }
 
     if is_notification {
-        handle_notification(store, &request).await;
-        return Vec::new();
+        let store = Arc::clone(store);
+        tokio::spawn(async move {
+            handle_notification(&store, &request).await;
+        });
+        return;
     }
 
+    // Real request — spawn so the read loop keeps pumping.
     let id = request.id.clone().unwrap_or(Value::Null);
-    match handle_method(runtime, filter, store, &request).await {
-        Ok(outcome) => {
-            let mut frames: Vec<Outbound> = outcome
-                .notifications
-                .into_iter()
-                .map(Outbound::Notification)
-                .collect();
-            frames.push(Outbound::Response(RpcResponse::ok(id, outcome.result)));
-            frames
+    let runtime = Arc::clone(runtime);
+    let filter = Arc::clone(filter);
+    let store = Arc::clone(store);
+    let link = Arc::clone(link);
+    let observability = observability.clone();
+    let outbound = outbound.clone();
+    tokio::spawn(async move {
+        let frames: Vec<Outbound> = match handle_method(
+            &runtime,
+            &filter,
+            &store,
+            &link,
+            &observability,
+            &request,
+        )
+        .await
+        {
+            Ok(outcome) => {
+                let mut frames: Vec<Outbound> = outcome
+                    .notifications
+                    .into_iter()
+                    .map(Outbound::Notification)
+                    .collect();
+                frames.push(Outbound::Response(RpcResponse::ok(id, outcome.result)));
+                frames
+            }
+            Err(err) => vec![Outbound::Response(RpcResponse::err(id, err))],
+        };
+        for frame in frames {
+            let _ = outbound.send(frame);
         }
-        Err(err) => vec![Outbound::Response(RpcResponse::err(id, err))],
-    }
+    });
 }
 
 /// Inbound notifications (no `id`, no response). `notifications/cancelled`
@@ -230,8 +333,10 @@ async fn handle_notification(store: &Arc<TaskStore>, request: &RpcRequest) {
 
 async fn handle_method(
     runtime: &Arc<Runtime>,
-    filter: &PipelineFilter,
+    filter: &Arc<PipelineFilter>,
     store: &Arc<TaskStore>,
+    link: &Arc<McpClientLink>,
+    observability: &SharedObservability,
     request: &RpcRequest,
 ) -> Result<MethodOutcome, RpcError> {
     let require_params = || {
@@ -241,14 +346,33 @@ async fn handle_method(
             .ok_or_else(|| RpcError::new(protocol::ERR_INVALID_PARAMS, "missing params"))
     };
     match request.method.as_str() {
-        "initialize" => Ok(MethodOutcome::just(handle_initialize())),
-        "tools/list" => Ok(MethodOutcome::just(handle_tools_list(runtime, |name| {
-            filter.matches(name)
-        }))),
+        "initialize" => {
+            // Capture the client's capabilities so the elicitation approval
+            // bridge knows whether `elicitation/create` is usable. `initialize`
+            // always precedes any `tools/call`, so caps are set before an
+            // approval can fire.
+            if let Some(p) = request.params.as_ref() {
+                link.set_caps(parse_client_caps(p));
+            }
+            Ok(MethodOutcome::just(handle_initialize()))
+        }
+        "tools/list" => Ok(MethodOutcome::just(handle_tools_list(
+            runtime,
+            observability.as_deref(),
+            |name| filter.matches(name),
+        ))),
         "tools/call" => {
             let params = require_params()?;
             let id = request.id.clone().unwrap_or(Value::Null);
-            handle_tools_call(runtime, store, &id, params, |name| filter.matches(name)).await
+            handle_tools_call(
+                runtime,
+                store,
+                observability.as_deref(),
+                &id,
+                params,
+                |name| filter.matches(name),
+            )
+            .await
         }
         "tasks/get" => handle_tasks_get(store, require_params()?)
             .await
@@ -280,6 +404,15 @@ where
                 "jsonrpc": JSONRPC_VERSION,
                 "method": n.method,
                 "params": n.params,
+            });
+            serde_json::to_vec(&envelope).map_err(|e| internal_error(e).message)?
+        }
+        Outbound::Request { id, method, params } => {
+            let envelope = serde_json::json!({
+                "jsonrpc": JSONRPC_VERSION,
+                "id": id,
+                "method": method,
+                "params": params,
             });
             serde_json::to_vec(&envelope).map_err(|e| internal_error(e).message)?
         }
@@ -768,6 +901,214 @@ mod tests {
 
         drop(client_w);
         server_task.await.unwrap().unwrap();
+    }
+
+    // ── Bidirectional: server-initiated request round-trips ──────────
+    //
+    // Exercises the 2b-sync transport: a server-side task (standing in for
+    // the elicitation approval channel) issues a request via the
+    // `McpClientLink`; the read loop must route the client's *response*
+    // (which carries no `method`) back to the waiting caller while the loop
+    // keeps pumping.
+    #[tokio::test]
+    async fn server_initiated_request_round_trips_over_wire() {
+        use crate::mcp::server::link::McpClientLink;
+
+        let dir = TempDir::new().unwrap();
+        let runtime = build_runtime(build_workspace(), &dir);
+
+        let (client_to_server, server_in) = tokio::io::duplex(8192);
+        let (server_out, client_from_server) = tokio::io::duplex(8192);
+
+        let (link, outbound_rx) = McpClientLink::new();
+        let link_for_server = Arc::clone(&link);
+        let server_task = tokio::spawn(async move {
+            serve_with_link(
+                runtime,
+                ServerConfig::default(),
+                BufReader::new(server_in),
+                server_out,
+                link_for_server,
+                outbound_rx,
+                None,
+            )
+            .await
+        });
+
+        let mut client_w = client_to_server;
+        let mut client_r = BufReader::new(client_from_server);
+
+        // Server side initiates a request (as the elicitation channel would).
+        let caller = tokio::spawn(async move {
+            link.request("elicitation/create", json!({ "message": "approve?" }))
+                .await
+        });
+
+        // Client reads the server-initiated request and replies.
+        let req = read_json_line(&mut client_r).await;
+        assert_eq!(req["method"], "elicitation/create");
+        assert_eq!(req["params"]["message"], "approve?");
+        let id = req["id"].clone();
+        let resp = json!({ "jsonrpc": "2.0", "id": id, "result": { "action": "accept" } });
+        let mut bytes = serde_json::to_vec(&resp).unwrap();
+        bytes.push(b'\n');
+        client_w.write_all(&bytes).await.unwrap();
+        client_w.flush().await.unwrap();
+
+        let result = caller.await.unwrap().expect("request should resolve");
+        assert_eq!(result["action"], "accept");
+
+        drop(client_w);
+        server_task.await.unwrap().unwrap();
+    }
+
+    // ── Observability tools (ADR-0034) end-to-end ────────────────────
+    //
+    // With a `CliObservability` provider wired in, `tools/list` advertises
+    // the four `zymi.runs.*` tools; running a sync pipeline records the run
+    // under session scope; then list / get / events / step_io read it back.
+    #[tokio::test]
+    async fn observability_tools_list_get_events_step_io() {
+        use crate::cli::mcp_observability::{CliObservability, ObservabilityScope};
+
+        let dir = TempDir::new().unwrap();
+        let runtime = build_runtime(build_workspace(), &dir);
+
+        let (client_to_server, server_in) = tokio::io::duplex(8192);
+        let (server_out, client_from_server) = tokio::io::duplex(8192);
+
+        let (link, outbound_rx) = McpClientLink::new();
+        let provider = Arc::new(CliObservability::new(
+            Arc::clone(&runtime),
+            ObservabilityScope::Session,
+        ));
+        let server_task = tokio::spawn(async move {
+            serve_with_link(
+                runtime,
+                ServerConfig::default(),
+                BufReader::new(server_in),
+                server_out,
+                link,
+                outbound_rx,
+                Some(provider),
+            )
+            .await
+        });
+
+        let mut client_w = client_to_server;
+        let mut client_r = BufReader::new(client_from_server);
+
+        // tools/list advertises the four observability tools alongside pipelines.
+        let listed = rpc_roundtrip(&mut client_w, &mut client_r, "tools/list", 1, None).await;
+        let names: Vec<&str> = listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"zymi.runs.list"), "got: {names:?}");
+        assert!(names.contains(&"zymi.runs.step_io"), "got: {names:?}");
+
+        // Run the sync pipeline so a run is recorded under this session.
+        let called = rpc_roundtrip(
+            &mut client_w,
+            &mut client_r,
+            "tools/call",
+            2,
+            Some(json!({ "name": "web_search", "arguments": { "query": "x" } })),
+        )
+        .await;
+        assert_eq!(called["result"]["isError"], false, "got: {called}");
+
+        // zymi.runs.list → exactly our one session run.
+        let list = obs_call(&mut client_w, &mut client_r, 3, "zymi.runs.list", json!({})).await;
+        let runs = list["runs"].as_array().unwrap();
+        assert_eq!(runs.len(), 1, "got: {list}");
+        let run_id = runs[0]["run_id"].as_str().unwrap().to_string();
+        assert_eq!(runs[0]["pipeline"], "web_search");
+        assert_eq!(runs[0]["status"], "ok");
+
+        // zymi.runs.get → status + step counts.
+        let got = obs_call(
+            &mut client_w,
+            &mut client_r,
+            4,
+            "zymi.runs.get",
+            json!({ "run_id": run_id }),
+        )
+        .await;
+        assert_eq!(got["status"], "ok");
+        assert_eq!(got["total_steps"], 1);
+
+        // zymi.runs.events → flat trace, includes the step substream events.
+        let events = obs_call(
+            &mut client_w,
+            &mut client_r,
+            5,
+            "zymi.runs.events",
+            json!({ "run_id": run_id }),
+        )
+        .await;
+        let evs = events["events"].as_array().unwrap();
+        assert!(!evs.is_empty(), "expected events, got: {events}");
+        assert!(
+            evs.iter().any(|e| e["step_id"] == "go"),
+            "expected a step-tagged event, got: {events}"
+        );
+
+        // zymi.runs.step_io → reconstructed prompt-in + output for step `go`.
+        let io = obs_call(
+            &mut client_w,
+            &mut client_r,
+            6,
+            "zymi.runs.step_io",
+            json!({ "run_id": run_id, "step_id": "go" }),
+        )
+        .await;
+        assert_eq!(io["output"], "search-result-stub", "got: {io}");
+        let roles: Vec<&str> = io["prompt_in"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
+        assert!(roles.contains(&"system") && roles.contains(&"user"), "got: {roles:?}");
+
+        // Out-of-scope run id is refused under session scope (JSON-RPC error,
+        // the same class as a bad-argument: the run isn't ours to read).
+        let denied = rpc_roundtrip(
+            &mut client_w,
+            &mut client_r,
+            "tools/call",
+            7,
+            Some(json!({ "name": "zymi.runs.get", "arguments": { "run_id": "not-ours" } })),
+        )
+        .await;
+        assert!(denied["error"].is_object(), "expected JSON-RPC error, got: {denied}");
+
+        drop(client_w);
+        server_task.await.unwrap().unwrap();
+    }
+
+    /// Call an observability tool and parse the JSON packed in its text block.
+    async fn obs_call(
+        client_w: &mut tokio::io::DuplexStream,
+        client_r: &mut BufReader<tokio::io::DuplexStream>,
+        id: u64,
+        tool: &str,
+        arguments: Value,
+    ) -> Value {
+        let resp = rpc_roundtrip(
+            client_w,
+            client_r,
+            "tools/call",
+            id,
+            Some(json!({ "name": tool, "arguments": arguments })),
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], false, "tool {tool} errored: {resp}");
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        serde_json::from_str(text).unwrap()
     }
 
     #[tokio::test]

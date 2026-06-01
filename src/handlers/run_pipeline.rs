@@ -60,6 +60,10 @@ pub struct PipelineResult {
     pub step_results: HashMap<String, StepResult>,
     pub final_output: Option<String>,
     pub success: bool,
+    /// The stream id this run was recorded under (`run_id` for observability).
+    /// For a sync `RunPipeline::new` the handler derives it; surfaced here so
+    /// callers (e.g. the MCP server's session-run tracking, ADR-0034) learn it.
+    pub stream_id: String,
 }
 
 /// Execute a [`RunPipeline`] command against the given runtime.
@@ -492,6 +496,7 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
         step_results: all_results,
         final_output,
         success: overall_success,
+        stream_id,
     })
 }
 
@@ -997,7 +1002,7 @@ fn resolve_str_template(
 }
 
 /// Resolve `${inputs.*}` and `${steps.<id>.output}` in a task template.
-fn resolve_task_template(
+pub(crate) fn resolve_task_template(
     task: &str,
     inputs: &HashMap<String, String>,
     step_outputs: &HashMap<String, String>,

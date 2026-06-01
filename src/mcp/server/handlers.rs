@@ -22,6 +22,7 @@ use crate::events::{Event, EventKind};
 use crate::handlers::run_pipeline;
 use crate::runtime::Runtime;
 
+use super::observability::ObservabilityProvider;
 use super::protocol::{
     related_task_meta, task_augmentation, MethodOutcome, Notification, RpcError, Task, TaskStatus,
     ERR_INTERNAL, ERR_INVALID_PARAMS, ERR_METHOD_NOT_FOUND,
@@ -74,7 +75,11 @@ pub fn handle_initialize() -> Value {
 /// (`--include` / `--exclude` glob filters); it's applied *before* the
 /// `expose:` check so that names which never pass the filter cannot
 /// leak through.
-pub fn handle_tools_list<F>(runtime: &Runtime, filter: F) -> Value
+pub fn handle_tools_list<F>(
+    runtime: &Runtime,
+    observability: Option<&dyn ObservabilityProvider>,
+    filter: F,
+) -> Value
 where
     F: Fn(&str) -> bool,
 {
@@ -101,6 +106,10 @@ where
         tool.insert("inputSchema".into(), config.inputs_json_schema());
         tools.push(Value::Object(tool));
     }
+    // ADR-0034: append the read-only observability tools when enabled.
+    if let Some(obs) = observability {
+        tools.extend(obs.tool_descriptors());
+    }
     json!({ "tools": tools })
 }
 
@@ -123,6 +132,7 @@ where
 pub async fn handle_tools_call<F>(
     runtime: &Arc<Runtime>,
     store: &Arc<TaskStore>,
+    observability: Option<&dyn ObservabilityProvider>,
     request_id: &Value,
     params: &Value,
     filter: F,
@@ -140,6 +150,14 @@ where
         .cloned()
         .unwrap_or_else(|| Value::Object(Map::new()));
 
+    // ADR-0034: observability tools (`zymi.runs.*`) are not pipelines —
+    // dispatch them to the provider before pipeline resolution.
+    if let Some(obs) = observability {
+        if obs.handles(name) {
+            return obs.call(name, &arguments).await.map(MethodOutcome::just);
+        }
+    }
+
     let (pipeline_name, _config) = resolve_exposed_pipeline(runtime, name, filter)
         .ok_or_else(|| RpcError::new(ERR_METHOD_NOT_FOUND, format!("unknown tool `{name}`")))?;
 
@@ -154,6 +172,11 @@ where
                     ERR_INVALID_PARAMS,
                     format!("taskId `{}` is already in use", aug.task_id),
                 ));
+            }
+            // ADR-0034 session scope: the async task runs on stream
+            // `mcp-task-{task_id}` (see spawn_pipeline_task).
+            if let Some(obs) = observability {
+                obs.record_run(&format!("mcp-task-{}", aug.task_id));
             }
             let task = spawn_pipeline_task(
                 runtime,
@@ -183,7 +206,14 @@ where
         None => {
             let cmd = RunPipeline::new(pipeline_name.clone(), inputs);
             let result = match run_pipeline::handle(runtime, cmd).await {
-                Ok(pr) => tool_call_result(pr.success, pr.final_output.as_deref(), None),
+                Ok(pr) => {
+                    // ADR-0034 session scope: record the run_id the handler
+                    // derived so the agent can introspect this sync run.
+                    if let Some(obs) = observability {
+                        obs.record_run(&pr.stream_id);
+                    }
+                    tool_call_result(pr.success, pr.final_output.as_deref(), None)
+                }
                 Err(err) => tool_call_result(false, None, Some(err.as_str())),
             };
             Ok(MethodOutcome::just(result))
