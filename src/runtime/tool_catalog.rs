@@ -466,13 +466,24 @@ impl ToolCatalog {
         }
     }
 
-    /// Does this tool require human approval by default?
+    /// Was this tool explicitly marked `requires_approval: true`?
+    ///
+    /// When `true`, the step dispatchers pass `force_human` through
+    /// [`ApprovalContext`](crate::esaa::orchestrator::ApprovalContext) so a
+    /// contract auto-approve is upgraded to a human round-trip — this is the
+    /// per-tool gate ADR-0014 §4 promises, independent of the shell policy.
+    ///
+    /// Deliberately ignores the kind-level *default* for declarative shell
+    /// tools (`effective_requires_approval`): an unmarked shell tool is
+    /// already gated by the `execute_shell_command` policy (allowlisted
+    /// commands run, everything else asks). Forcing on the default would
+    /// make every scaffold placeholder prompt on each call.
     pub fn requires_approval(&self, name: &str) -> bool {
         if let Some(entry) = self.builtin.get(name) {
             return entry.requires_approval;
         }
         if let Some(entry) = self.declarative.get(name) {
-            return entry.config.effective_requires_approval();
+            return entry.config.requires_approval == Some(true);
         }
         if let Some(entry) = self.mcp.get(name) {
             return entry.requires_approval;
@@ -751,9 +762,23 @@ mod tests {
     }
 
     #[test]
-    fn shell_tool_requires_approval_by_default() {
+    fn shell_tool_default_does_not_force_approval() {
+        // The kind-level default for shell is handled by the
+        // execute_shell_command policy gate, not by per-tool forcing —
+        // only an explicit `requires_approval: true` forces the human
+        // round-trip (see requires_approval() doc).
         let mut tools = HashMap::new();
         tools.insert("sh".into(), make_shell_tool("sh", "echo hi"));
+        let catalog = ToolCatalog::with_declarative(&tools).unwrap();
+        assert!(!catalog.requires_approval("sh"));
+    }
+
+    #[test]
+    fn shell_tool_explicit_requires_approval_forces() {
+        let mut tools = HashMap::new();
+        let mut tool = make_shell_tool("sh", "echo hi");
+        tool.requires_approval = Some(true);
+        tools.insert("sh".into(), tool);
         let catalog = ToolCatalog::with_declarative(&tools).unwrap();
         assert!(catalog.requires_approval("sh"));
     }

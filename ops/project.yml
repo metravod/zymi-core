@@ -1,0 +1,38 @@
+# zymi-core release ops — a zymi project that releases the repo around it.
+#
+# Serve it with the LOCALLY BUILT binary, never the global pip zymi:
+#
+#   cargo build --features cli && cd ops && claude     # .mcp.json points at ../target/debug/zymi
+#
+# Two reasons (see ops/README.md): the release may depend on engine
+# features the last published version doesn't have yet, and "the code you
+# are about to tag runs your release" doubles as a final smoke test.
+name: zymi-release-ops
+version: "0.1"
+
+# Required by the loader; never used — every step here is a deterministic
+# tool step, no agent ever runs.
+llm:
+  provider: openai
+  model: gpt-4o-mini
+  api_key: "unused-no-agent-steps"
+
+defaults:
+  timeout_secs: 60
+
+policy:
+  enabled: true
+  allow:
+    - "python3 scripts/*"
+    - "cargo *"
+    - "git *"
+    - "test *"
+    - "echo *"
+  deny:
+    - "rm -rf *"
+    - "git push --force*"
+    - "git push -f*"
+
+# No approvals: block on purpose. Under `zymi mcp serve` the engine
+# auto-defaults to the mcp_elicitation channel (approve/deny form in the
+# MCP host); under a terminal `zymi run` it auto-spawns a terminal prompt.

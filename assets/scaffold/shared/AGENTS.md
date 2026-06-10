@@ -29,7 +29,8 @@ zymi runs them.
   `file_append`, `stdout`.
 - **Approval** — a gated tool call. Tools with `requires_approval: true`
   publish `ApprovalRequested`; an approval channel routes a human
-  decision back. Channels: `terminal`, `http`, `telegram`.
+  decision back. Channels: `terminal`, `http`, `telegram` (plus an
+  auto-spawned `mcp_elicitation` form when serving over `zymi mcp serve`).
 - **Stream** — append-only ordered sequence of events. Each pipeline run
   is a stream. Hash-chained per stream for tamper-evidence.
 - **Event** — every state change. Hits the bus, gets persisted in

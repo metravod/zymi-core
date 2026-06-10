@@ -1,0 +1,16 @@
+name: run_checks
+description: >-
+  Run the pre-push checks that match CI: clippy with -D warnings on the
+  full cli+python feature set, then the lib test suite. Also refreshes
+  Cargo.lock after the version bump so the release commit can include it.
+parameters:
+  type: object
+  properties: {}
+  required: []
+
+implementation:
+  kind: shell
+  command_template: >-
+    cargo clippy --manifest-path ../Cargo.toml --lib --features cli --features python -- -D warnings
+    && cargo test --manifest-path ../Cargo.toml --lib --features cli
+  timeout_secs: 900

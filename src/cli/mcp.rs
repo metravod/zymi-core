@@ -12,8 +12,11 @@ use std::time::Duration;
 
 use tokio::io::BufReader;
 
+use crate::approval::ApprovalChannel;
 use crate::config::load_project_dir;
-use crate::mcp::server::{serve as serve_mcp, ServerConfig};
+use crate::mcp::server::elicitation::{McpElicitationApprovalChannel, CHANNEL_NAME};
+use crate::mcp::server::link::McpClientLink;
+use crate::mcp::server::{serve_with_link, ServerConfig};
 use crate::mcp::{McpServerConnection, McpServerSpec};
 use crate::runtime::Runtime;
 
@@ -81,8 +84,13 @@ pub fn exec_serve(
     include: &[String],
     exclude: &[String],
     root: impl AsRef<Path>,
+    expose_observability: bool,
+    observability_scope: &str,
 ) -> Result<(), String> {
     let root = root.as_ref().to_path_buf();
+    // Parse the scope flag up front so a typo fails before we touch the project.
+    let observability_scope =
+        super::mcp_observability::ObservabilityScope::parse(observability_scope)?;
     if !root.join("project.yml").exists() {
         return Err(format!(
             "no project.yml found in {}. Run `zymi init` first.",
@@ -96,18 +104,82 @@ pub fn exec_serve(
 
     let rt = super::runtime();
     rt.block_on(async move {
+        // Pull approval routing out before the workspace moves into the builder.
+        let approvals = workspace.project.approvals.clone();
+        // Auto + respect project.yml: use the project's declared default approval
+        // channel if any, otherwise default to the MCP elicitation bridge so an
+        // approval gate is answerable through the connected client (ADR-0033
+        // 2b-sync). Without this, an approval under `serve` has no channel on the
+        // bus and the orchestrator fail-closes (hard deny).
+        let default_channel = workspace
+            .project
+            .default_approval_channel
+            .clone()
+            .unwrap_or_else(|| CHANNEL_NAME.to_string());
+
         let runtime = Arc::new(
             Runtime::builder(workspace, root.clone())
+                .with_approval_channel(default_channel)
                 .build_async()
                 .await?,
         );
+
+        // The bidirectional link shared with the elicitation approval channel.
+        let (link, outbound_rx) = McpClientLink::new();
+
+        // Start approval channels on the runtime bus. Kept alive (`_handles`)
+        // until `serve` returns — dropping a handle aborts its bus listener.
+        let mut _handles = Vec::new();
+        if !approvals.is_empty() {
+            let started =
+                crate::approval::spawn_approval_channels(&approvals, Arc::clone(runtime.bus()))
+                    .await?;
+            for (name, err) in &started.failures {
+                eprintln!("approval channel '{name}' failed to start: {err}");
+            }
+            _handles.extend(started.handles);
+        }
+        let elicit = McpElicitationApprovalChannel::new(Arc::clone(&link));
+        _handles.push(elicit.start(Arc::clone(runtime.bus())).await?);
+
+        // ADR-0034: optional read-only observability tools. The provider holds
+        // the session-run set and reads the event store on demand.
+        let observability: crate::mcp::server::observability::SharedObservability =
+            if expose_observability {
+                eprintln!(
+                    "zymi mcp serve: observability tools enabled (scope: {observability_scope:?})"
+                );
+                Some(Arc::new(super::mcp_observability::CliObservability::new(
+                    Arc::clone(&runtime),
+                    observability_scope,
+                )))
+            } else {
+                None
+            };
+
+        // Self-heal approvals left dangling by a prior crash (parity with the
+        // `zymi serve` / `zymi run` startup path).
+        let _ = crate::approval::replay_unfulfilled_approvals(
+            Arc::clone(runtime.bus()),
+            crate::approval::DEFAULT_APPROVAL_TIMEOUT,
+        )
+        .await;
 
         let real_stdout = redirect_stdout_for_jsonrpc()
             .map_err(|e| format!("could not isolate stdout for MCP wire: {e}"))?;
         eprintln!("zymi mcp serve: ready (stdio, pipelines filtered by expose.mcp)");
 
         let stdin = BufReader::new(tokio::io::stdin());
-        serve_mcp(runtime, config, stdin, real_stdout).await
+        serve_with_link(
+            runtime,
+            config,
+            stdin,
+            real_stdout,
+            link,
+            outbound_rx,
+            observability,
+        )
+        .await
     })
 }
 

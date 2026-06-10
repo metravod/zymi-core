@@ -404,7 +404,10 @@ impl ContextBuilder {
 /// - `ToolCallCompleted` → `Message::ToolResult`
 /// - `UserMessageReceived` → `Message::User`
 /// - `ContextCompacted` → `Message::System("[compacted history]\n…")`
-fn events_to_messages(events: &[crate::events::Event]) -> Vec<Message> {
+///
+/// `pub(crate)` so the MCP observability `step_io` tool (ADR-0034) can
+/// reconstruct a step's conversation from its `{run}:step:{step}` substream.
+pub(crate) fn events_to_messages(events: &[crate::events::Event]) -> Vec<Message> {
     events_to_messages_with_seqs(events)
         .into_iter()
         .map(|(msg, _seq)| msg)

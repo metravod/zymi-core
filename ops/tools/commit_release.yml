@@ -1,0 +1,17 @@
+name: commit_release
+description: >-
+  Commit the release bump: the two manifests plus Cargo.lock (tracked in
+  this repo, refreshed by run_checks).
+parameters:
+  type: object
+  properties:
+    version:
+      type: string
+      description: "Semver being released, used in the commit message"
+  required: [version]
+
+implementation:
+  kind: shell
+  command_template: >-
+    git -C .. add Cargo.toml pyproject.toml Cargo.lock
+    && git -C .. commit -m "release: v${args.version}"

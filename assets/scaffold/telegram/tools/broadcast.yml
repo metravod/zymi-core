@@ -18,8 +18,9 @@ parameters:
       description: "The announcement text. Plain text, ≤ 280 chars."
   required: [message]
 
-# Default for `kind: shell` is already `requires_approval: true`, but
-# spell it out so a future reader sees the gate without grepping ADRs.
+# Explicit `requires_approval: true` forces the human round-trip on
+# EVERY call — even though `echo` is allowlisted in project.yml policy.
+# (An unmarked shell tool only asks when its command is not allowlisted.)
 requires_approval: true
 
 implementation:

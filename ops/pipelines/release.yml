@@ -1,0 +1,41 @@
+name: release
+description: >-
+  Cut a zymi-core release: verify clean tree, bump BOTH manifests
+  (Cargo.toml + pyproject.toml — the two-manifest rule), run the
+  CI-matching checks, commit, then — after human approval — tag and push.
+  The v<version> tag triggers the GitHub release workflow (PyPI wheels).
+
+expose:
+  mcp: {}
+
+inputs:
+  - name: version
+    type: string
+    required: true
+    description: "Semver to release, e.g. 0.7.0. The git tag becomes v0.7.0."
+
+steps:
+  - id: guard
+    tool: check_clean
+
+  - id: bump
+    tool: bump_manifests
+    args: { version: "${inputs.version}" }
+    depends_on: [guard]
+
+  - id: check
+    tool: run_checks
+    depends_on: [bump]
+
+  - id: commit
+    tool: commit_release
+    args: { version: "${inputs.version}" }
+    depends_on: [check]
+
+  - id: ship
+    tool: tag_and_push
+    args: { version: "${inputs.version}" }
+    depends_on: [commit]
+
+output:
+  step: ship

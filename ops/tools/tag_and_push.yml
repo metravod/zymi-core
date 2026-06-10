@@ -1,0 +1,25 @@
+name: tag_and_push
+description: >-
+  Tag v<version> and push the branch + tag to origin. The tag triggers
+  the GitHub release workflow (maturin wheels -> PyPI), so this is the
+  point of no return. Always requires human approval.
+parameters:
+  type: object
+  properties:
+    version:
+      type: string
+      description: "Semver to tag, e.g. 0.7.0 — pushed as v0.7.0"
+  required: [version]
+
+# Explicit `requires_approval: true` forces the approval round-trip on
+# every call even though `git *` is policy-allowlisted (ADR-0014
+# addendum 2026-06-10). Over MCP this renders as an approve/deny form in
+# the calling host; under `zymi run` it's a terminal prompt.
+requires_approval: true
+
+implementation:
+  kind: shell
+  command_template: >-
+    git -C .. tag "v${args.version}"
+    && git -C .. push origin HEAD "v${args.version}"
+  timeout_secs: 120

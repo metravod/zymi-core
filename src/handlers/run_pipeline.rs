@@ -60,6 +60,10 @@ pub struct PipelineResult {
     pub step_results: HashMap<String, StepResult>,
     pub final_output: Option<String>,
     pub success: bool,
+    /// The stream id this run was recorded under (`run_id` for observability).
+    /// For a sync `RunPipeline::new` the handler derives it; surfaced here so
+    /// callers (e.g. the MCP server's session-run tracking, ADR-0034) learn it.
+    pub stream_id: String,
 }
 
 /// Execute a [`RunPipeline`] command against the given runtime.
@@ -492,6 +496,7 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
         step_results: all_results,
         final_output,
         success: overall_success,
+        stream_id,
     })
 }
 
@@ -719,6 +724,9 @@ async fn run_agent_step(
                         (payload.to_string(), false)
                     } else {
                         let intention = tool_catalog.intention(&tc.name, &tc.arguments);
+                        let force_human = tool_catalog.requires_approval(&tc.name).then(|| {
+                            format!("tool '{}' is marked requires_approval: true", tc.name)
+                        });
                         let verdict = orchestrator
                             .process_intention(
                                 &intention,
@@ -727,6 +735,7 @@ async fn run_agent_step(
                                 crate::esaa::orchestrator::ApprovalContext {
                                     channel: approval_channel.as_deref(),
                                     timeout: approval_timeout,
+                                    force_human,
                                 },
                             )
                             .await;
@@ -858,6 +867,9 @@ async fn run_tool_step(
         (payload.to_string(), false)
     } else {
         let intention = tool_catalog.intention(tool_name, &args_json);
+        let force_human = tool_catalog
+            .requires_approval(tool_name)
+            .then(|| format!("tool '{tool_name}' is marked requires_approval: true"));
         let verdict = orchestrator
             .process_intention(
                 &intention,
@@ -866,6 +878,7 @@ async fn run_tool_step(
                 ApprovalContext {
                     channel: approval_channel.as_deref(),
                     timeout: approval_timeout,
+                    force_human,
                 },
             )
             .await;
@@ -997,7 +1010,7 @@ fn resolve_str_template(
 }
 
 /// Resolve `${inputs.*}` and `${steps.<id>.output}` in a task template.
-fn resolve_task_template(
+pub(crate) fn resolve_task_template(
     task: &str,
     inputs: &HashMap<String, String>,
     step_outputs: &HashMap<String, String>,

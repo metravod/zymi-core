@@ -3,6 +3,7 @@ mod events;
 mod fetch;
 mod init;
 mod mcp;
+pub mod mcp_observability;
 mod observe;
 mod pipelines;
 mod resume;
@@ -76,6 +77,18 @@ enum McpCommand {
         /// Project directory (defaults to the current working directory).
         #[arg(short = 'd', long)]
         dir: Option<PathBuf>,
+
+        /// Expose read-only observability tools (`zymi.runs.*`, ADR-0034) so a
+        /// connected agent can introspect its own run traces. Off by default
+        /// to keep the tool catalog lean.
+        #[arg(long = "expose-observability")]
+        expose_observability: bool,
+
+        /// Which runs the observability tools can see: `session` (default —
+        /// only runs this serve process started) or `all` (every run in the
+        /// store; single-user dev only).
+        #[arg(long = "observability-scope", value_name = "session|all", default_value = "session")]
+        observability_scope: String,
     },
 }
 
@@ -412,7 +425,15 @@ fn dispatch(cli: Cli) {
                 include,
                 exclude,
                 dir,
-            } => mcp::exec_serve(&include, &exclude, resolve_root(dir.as_deref())),
+                expose_observability,
+                observability_scope,
+            } => mcp::exec_serve(
+                &include,
+                &exclude,
+                resolve_root(dir.as_deref()),
+                expose_observability,
+                &observability_scope,
+            ),
         },
         Command::Schema { kind, all } => schema::exec(kind.as_deref(), all),
     };

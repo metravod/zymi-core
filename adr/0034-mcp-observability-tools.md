@@ -2,7 +2,7 @@
 
 Date: 2026-05-22
 
-Status: Proposed.
+Status: Accepted (v1 shipped 2026-06-01 — all four read-only tools).
 
 ## Context
 
@@ -76,6 +76,31 @@ Open questions for Stage 3:
 **Stage 4 — fork / replay.** `zymi.runs.fork(run_id, from_step)` using ADR-0018 idempotent fork. Write surface (creates a new run). Behind approval. Closes the "retry from step N with different inputs" loop without re-running the entire pipeline.
 
 **Stage 5 — resources, eventually.** When MCP client support for resources matures (subscriptions surfacing in host UIs), migrate event streams to `zymi://runs/{run_id}/events` resources with live subscriptions. Tools remain the explicit-call surface; resources become the streaming surface. Not v1 because Claude Desktop / Cursor resource UX is weak as of 2026-05.
+
+## Implementation notes (v1, 2026-06-01)
+
+- **Step attribution was already present.** §step_io assumed new plumbing to tag
+  events by step. In fact `run_pipeline` already records each step's LLM/tool events on
+  a derived stream `{run_id}:step:{step_id}` (and `ContextBuilder` is built against it),
+  with workflow-level events (`WorkflowNodeStarted/Completed`, `node_id = step_id`) on
+  the run stream. So no event-schema change was needed: `step_io` reads the substream
+  directly; `events` merges the run stream + `{run_id}:step:*` substreams and tags each
+  event's `step_id` from the stream suffix.
+- **`step_io` is reconstructed, unmasked.** `prompt_in` = `[System(agent.system_prompt),
+  User(resolved_task)] + events_to_messages(step_substream)`; the task is re-resolved via
+  `resolve_task_template` over the run's inputs + best-effort prior step outputs. The
+  exact *masked* context sent per LLM iteration is not stored verbatim (ADR-0016), so the
+  result carries a `note` saying so — the unmasked full exchange is more useful for
+  debugging than the masked one anyway.
+- **Scope uses an in-process initiated-run set, not a persisted `parent_run_id`.** For
+  stdio (the only v1 transport) the serve process records the run ids it starts (sync via
+  `PipelineResult.stream_id`, async via the `mcp-task-{id}` stream) in an in-memory set;
+  `session` scope filters to it, `all` removes the filter. A persisted `parent_run_id` is
+  only needed for multi-session HTTP (post-0.7) and is deferred.
+- **Layering.** `mcp::server` (runtime-gated, compiles without `cli`) defines a
+  dependency-free `ObservabilityProvider` port; the `cli` layer (which owns `list_runs` /
+  `format_event`) implements it (`cli::mcp_observability::CliObservability`). `zymi mcp
+  serve --expose-observability [--observability-scope session|all]` wires it in.
 
 ## Rejected alternatives
 

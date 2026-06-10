@@ -70,6 +70,28 @@ pub struct Notification {
     pub params: Value,
 }
 
+/// What the connected client advertised in its `initialize` `capabilities`.
+/// We only track what the server side acts on; today that's elicitation
+/// (the 2b-sync approval bridge). Absent ⇒ treated as unsupported.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ClientCaps {
+    /// Client declared `capabilities.elicitation` — it can render
+    /// `elicitation/create` forms. Gates the MCP elicitation approval
+    /// channel (ADR-0033 2b-sync).
+    pub elicitation: bool,
+}
+
+/// Parse the client's advertised capabilities from `initialize` params.
+/// Presence of the `capabilities.elicitation` object is the signal; its
+/// inner shape is not inspected (the 2025-11-25 schema leaves it open).
+pub fn parse_client_caps(params: &Value) -> ClientCaps {
+    let elicitation = params
+        .get("capabilities")
+        .and_then(|c| c.get("elicitation"))
+        .is_some();
+    ClientCaps { elicitation }
+}
+
 /// Outcome of handling a request: the JSON-RPC `result` plus any
 /// notifications to emit alongside it (e.g. `notifications/tasks/created`,
 /// which SEP-1686 requires right after task creation).
