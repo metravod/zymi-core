@@ -1,6 +1,6 @@
 # zymi-core
 
-> Event-sourced agent engine. YAML-first orchestration for LLM agents with full audit trail, deterministic replay, human approval gates, and pluggable connectors. Distributed as `pip install zymi-core` (Python) and as a Rust crate.
+> Auditable MCP backend for agents: `zymi mcp serve` exposes declarative YAML pipelines as MCP tools with event-sourced audit trail, deterministic replay, interactive human approval gates (MCP elicitation), and self-introspection tools (`zymi.runs.*`). Also a standalone YAML-first agent engine with pluggable connectors. Distributed as `pip install zymi-core` (Python) and as a Rust crate.
 
 ## Quick start
 
@@ -14,7 +14,8 @@
 - [Pipelines](docs/pipelines.md): `pipelines/<name>.yml` schema, agent steps and deterministic tool steps (ADR-0024), DAG semantics, conditional edges via `when:` (ADR-0028), `${inputs.*}` / `${steps.<id>.output}` interpolation
 - [Tools](docs/tools.md): four tool kinds — declarative HTTP/shell, Python `@tool`, MCP, builtin
 - [Connectors](docs/connectors.md): inbound (`http_inbound`, `http_poll`, `cron`, `file_read`, `stdin`) and outbound (`http_post`, `file_append`, `stdout`)
-- [Approvals](docs/approvals.md): event-sourced human-in-the-loop, channels (`terminal`, `http`, `telegram`), restart-safe replay (ADR-0022)
+- [Approvals](docs/approvals.md): event-sourced human-in-the-loop, channels (`terminal`, `http`, `telegram`, auto `mcp_elicitation` under `zymi mcp serve`), restart-safe replay (ADR-0022)
+- MCP server: `zymi mcp serve` — pipelines as MCP tools (opt-in `expose.mcp:`), sync + SEP-1686 async tasks, approval gates as elicitation forms in the host, `--expose-observability` for `zymi.runs.list/get/events/step_io` (ADR-0033, ADR-0034); see README §"zymi as an MCP server"
 - [Store backends](docs/store-backends.md): SQLite (default) vs Postgres (multi-process `zymi serve` against a shared store)
 - [Events and replay](docs/events-and-replay.md): event-sourcing model, stream and hash-chain semantics, `zymi events` / `runs` / `verify` / `observe`, fork-resume
 - [CLI reference](docs/cli.md): every `zymi` subcommand with flags and examples

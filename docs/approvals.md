@@ -10,7 +10,7 @@ Approvals live entirely on the event bus (ADR-0022). No in-memory pending map, n
 - TUI / `zymi events` see every approval decision the same way they see any other event.
 - Hash-chained: decisions are tamper-evident.
 
-Three channel types ship in the box: `terminal`, `http`, `telegram`. New channels plug in via the same registry as connectors.
+Three channel types are declarable in `approvals:`: `terminal`, `http`, `telegram`. A fourth, `mcp_elicitation`, is auto-provided by `zymi mcp serve` (not declared in YAML) — it renders the approve/deny form in the calling MCP host. New channels plug in via the same registry as connectors.
 
 ## Resolution order
 
@@ -20,6 +20,8 @@ When a tool with `requires_approval: true` fires, zymi picks a channel by:
 2. Project-level `default_approval_channel:` (in `project.yml`), if set.
 3. Auto-spawn a terminal channel — only when no `approvals:` is configured AND stdin is attached (zero-config UX for `zymi run`).
 4. Fail closed (`ApprovalDenied{reason: no_channel}`) — when none of the above apply.
+
+Under `zymi mcp serve`, step 3 spawns an `mcp_elicitation` channel instead of a terminal one (stdio is the JSON-RPC wire), and it becomes the default when `project.yml` sets none. Project-declared channels still start alongside and win when named by steps 1–2.
 
 ## Schema
 
@@ -101,6 +103,10 @@ curl "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
 `secret_token:` is enforced via Telegram's `X-Telegram-Bot-Api-Secret-Token` header. Without it, anyone who guesses the public URL can forge approvals — only safe for local development.
 
 `decided_by:` on the resulting `ApprovalGranted` / `ApprovalDenied` event records `telegram:<from.username>` so the audit trail names the human who clicked.
+
+### `mcp_elicitation` — form in the MCP host {#mcp-elicitation}
+
+Auto-provided by `zymi mcp serve`; nothing to declare in YAML. When a pipeline running as an MCP tool trips an approval, the server sends `elicitation/create` back through the live `tools/call` — Claude Code renders it as a native approve/deny form. Approve and the pipeline continues; deny and the step fails with `[rejected by human]`. A client that never declared the `elicitation` capability fail-closes immediately (`ApprovalDenied{reason: client_no_elicitation}`); headless / non-interactive clients typically auto-decline. Sync `tools/call` only — an approval inside a SEP-1686 *task-augmented* (async) call times out instead, see the MCP-server limitations in the README.
 
 ## Per-pipeline override
 
