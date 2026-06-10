@@ -50,8 +50,11 @@ pub struct McpExpose {
     /// pipeline's `description:` when omitted.
     #[serde(default)]
     pub description: Option<String>,
-    /// Sync blocks `tools/call` until the pipeline terminates; async
-    /// (Slice 2, SEP-1686) returns a task handle and resolves later.
+    /// Execution-mode hint. The tool descriptor is identical either way:
+    /// whether a call runs sync (blocking `tools/call`) or async is decided
+    /// by the *client* task-augmenting the request (SEP-1686). `async`
+    /// signals that callers SHOULD task-augment because the pipeline runs
+    /// long.
     #[serde(default)]
     pub mode: McpExposeMode,
 }
@@ -61,8 +64,9 @@ pub struct McpExpose {
 pub enum McpExposeMode {
     #[default]
     Sync,
-    /// Reserved for Slice 2 (SEP-1686 Tasks). Parses today but the v1
-    /// server skips async-mode pipelines until task support lands.
+    /// Hint that callers SHOULD task-augment `tools/call` (SEP-1686)
+    /// because the pipeline runs long. Listed in `tools/list` like any
+    /// sync pipeline since Slice 2a.
     Async,
 }
 

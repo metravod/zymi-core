@@ -510,7 +510,7 @@ mod tests {
     // declares three pipelines:
     //   - `web_search`     — exposed, sync (the happy-path tool)
     //   - `hidden_cron`    — not exposed (must not appear in tools/list)
-    //   - `long_task`      — exposed, async (Slice 2 territory, skipped)
+    //   - `long_task`      — exposed, async (listed like sync since Slice 2a)
     // The test drives the server over an in-memory duplex pair and
     // verifies the wire shape for `initialize`, `tools/list`, and
     // `tools/call`.

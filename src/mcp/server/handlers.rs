@@ -1,12 +1,12 @@
-//! MCP method handlers for `zymi mcp serve` (ADR-0033 Slice 1, sync only).
+//! MCP method handlers for `zymi mcp serve` (ADR-0033).
 //!
-//! Three methods today:
-//! - `initialize` — protocol handshake, server info, tools capability.
-//! - `tools/list` — enumerate exposed pipelines as MCP tools.
-//! - `tools/call` — invoke an exposed pipeline and block on completion.
-//!
-//! Async-mode pipelines are silently skipped from `tools/list` here;
-//! Slice 2 (SEP-1686) will flip the capability bit and add task surface.
+//! - `initialize` — protocol handshake, server info, tools + tasks capabilities.
+//! - `tools/list` — enumerate exposed pipelines (sync and async alike) as MCP tools.
+//! - `tools/call` — invoke an exposed pipeline: plain calls block until
+//!   completion; task-augmented calls (SEP-1686, `_meta.task`) return a
+//!   task handle immediately.
+//! - `tasks/get` / `tasks/result` / `tasks/list` / `tasks/cancel` — the
+//!   SEP-1686 task surface over backgrounded pipeline runs.
 
 use std::collections::HashMap;
 use std::sync::Arc;

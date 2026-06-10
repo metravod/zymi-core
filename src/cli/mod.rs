@@ -56,9 +56,11 @@ enum McpCommand {
 
     /// Serve this project's pipelines as MCP tools over stdio (ADR-0033).
     ///
-    /// Pipelines opt in by declaring `expose.mcp:` in their YAML. Sync
-    /// mode only in v1 — async-mode pipelines parse but are skipped from
-    /// `tools/list` until Slice 2 (SEP-1686 Tasks).
+    /// Pipelines opt in by declaring `expose.mcp:` in their YAML. A plain
+    /// `tools/call` blocks until the pipeline terminates; clients that
+    /// support SEP-1686 Tasks can task-augment the call to run it in the
+    /// background (`expose.mcp.mode: async` marks pipelines where callers
+    /// should do so).
     ///
     /// Example: wire into Claude Desktop via
     ///   { "command": "zymi", "args": ["mcp", "serve", "--dir", "/path/to/project"] }
