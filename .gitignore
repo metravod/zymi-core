@@ -23,6 +23,8 @@ __pycache__/
 # Project-local
 /.drift
 /.claude
+# release-ops run history (ops/ is a zymi project; its event store is local)
+/ops/.zymi/
 CLAUDE.md
 # AGENTS.md is generated INTO user projects by `zymi init`; in this repo
 # the equivalent is CLAUDE.md (kept local). Don't commit a root AGENTS.md

@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "zymi-release": {
+      "command": "../target/debug/zymi",
+      "args": ["mcp", "serve", "--dir", ".", "--expose-observability"]
+    }
+  }
+}

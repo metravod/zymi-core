@@ -1,0 +1,12 @@
+name: check_clean
+description: >-
+  Fail fast when the repo working tree is dirty — a release must start
+  from a committed state so the bump commit contains nothing else.
+parameters:
+  type: object
+  properties: {}
+  required: []
+
+implementation:
+  kind: shell
+  command_template: 'test -z "$(git -C .. status --porcelain)" && echo "working tree clean"'

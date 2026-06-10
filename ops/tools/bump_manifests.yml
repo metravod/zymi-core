@@ -1,0 +1,16 @@
+name: bump_manifests
+description: >-
+  Set the version in BOTH release manifests (Cargo.toml + pyproject.toml).
+  Bumping only one is the classic broken release: the tag rebuilds the
+  previous PyPI version and the upload fails with "400 File already exists".
+parameters:
+  type: object
+  properties:
+    version:
+      type: string
+      description: "Semver, e.g. 0.7.0 (no leading v)"
+  required: [version]
+
+implementation:
+  kind: shell
+  command_template: "python3 scripts/bump.py ${args.version}"
