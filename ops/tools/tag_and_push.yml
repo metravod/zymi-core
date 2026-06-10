@@ -19,7 +19,12 @@ requires_approval: true
 
 implementation:
   kind: shell
+  # The trailing echo is the step's entire stdout: `git tag` is silent and
+  # `git push` reports to stderr, so without it the pipeline (and the MCP
+  # tool result, via `output: step: ship`) returns an empty string —
+  # observed on the v0.7.0 run.
   command_template: >-
     git -C .. tag "v${args.version}"
     && git -C .. push origin HEAD "v${args.version}"
+    && echo "released v${args.version}: tag pushed, release workflow triggered"
   timeout_secs: 120
