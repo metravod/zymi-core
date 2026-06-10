@@ -967,6 +967,9 @@ mod tests {
     // With a `CliObservability` provider wired in, `tools/list` advertises
     // the four `zymi.runs.*` tools; running a sync pipeline records the run
     // under session scope; then list / get / events / step_io read it back.
+    // The provider implementation lives behind the `cli` feature; the
+    // ObservabilityProvider port itself stays feature-free.
+    #[cfg(feature = "cli")]
     #[tokio::test]
     async fn observability_tools_list_get_events_step_io() {
         use crate::cli::mcp_observability::{CliObservability, ObservabilityScope};
