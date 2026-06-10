@@ -235,3 +235,18 @@ What is still deferred from the ADR design:
 - `intention` mapping for declarative tools (Python-side tag → `Intention` variant).
 - Unsafe-shell miette warning.
 - `ProgrammaticTool` Rust trait — auto-discovery currently stores `Py<PyAny>` directly in `PythonEntry`; lifting that to a trait waits for a second source of programmatic tools.
+
+---
+
+## Addendum 2026-06-10 — `requires_approval` was never enforced; explicit-only forcing
+
+**Context.** The live MCP smoke (ADR-0033 2b-sync verification against real Claude Code) revealed that `ToolCatalog::requires_approval()` had **zero execution-path callers** — the §4 promise was dead code. Both step dispatchers (`run_agent_step`, `run_tool_step`) built an `Intention` and let `ContractEngine::evaluate` decide alone; contracts only know intention shapes (shell policy, file paths, sub-agent), not which tool the operator marked sensitive. Consequences before the fix: `requires_approval: true` on HTTP / Python / MCP tools never gated at all (`CallCustomTool` → always `Approved`); on shell tools it gated only by accident, when the command happened to not be allowlisted. The telegram scaffold's `broadcast` (echo-based, `requires_approval: true`, `allow: ["echo *"]`) executed silently — contradicting this ADR, the README, and docs/approvals.md.
+
+**Decision.** Two-level gate, wired via a new `force_human: Option<String>` on `ApprovalContext` (orchestrator upgrades a contract `Approved` to `RequiresHumanApproval`; `Denied` is never upgraded):
+
+1. **Explicit `requires_approval: true`** (YAML `Some(true)`, `@tool(requires_approval=True)`, MCP per-server list, builtin entry flag) → human approval round-trip on **every** call, even when contracts would auto-approve. `ToolCatalog::requires_approval()` now answers exactly this question (explicit marking), and both step dispatchers consult it.
+2. **Kind-level defaults stay with the contracts**: an unmarked shell tool is gated by the `execute_shell_command` policy (allowlisted → run, else → ask, deny → denied); unmarked http/python/MCP stay auto-approved. Forcing on the shell *default* would make every scaffold placeholder (`web_search`/`web_scrape` echo stubs) prompt on each call.
+
+**Supersedes one §4 sentence:** explicit `requires_approval: false` on a shell tool does **not** bypass the policy gate (the §4 wording implied it would; the bypass was never implemented and stays unimplemented deliberately — deny patterns and the ask-by-default for unknown commands continue to apply). The validator warning is kept as-is since the flag still expresses intent to downgrade.
+
+**Verification.** Orchestrator unit tests (`force_human_upgrades_contract_approve_to_approval`, `force_human_does_not_override_denial`), catalog tests for explicit-vs-default semantics, and the live MCP smoke re-run: allowlisted `echo` + explicit `requires_approval: true` now triggers `elicitation/create` in Claude Code; approve → pipeline continues, deny → halts; an unmarked allowlisted tool stays promptless.

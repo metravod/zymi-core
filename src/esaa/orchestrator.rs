@@ -24,6 +24,13 @@ pub struct ApprovalContext<'a> {
     /// Per-request timeout for the bus path. Used as the default
     /// "denied on timeout" budget.
     pub timeout: Duration,
+    /// When set, an intention the contracts would auto-approve is
+    /// upgraded to `RequiresHumanApproval` with this reason. Carries the
+    /// per-tool `requires_approval: true` marking (ADR-0014 §4) from the
+    /// tool catalog into the gate — contracts only know intention shapes
+    /// (shell policy, file paths), not which tool was explicitly marked
+    /// sensitive by the operator. A contract `Denied` is never upgraded.
+    pub force_human: Option<String>,
 }
 
 impl<'a> ApprovalContext<'a> {
@@ -31,6 +38,7 @@ impl<'a> ApprovalContext<'a> {
         Self {
             channel: None,
             timeout: crate::approval::DEFAULT_APPROVAL_TIMEOUT,
+            force_human: None,
         }
     }
 }
@@ -93,8 +101,17 @@ impl Orchestrator {
         )
         .await;
 
-        // 2. Evaluate contracts
-        let verdict = self.contracts.evaluate(intention);
+        // 2. Evaluate contracts. A tool explicitly marked
+        // `requires_approval: true` upgrades a contract auto-approve to a
+        // human round-trip; Denied / RequiresHumanApproval stay as-is.
+        let verdict = match (self.contracts.evaluate(intention), &approval.force_human) {
+            (IntentionVerdict::Approved, Some(reason)) => {
+                IntentionVerdict::RequiresHumanApproval {
+                    reason: reason.clone(),
+                }
+            }
+            (verdict, _) => verdict,
+        };
 
         // 3. Emit IntentionEvaluated
         let verdict_str = match &verdict {
@@ -379,12 +396,105 @@ mod tests {
                 ApprovalContext {
                     channel: Some("test-channel"),
                     timeout: Duration::from_secs(2),
+                    force_human: None,
                 },
             )
             .await;
 
         assert!(matches!(result, OrchestratorResult::Approved));
         channel_task.await.unwrap();
+    }
+
+    /// `force_human` (per-tool `requires_approval: true`, ADR-0014 §4)
+    /// upgrades a contract auto-approve to the approval round-trip: `ls`
+    /// is allowlisted by the shell policy, yet ApprovalRequested fires
+    /// and the verdict waits on the channel decision.
+    #[tokio::test]
+    async fn force_human_upgrades_contract_approve_to_approval() {
+        let (_dir, bus, contracts) = setup().await;
+        let orch = Orchestrator::new(contracts, bus.clone());
+
+        let bus_for_channel = Arc::clone(&bus);
+        let channel_task = tokio::spawn(async move {
+            let mut rx = bus_for_channel.subscribe().await;
+            while let Some(ev) = rx.recv().await {
+                if let EventKind::ApprovalRequested {
+                    approval_id,
+                    stream_id,
+                    channel,
+                    description,
+                    ..
+                } = &ev.kind
+                {
+                    if channel == "test-channel" {
+                        assert!(
+                            description.contains("marked requires_approval"),
+                            "approval reason should carry the per-tool marking, got: {description}"
+                        );
+                        let mut grant = Event::new(
+                            stream_id.clone(),
+                            EventKind::ApprovalGranted {
+                                approval_id: approval_id.clone(),
+                                stream_id: stream_id.clone(),
+                                decided_by: "test".into(),
+                                reason: None,
+                            },
+                            "approval_channel".into(),
+                        );
+                        if let Some(corr) = ev.correlation_id {
+                            grant = grant.with_correlation(corr);
+                        }
+                        bus_for_channel.publish(grant).await.unwrap();
+                        break;
+                    }
+                }
+            }
+        });
+
+        let result = orch
+            .process_intention(
+                &Intention::ExecuteShellCommand {
+                    command: "ls".into(), // allowlisted — contracts say Approved
+                    timeout_secs: None,
+                },
+                "test-stream",
+                Uuid::new_v4(),
+                ApprovalContext {
+                    channel: Some("test-channel"),
+                    timeout: Duration::from_secs(2),
+                    force_human: Some("tool 'broadcast' is marked requires_approval: true".into()),
+                },
+            )
+            .await;
+
+        assert!(matches!(result, OrchestratorResult::Approved));
+        channel_task.await.unwrap();
+    }
+
+    /// `force_human` never downgrades a denial: a policy-denied command
+    /// stays Denied without any approval round-trip.
+    #[tokio::test]
+    async fn force_human_does_not_override_denial() {
+        let (_dir, bus, contracts) = setup().await;
+        let orch = Orchestrator::new(contracts, bus.clone());
+
+        let result = orch
+            .process_intention(
+                &Intention::ExecuteShellCommand {
+                    command: "rm -rf /".into(), // matches deny list
+                    timeout_secs: None,
+                },
+                "test-stream",
+                Uuid::new_v4(),
+                ApprovalContext {
+                    channel: Some("test-channel"),
+                    timeout: Duration::from_secs(2),
+                    force_human: Some("tool 'wipe' is marked requires_approval: true".into()),
+                },
+            )
+            .await;
+
+        assert!(matches!(result, OrchestratorResult::Denied { .. }));
     }
 
     /// Bus-path timeout: no channel listener responds within the
@@ -406,6 +516,7 @@ mod tests {
                 ApprovalContext {
                     channel: Some("nobody-home"),
                     timeout: Duration::from_millis(80),
+                    force_human: None,
                 },
             )
             .await;

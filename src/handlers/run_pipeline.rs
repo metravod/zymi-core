@@ -724,6 +724,9 @@ async fn run_agent_step(
                         (payload.to_string(), false)
                     } else {
                         let intention = tool_catalog.intention(&tc.name, &tc.arguments);
+                        let force_human = tool_catalog.requires_approval(&tc.name).then(|| {
+                            format!("tool '{}' is marked requires_approval: true", tc.name)
+                        });
                         let verdict = orchestrator
                             .process_intention(
                                 &intention,
@@ -732,6 +735,7 @@ async fn run_agent_step(
                                 crate::esaa::orchestrator::ApprovalContext {
                                     channel: approval_channel.as_deref(),
                                     timeout: approval_timeout,
+                                    force_human,
                                 },
                             )
                             .await;
@@ -863,6 +867,9 @@ async fn run_tool_step(
         (payload.to_string(), false)
     } else {
         let intention = tool_catalog.intention(tool_name, &args_json);
+        let force_human = tool_catalog
+            .requires_approval(tool_name)
+            .then(|| format!("tool '{tool_name}' is marked requires_approval: true"));
         let verdict = orchestrator
             .process_intention(
                 &intention,
@@ -871,6 +878,7 @@ async fn run_tool_step(
                 ApprovalContext {
                     channel: approval_channel.as_deref(),
                     timeout: approval_timeout,
+                    force_human,
                 },
             )
             .await;

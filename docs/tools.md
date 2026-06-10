@@ -56,7 +56,7 @@ implementation:
 
 Runs through the persistent shell session pool (same pool as the builtin `execute_shell_command`). Subject to the project's `policy:` allow/deny.
 
-**Default `requires_approval: true`** — shell tools are gated by default (ADR-0014 §4). Override with `requires_approval: false` for genuinely read-only commands.
+**Gating:** an unmarked shell tool goes through the `policy:` shell gate — allowlisted commands run, everything else asks a human (ADR-0014 §4). Set `requires_approval: true` **explicitly** to ask a human on *every* call, even when the command is allowlisted (this is what a sensitive tool like the scaffold's `broadcast` does).
 
 ## Python {#python}
 
@@ -162,7 +162,7 @@ Set `requires_approval: true` on a tool (declarative, MCP, or via `@tool(require
 
 - **Tool name collisions are a startup error.** Pick globally unique names.
 - **`${args.X}` is call-time, `${env.X}` is parse-time.** Mixing them up means stale or empty values.
-- **Shell tools default to `requires_approval: true`** — explicit `requires_approval: false` is required for read-only utilities you want to run without prompting.
+- **Explicit `requires_approval: true` always prompts; the shell default defers to `policy:`.** To run a read-only shell utility without prompting, allowlist its command in `policy.allow` and don't mark the tool. Explicit `requires_approval: false` does *not* bypass the policy gate — non-allowlisted commands still ask.
 - **Python tools won't load from a `cargo run` build of the CLI** — the pyo3 extension only links inside a Python runtime. Use the pip-installed `zymi`.
 - **MCP tool names are flat under the `mcp__<server>__` prefix.** No nested namespaces.
 
