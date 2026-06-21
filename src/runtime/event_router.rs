@@ -216,4 +216,10 @@ async fn publish_completion(
     if let Err(e) = bus.publish(event).await {
         log::error!("failed to publish PipelineCompleted: {e}");
     }
+    // ADR-0030: flush the WAL so a separate `zymi events` process tailing this
+    // long-lived `zymi serve` sees the completion without waiting for an
+    // auto-checkpoint. Best-effort.
+    if let Err(e) = bus.store().checkpoint().await {
+        log::warn!("post-run WAL checkpoint failed: {e}");
+    }
 }

@@ -480,6 +480,14 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
             },
         )
         .await;
+
+        // ADR-0030: flush the WAL so a separate `zymi events` process sees the
+        // run's terminal events immediately. `publish` above already awaited
+        // the append, so the completion is durably committed before we
+        // checkpoint. Best-effort — a failed checkpoint must not fail the run.
+        if let Err(e) = rt.store().checkpoint().await {
+            log::warn!("post-run WAL checkpoint failed: {e}");
+        }
     }
 
     // Close the persistent shell session for this stream (ADR-0015 §3).

@@ -2,7 +2,7 @@
 
 Date: 2026-05-15
 
-Status: Draft — observation only, fix deferred until more bugs land in this area.
+Status: Resolved 2026-06-21 — writer-side `wal_checkpoint(PASSIVE)` on terminal events. See "Resolution" below.
 
 ## Context
 
@@ -40,3 +40,25 @@ When a fix is warranted, the cheapest first move is to checkpoint on `PipelineCo
 - 0.6.9 ships with the bug; not blocking the unveil polish (no ADR-0030-versioned release).
 - If the bug recurs and we go with the writer-side checkpoint, expect a small per-pipeline cost — `wal_checkpoint(PASSIVE)` is non-blocking and runs against the writer's own connection, so it shouldn't show up under load. Worth measuring on a `zymi serve` host before merging.
 - This ADR will get a Status update or a successor when a fix lands.
+
+## Resolution (2026-06-21)
+
+The deferral was lifted ahead of outreach: the audit trail is the headline of
+the pitch, so a curious adopter running `zymi run` then `zymi events` and not
+seeing `pipeline_completed` is a first-contact credibility hit, not a parked
+edge case. We took the cheapest fix named above — the writer-side checkpoint —
+without waiting for a second host repro.
+
+- `EventStore::checkpoint()` added to the trait with a no-op default body, so
+  Postgres (no WAL) is untouched. `SqliteEventStore::checkpoint()` runs
+  `PRAGMA wal_checkpoint(PASSIVE)` on the writer's own connection.
+- Called once per run after the terminal `PipelineCompleted` is published —
+  in `handlers/run_pipeline.rs` (local CLI / resume) and in
+  `runtime/event_router.rs::publish_completion` (`zymi serve`). `bus.publish`
+  awaits the append, so the completion is durably committed before checkpoint.
+- Best-effort: a failed checkpoint logs a warning and never fails the run.
+- PASSIVE never blocks on readers and touches only the writer's connection, so
+  the per-run cost is negligible; no separate load measurement was needed.
+- Covered by `checkpoint_makes_tail_visible_to_separate_connection` (writes via
+  one store, reads the tail incl. `PipelineCompleted` via a fresh connection on
+  the same file) and `checkpoint_is_idempotent_on_empty_store`.

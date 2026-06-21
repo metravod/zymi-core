@@ -429,6 +429,21 @@ impl EventStore for SqliteEventStore {
         .await
         .map_err(|e| EventStoreError::Connection(e.to_string()))?
     }
+
+    async fn checkpoint(&self) -> Result<(), EventStoreError> {
+        // ADR-0030: move committed WAL frames into the main db file so a
+        // separate reader process sees the run's terminal events without
+        // waiting for an auto-checkpoint. PASSIVE never blocks on readers and
+        // runs against the writer's own connection, so it is cheap per run.
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")
+                .map_err(|e| EventStoreError::Connection(e.to_string()))
+        })
+        .await
+        .map_err(|e| EventStoreError::Connection(e.to_string()))?
+    }
 }
 
 #[cfg(test)]
@@ -447,6 +462,51 @@ mod tests {
 
     fn make_event(stream: &str, kind: EventKind) -> Event {
         Event::new(stream.into(), kind, "test".into())
+    }
+
+    // ADR-0030: after the writer checkpoints, a *separate* reader connection
+    // against the same file must see the run's terminal event. This mirrors a
+    // fresh `zymi events` process reading a db just written by `zymi run`.
+    #[tokio::test]
+    async fn checkpoint_makes_tail_visible_to_separate_connection() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("events.db");
+
+        let writer = SqliteEventStore::new(&db_path).unwrap();
+        let mut started = make_event(
+            "run-1",
+            EventKind::AgentProcessingStarted {
+                conversation_id: "run-1".into(),
+            },
+        );
+        let mut completed = make_event(
+            "run-1",
+            EventKind::PipelineCompleted {
+                pipeline: "main".into(),
+                success: true,
+                final_output: Some("done".into()),
+                error: None,
+            },
+        );
+        writer.append(&mut started).await.unwrap();
+        writer.append(&mut completed).await.unwrap();
+        writer.checkpoint().await.unwrap();
+
+        // Fresh connection — the reader process in the bug report.
+        let reader = SqliteEventStore::new(&db_path).unwrap();
+        let events = reader.read_stream("run-1", 0).await.unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events.last().unwrap().kind,
+            EventKind::PipelineCompleted { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn checkpoint_is_idempotent_on_empty_store() {
+        let (_dir, store) = setup().await;
+        store.checkpoint().await.unwrap();
+        store.checkpoint().await.unwrap();
     }
 
     #[tokio::test]

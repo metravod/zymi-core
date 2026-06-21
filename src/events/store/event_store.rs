@@ -78,4 +78,14 @@ pub trait EventStore: Send + Sync {
         inbound_tag: &str,
         completion_tag: &str,
     ) -> Result<Vec<Event>, EventStoreError>;
+
+    /// Flush durably-committed events so a *separate* reader process (e.g. a
+    /// fresh `zymi events` invocation) sees them. On SQLite in WAL mode the
+    /// tail of a run could otherwise stay in the `-wal` file, invisible to a
+    /// reader that opened its own connection, until an auto-checkpoint fired
+    /// (ADR-0030). The writer calls this once a run reaches a terminal event.
+    /// No-op for backends without a write-ahead log (e.g. Postgres).
+    async fn checkpoint(&self) -> Result<(), EventStoreError> {
+        Ok(())
+    }
 }
