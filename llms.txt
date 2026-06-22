@@ -1,11 +1,11 @@
 # zymi-core
 
-> Auditable MCP backend for agents: `zymi mcp serve` exposes declarative YAML pipelines as MCP tools with event-sourced audit trail, deterministic replay, interactive human approval gates (MCP elicitation), and self-introspection tools (`zymi.runs.*`). Also a standalone YAML-first agent engine with pluggable connectors. Distributed as `pip install zymi-core` (Python) and as a Rust crate.
+> Auditable MCP backend for agents: `zymi mcp serve` exposes declarative YAML pipelines as MCP tools with event-sourced audit trail, deterministic replay, interactive human approval gates (MCP elicitation), and self-introspection tools (`zymi.runs.*`). Also a standalone YAML-first agent engine with pluggable connectors. Installed as a global CLI with `uv tool install zymi-core` (or `pip install zymi-core` to embed the Python API in a venv); also a Rust crate.
 
 ## Quick start
 
 - [README](README.md): pitch, 60-second start, feature tour
-- [Getting started](docs/getting-started.md): pip install → `zymi init` → first run, end-to-end
+- [Getting started](docs/getting-started.md): `uv tool install` → `zymi init` → `zymi fetch` → first run, end-to-end
 
 ## Reference
 

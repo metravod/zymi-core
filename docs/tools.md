@@ -97,7 +97,7 @@ The decorator is a marker — it sets attributes on the function and returns it 
 - Files in `tools/*.py` are scanned alphabetically at startup.
 - One broken file logs a warning and is skipped — it does NOT take down the rest.
 - Name collisions with declarative / MCP / builtin tools are a hard error.
-- Python tools require pip-installed zymi (`pip install zymi-core`) — the cargo CLI binary doesn't bundle the Python runtime.
+- Python tools require the PyPI wheel — installed via `uv tool install zymi-core` (or `pip install zymi-core`), both of which bundle the Python runtime. A `zymi` built from the cargo crate does not.
 
 **Don't `print()`.** Return a string from the function. Print goes to stderr and is not captured.
 

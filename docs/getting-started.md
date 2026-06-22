@@ -4,15 +4,19 @@ Build your first zymi project in five minutes: install, scaffold, run.
 
 ## Overview
 
-zymi-core is shipped as a single Python package with an embedded Rust runtime. You install it with `pip`, scaffold a project with `zymi init`, point it at an LLM provider, and run a pipeline.
+zymi-core is shipped as a single Python package with an embedded Rust runtime. You install the `zymi` CLI globally, scaffold a project with `zymi init`, build the project's venv with `zymi fetch`, point it at an LLM provider, and run a pipeline.
 
 ## Install
 
+Install the CLI globally with [uv](https://docs.astral.sh/uv/) — this is the recommended path ([ADR-0032](../adr/0032-install-ux-fetch.md)):
+
 ```bash
-pip install zymi-core
+uv tool install zymi-core
 ```
 
-This installs the `zymi` CLI on your `$PATH` plus the `zymi` Python module (used by `tools/*.py` files and embedding zymi in your own Python code).
+This puts the `zymi` CLI on your `$PATH` in its own isolated environment, so it doesn't collide with any project's dependencies. Don't have `uv`? `curl -LsSf https://astral.sh/uv/install.sh | sh` (macOS/Linux) or `irm https://astral.sh/uv/install.ps1 | iex` (Windows).
+
+> **Embedding zymi in your own Python?** Use `uv add zymi-core` (or `pip install zymi-core`) *inside that project's venv* instead — the same wheel exposes the `zymi` Python module (`Runtime`, `@tool`, …). See [python-api.md](python-api.md). For running pipelines from the CLI, prefer the global `uv tool install` above.
 
 Verify the install:
 
@@ -56,6 +60,16 @@ OPENAI_API_KEY=sk-...
 
 Supported providers (out of the box): `openai` and any OpenAI-compatible endpoint (Anthropic via proxy, OpenRouter, local Ollama, …) by setting `base_url:` alongside `provider: openai`.
 
+## Build the project venv
+
+`zymi init` writes a `pyproject.toml` alongside your project. Build its venv once with `zymi fetch` (a thin wrapper over `uv sync`); pipeline-run commands transparently re-exec inside `./.venv` ([ADR-0032](../adr/0032-install-ux-fetch.md)):
+
+```bash
+zymi fetch
+```
+
+Re-run it whenever you add a Python `@tool` that imports a third-party library (append the dep to `pyproject.toml` first).
+
 ## Run a pipeline
 
 For the minimal scaffold:
@@ -64,7 +78,7 @@ For the minimal scaffold:
 zymi run main -i task="Summarize the latest research on quantum error correction"
 ```
 
-For the telegram scaffold, follow the printed checklist (BotFather token, `.env` setup, `zymi serve chat`, ngrok for the approval callback). The full Telegram setup is in [docs/connectors.md#http-poll](connectors.md#http-poll) and [docs/approvals.md](approvals.md).
+For the telegram scaffold, follow the printed checklist (BotFather token, `.env` setup, then `zymi serve chat`). No public URL or ngrok needed — the Telegram scaffold uses the `http_poll` connector (long-polls `getUpdates`) and the `telegram` approval channel (DMs admins inline ✅/❌ buttons), so nothing has to be reachable from the internet. Full Telegram setup is in [docs/connectors.md#http-poll](connectors.md#http-poll) and [docs/approvals.md](approvals.md).
 
 ## Inspect what happened
 
