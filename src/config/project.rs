@@ -465,12 +465,11 @@ pub fn load_project(path: &Path) -> Result<ProjectConfig, ConfigError> {
         source: e,
     })?;
 
-    // First pass: resolve ${env.*} only (variables map not yet available).
-    let env_vars = HashMap::new();
-    let resolved = template::resolve_templates(&raw, &env_vars, path)
-        // If there are unresolved plain vars, that's expected — they'll be in the variables map.
-        // So we fall back to the raw string for non-env vars.
-        .unwrap_or_else(|_| raw.clone());
+    // First pass: resolve ${env.*} only (variables map not yet available);
+    // plain ${var} / ${project.*} are left for later passes. A missing env
+    // var is a hard error — falling back to the raw string would leak
+    // literal `${env.X}` values (e.g. api_key) downstream as a cryptic 401.
+    let resolved = template::resolve_env_templates(&raw, path)?;
 
     let config: ProjectConfig =
         serde_yml::from_str(&resolved).map_err(|e| parse_error(path, &resolved, e))?;
@@ -588,6 +587,36 @@ services:
         let config = load_project(&path).unwrap();
         assert_eq!(config.llm.unwrap().api_key.as_deref(), Some("sk-test"));
         unsafe { std::env::remove_var("ZYMI_TEST_KEY") };
+    }
+
+    #[test]
+    fn missing_env_var_is_hard_error_not_raw_fallback() {
+        // Regression for issue #9: an unset ${env.*} anywhere in the file
+        // used to revert the WHOLE config to raw YAML, sending the literal
+        // string `${env.KEY}` to the LLM provider as an api_key (401).
+        unsafe { std::env::set_var("ZYMI_TEST_KEY_9", "sk-valid") };
+        let dir = TempDir::new().unwrap();
+        let yaml = "name: test\n\
+            llm:\n  provider: openai\n  model: gpt-4o\n  api_key: ${env.ZYMI_TEST_KEY_9}\n\
+            connectors:\n  - type: http_poll\n    url: \"https://api.telegram.org/bot${env.ZYMI_TEST_UNSET_9}/getUpdates\"\n";
+        let path = write_file(&dir, "project.yml", yaml);
+        let err = load_project(&path).unwrap_err();
+        unsafe { std::env::remove_var("ZYMI_TEST_KEY_9") };
+        assert!(matches!(
+            err,
+            ConfigError::UnresolvedVariable { ref var, .. } if var == "env.ZYMI_TEST_UNSET_9"
+        ));
+    }
+
+    #[test]
+    fn plain_vars_survive_env_pass_untouched() {
+        // Plain ${var} belongs to the second pass (project `variables` map);
+        // its presence must not trip the env-only first pass.
+        let dir = TempDir::new().unwrap();
+        let yaml = "name: test\nvariables:\n  model: gpt-4o\nllm:\n  provider: openai\n  model: ${model}\n";
+        let path = write_file(&dir, "project.yml", yaml);
+        let config = load_project(&path).unwrap();
+        assert_eq!(config.llm.unwrap().model, "${model}");
     }
 
     #[test]

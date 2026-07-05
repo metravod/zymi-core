@@ -68,6 +68,48 @@ pub fn resolve_templates(
     Ok(result)
 }
 
+/// Resolve only `${env.*}` placeholders in a raw YAML string.
+///
+/// First pass over `project.yml`, which runs before the project's own
+/// `variables` map exists: every other namespace (`${var}`, `${project.*}`,
+/// `${inputs.*}`, …) is left untouched for later passes. A referenced but
+/// unset environment variable is a hard error — substituting nothing here
+/// would send literal `${env.X}` strings (e.g. an `api_key`) downstream.
+pub fn resolve_env_templates(raw: &str, path: &Path) -> Result<String, ConfigError> {
+    let re = Regex::new(r"\$\{([^}]+)\}").expect("valid regex");
+    let mut result = raw.to_owned();
+    let mut unresolved: Option<String> = None;
+
+    // Iterate in reverse so replacements don't shift offsets.
+    let captures: Vec<_> = re.captures_iter(raw).collect();
+    for cap in captures.iter().rev() {
+        let full_match = cap.get(0).unwrap();
+
+        if is_in_yaml_comment(raw, full_match.start()) {
+            continue;
+        }
+
+        let key = cap.get(1).unwrap().as_str().trim();
+        let Some(env_name) = key.strip_prefix("env.") else {
+            continue;
+        };
+
+        match std::env::var(env_name) {
+            Ok(val) => result.replace_range(full_match.range(), &val),
+            Err(_) => unresolved = Some(key.to_owned()),
+        }
+    }
+
+    if let Some(var) = unresolved {
+        return Err(ConfigError::UnresolvedVariable {
+            var,
+            path: path.to_path_buf(),
+        });
+    }
+
+    Ok(result)
+}
+
 /// Check whether the byte offset falls on a YAML comment line.
 ///
 /// Walks backward to the start of the line and checks if the non-whitespace
@@ -206,6 +248,49 @@ mod tests {
         let input = "# backup: ${env.NOT_SET}\nmodel: ${model}";
         let result = resolve_templates(input, &vars, Path::new("test.yml")).unwrap();
         assert_eq!(result, "# backup: ${env.NOT_SET}\nmodel: gpt-4o");
+    }
+
+    #[test]
+    fn env_pass_resolves_env_and_leaves_plain_vars() {
+        unsafe { std::env::set_var("ZYMI_TEST_ENV_PASS", "sk-live") };
+        let input = "api_key: ${env.ZYMI_TEST_ENV_PASS}\nmodel: ${model}\ntask: ${inputs.query}";
+        let result = resolve_env_templates(input, Path::new("test.yml")).unwrap();
+        assert_eq!(
+            result,
+            "api_key: sk-live\nmodel: ${model}\ntask: ${inputs.query}"
+        );
+        unsafe { std::env::remove_var("ZYMI_TEST_ENV_PASS") };
+    }
+
+    #[test]
+    fn env_pass_errors_on_missing_env_var_with_name() {
+        let input = "url: \"https://api.telegram.org/bot${env.ZYMI_TEST_ENV_GONE}/getUpdates\"";
+        let err = resolve_env_templates(input, Path::new("test.yml")).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::UnresolvedVariable { var, .. } if var == "env.ZYMI_TEST_ENV_GONE"
+        ));
+    }
+
+    #[test]
+    fn env_pass_missing_var_does_not_discard_other_substitutions_error() {
+        // Regression for issue #9: one missing env var must surface as an
+        // error, not silently revert the whole document to raw text.
+        unsafe { std::env::set_var("ZYMI_TEST_ENV_OK", "sk-live") };
+        let input = "api_key: ${env.ZYMI_TEST_ENV_OK}\ntoken: ${env.ZYMI_TEST_ENV_GONE2}";
+        let err = resolve_env_templates(input, Path::new("test.yml")).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::UnresolvedVariable { var, .. } if var == "env.ZYMI_TEST_ENV_GONE2"
+        ));
+        unsafe { std::env::remove_var("ZYMI_TEST_ENV_OK") };
+    }
+
+    #[test]
+    fn env_pass_skips_placeholders_in_yaml_comments() {
+        let input = "# token: ${env.ZYMI_TEST_ENV_COMMENTED}\nname: test";
+        let result = resolve_env_templates(input, Path::new("test.yml")).unwrap();
+        assert_eq!(result, input);
     }
 
     #[test]
