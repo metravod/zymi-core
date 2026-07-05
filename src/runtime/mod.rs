@@ -771,7 +771,7 @@ async fn spawn_mcp_servers(
     > = HashMap::new();
     let mut failures: Vec<FailedServer> = Vec::new();
 
-    for cfg in specs {
+    'servers: for cfg in specs {
         let cwd = match cfg.cwd.as_ref() {
             Some(p) if p.is_absolute() => p.clone(),
             Some(p) => project_root.join(p),
@@ -786,30 +786,41 @@ async fn spawn_mcp_servers(
         let init_timeout = Duration::from_secs(cfg.effective_init_timeout_secs());
         let call_timeout = Duration::from_secs(cfg.effective_call_timeout_secs());
 
-        let conn = match McpServerConnection::connect(spec.clone(), init_timeout, call_timeout)
-            .await
-        {
-            Ok(c) => c,
-            Err(err) => {
-                failures.push(FailedServer {
-                    name: cfg.name.clone(),
-                    reason: classify_startup_error(&err),
-                });
-                continue;
-            }
+        // Startup retry: `npx`-style launchers routinely miss the init
+        // timeout on a cold package cache, and a server that failed its
+        // initial handshake used to stay out of the catalog until the whole
+        // process restarted (seen on 0.6.9). A configured `restart:` budget
+        // covers the initial spawn too; servers without one get a single
+        // retry. An explicit `max_restarts: 0` disables startup retry as
+        // well — the user asked for exactly one attempt.
+        let max_attempts = match cfg.restart.as_ref() {
+            Some(r) => 1 + r.effective_max_restarts(),
+            None => 2,
         };
-
-        let advertised = match conn.list_tools().await {
-            Ok(t) => t,
-            Err(err) => {
-                // The subprocess is alive but not usable; tear it down before
-                // moving on so we don't leak a zombie.
-                conn.shutdown(MCP_SHUTDOWN_GRACE).await;
-                failures.push(FailedServer {
-                    name: cfg.name.clone(),
-                    reason: format!("tools_list_failed: {err}"),
-                });
-                continue;
+        let mut attempt = 0u32;
+        let (conn, advertised) = loop {
+            attempt += 1;
+            match connect_and_list(&spec, init_timeout, call_timeout).await {
+                Ok(pair) => break pair,
+                Err(reason) => {
+                    if attempt >= max_attempts {
+                        failures.push(FailedServer {
+                            name: cfg.name.clone(),
+                            reason,
+                        });
+                        continue 'servers;
+                    }
+                    let backoff_secs = cfg
+                        .restart
+                        .as_ref()
+                        .map_or(1, |r| r.backoff_for_attempt(attempt));
+                    log::warn!(
+                        "mcp server '{}' startup attempt {attempt}/{max_attempts} failed \
+                         ({reason}); retrying in {backoff_secs}s",
+                        cfg.name
+                    );
+                    tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                }
             }
         };
 
@@ -851,6 +862,26 @@ async fn spawn_mcp_servers(
         tools_by_server,
     };
     Ok(SpawnOutcome { state, failures })
+}
+
+/// Spawn + handshake + `tools/list` as one retryable unit. On a listing
+/// failure the subprocess is torn down before returning so a retry starts
+/// from a clean slate instead of leaking a zombie.
+async fn connect_and_list(
+    spec: &McpServerSpec,
+    init_timeout: Duration,
+    call_timeout: Duration,
+) -> Result<(McpServerConnection, Vec<McpTool>), String> {
+    let conn = McpServerConnection::connect(spec.clone(), init_timeout, call_timeout)
+        .await
+        .map_err(|e| classify_startup_error(&e))?;
+    match conn.list_tools().await {
+        Ok(tools) => Ok((conn, tools)),
+        Err(err) => {
+            conn.shutdown(MCP_SHUTDOWN_GRACE).await;
+            Err(format!("tools_list_failed: {err}"))
+        }
+    }
 }
 
 fn classify_startup_error(err: &crate::mcp::McpError) -> String {
@@ -1079,6 +1110,113 @@ mod mcp_tests {
         let outcome = spawn_mcp_servers(&[cfg], Path::new("."), test_bus()).await.unwrap();
         assert_eq!(outcome.failures.len(), 1);
         assert_eq!(outcome.failures[0].reason, "init_timeout");
+    }
+
+    #[tokio::test]
+    async fn spawn_startup_retry_consumes_restart_budget() {
+        // The crashing server is attempted 1 + max_restarts times before
+        // being recorded as a startup failure.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("attempts");
+        let script = format!("echo x >> {}; exit 1", marker.display());
+        let mut cfg = make_cfg("flaky", vec!["sh".into(), "-c".into(), script]);
+        cfg.restart = Some(crate::config::McpRestartConfig {
+            max_restarts: Some(2),
+            backoff_secs: Some(vec![0]),
+        });
+        let outcome = spawn_mcp_servers(&[cfg], Path::new("."), test_bus())
+            .await
+            .unwrap();
+        assert_eq!(outcome.failures.len(), 1);
+        let attempts = std::fs::read_to_string(&marker).unwrap().lines().count();
+        assert_eq!(attempts, 3);
+    }
+
+    #[tokio::test]
+    async fn spawn_startup_retries_once_without_restart_policy() {
+        // No `restart:` block still gets a single retry — the npx-cold-cache
+        // case shouldn't require explicit config to survive.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("attempts");
+        let script = format!("echo x >> {}; exit 1", marker.display());
+        let cfg = make_cfg("flaky", vec!["sh".into(), "-c".into(), script]);
+        let outcome = spawn_mcp_servers(&[cfg], Path::new("."), test_bus())
+            .await
+            .unwrap();
+        assert_eq!(outcome.failures.len(), 1);
+        let attempts = std::fs::read_to_string(&marker).unwrap().lines().count();
+        assert_eq!(attempts, 2);
+    }
+
+    #[tokio::test]
+    async fn spawn_recovers_on_second_attempt_and_registers_tools() {
+        // First invocation exits 1 (cold start); the retry runs a minimal
+        // line-delimited MCP responder, and its tools land in the catalog.
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return; // skip on platforms without python3
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("first-run");
+        let script_path = dir.path().join("flaky_mcp.py");
+        std::fs::write(
+            &script_path,
+            r#"
+import sys, os, json
+marker = sys.argv[1]
+if not os.path.exists(marker):
+    open(marker, "w").close()
+    sys.exit(1)
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    req = json.loads(line)
+    rid = req.get("id")
+    if rid is None:
+        continue
+    m = req.get("method")
+    if m == "initialize":
+        res = {"protocolVersion": "2024-11-05", "capabilities": {},
+               "serverInfo": {"name": "flaky", "version": "0"}}
+    elif m == "tools/list":
+        res = {"tools": [{"name": "ping", "description": "d",
+                          "inputSchema": {"type": "object"}}]}
+    else:
+        res = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": rid, "result": res}), flush=True)
+"#,
+        )
+        .unwrap();
+        let mut cfg = make_cfg(
+            "flaky",
+            vec![
+                "python3".into(),
+                script_path.display().to_string(),
+                marker.display().to_string(),
+            ],
+        );
+        cfg.allow = Some(vec!["ping".into()]);
+        cfg.restart = Some(crate::config::McpRestartConfig {
+            max_restarts: Some(1),
+            backoff_secs: Some(vec![0]),
+        });
+        let outcome = spawn_mcp_servers(&[cfg], Path::new("."), test_bus())
+            .await
+            .unwrap();
+        assert!(
+            outcome.failures.is_empty(),
+            "expected recovery, got failures: {:?}",
+            outcome.failures
+        );
+        let registry = outcome.state.registry.expect("registry populated");
+        assert_eq!(registry.server_names().collect::<Vec<_>>(), vec!["flaky"]);
+        let (tools, _, _) = &outcome.state.tools_by_server["flaky"];
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "ping");
     }
 
     #[test]
