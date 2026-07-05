@@ -522,3 +522,42 @@ This slice introduces `forget_after_turns: Option<usize>` to `ContextConfig` / `
 ### Tests
 
 `context_window.rs` gains 5 unit tests (`forget_after_turns_keeps_recent_drops_older`, `_preserves_pair_invariant`, `_drops_orphan_user_messages`, `_noop_when_below_threshold`, `_zero_drops_everything`). `context_builder.rs` gains 2 integration tests (`build_with_forget_after_turns_drops_ancient_turns`, `build_forget_runs_before_soft_cap` — the latter asserts that a properly-sized `forget_after_turns` keeps the soft cap from firing). All existing tests continue to pass with the new field defaulted to `None`.
+
+## Addendum (2026-07-05) — stable-prefix ordering invariant
+
+Documents an invariant `ContextBuilder::build()` has enforced since Slice 3
+but that was never stated as a contract. No code change; verified against
+`src/runtime/context_builder.rs` (Layer A at the top of `build()`) and
+`src/handlers/run_pipeline.rs` (`system_prompt` / `user_msg` construction).
+
+**Invariant: volatile content never appears at or before Layer A.** For a
+given agent step, Layer A is byte-stable across every `build()` call:
+
+- `system_prompt` comes verbatim from agent YAML (or the deterministic
+  fallback `"You are the '<name>' agent."`). Nothing is interpolated into it
+  at build time — no timestamps, no run ids, no memory.
+- The task message (`user_msg`) is fixed when the step starts: task text plus
+  `${steps.*}` context from previous steps. Within-step ReAct iterations
+  never rewrite it.
+
+Everything that changes between iterations enters strictly *after* Layer A:
+the memory snapshot (Layer B, rebuilt from the projection on every call) and
+the observation tail (Layer C, append + masking).
+
+**Why it matters:** provider prompt caches key on the longest byte-identical
+message prefix. Volatile data injected into or before the system prompt would
+invalidate the cache on every call and silently multiply input-token cost.
+The invariant guarantees the cacheable prefix is at least all of Layer A.
+
+**Known bounds, accepted:**
+
+- Layer B sits between A and C, so a memory write invalidates the cached
+  prefix from B onward. Deliberate: the projection must be visible and it
+  changes far less often than the tail grows.
+- Masking mutates older Layer-C messages as the observation window slides,
+  which bounds cache reuse inside the tail. The guarantee is about A, not C.
+
+**Discipline for future changes:** anything tempted to enrich the system
+prompt dynamically (current date, run metadata, connector state) must land in
+Layer B or C instead. Cache-hit telemetry (`cached_input` in `TokenUsage`)
+is the observable check that the invariant holds in practice.
