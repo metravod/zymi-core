@@ -447,6 +447,8 @@ retry:
         use std::sync::Arc as SArc;
         use std::sync::Mutex as SMutex;
 
+        type TestState = (SArc<SMutex<Vec<(String, String)>>>, SArc<AtomicUsize>);
+
         let received: SArc<SMutex<Vec<(String, String)>>> = SArc::new(SMutex::new(Vec::new()));
         let hits = SArc::new(AtomicUsize::new(0));
         let state = (SArc::clone(&received), SArc::clone(&hits));
@@ -454,10 +456,7 @@ retry:
             .route(
                 "/send",
                 post(
-                    |State(st): State<(
-                        SArc<SMutex<Vec<(String, String)>>>,
-                        SArc<AtomicUsize>,
-                    )>,
+                    |State(st): State<TestState>,
                      headers: axum::http::HeaderMap,
                      body: String| async move {
                         st.1.fetch_add(1, Ordering::SeqCst);

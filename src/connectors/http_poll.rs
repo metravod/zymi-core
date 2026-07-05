@@ -641,16 +641,19 @@ pipeline_input: message
         let mut saw_pipeline_req = false;
         let mut saw_mallory = false;
         while tokio::time::Instant::now() < deadline {
-            match tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await {
-                Ok(Some(ev)) => match &ev.kind {
-                    EventKind::UserMessageReceived { content, .. } => {
-                        if let Message::User(t) = content {
-                            if t == "hello bot" {
-                                saw_user_msg = true;
-                            }
-                            if t == "not allowed" {
-                                saw_mallory = true;
-                            }
+            if let Ok(Some(ev)) =
+                tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await
+            {
+                match &ev.kind {
+                    EventKind::UserMessageReceived {
+                        content: Message::User(t),
+                        ..
+                    } => {
+                        if t == "hello bot" {
+                            saw_user_msg = true;
+                        }
+                        if t == "not allowed" {
+                            saw_mallory = true;
                         }
                     }
                     EventKind::PipelineRequested {
@@ -663,8 +666,7 @@ pipeline_input: message
                         }
                     }
                     _ => {}
-                },
-                _ => {}
+                }
             }
             if saw_user_msg && saw_pipeline_req {
                 break;
