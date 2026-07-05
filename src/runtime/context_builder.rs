@@ -688,7 +688,7 @@ mod tests {
             EventKind::LlmCallCompleted {
                 response_message: Some(assistant),
                 has_tool_calls: true,
-                usage: Some(TokenUsage { input_tokens: 100, output_tokens: 50 }),
+                usage: Some(TokenUsage { input_tokens: 100, output_tokens: 50, ..Default::default() }),
                 content_preview: Some("I'll read the file.".into()),
             },
         )
@@ -1373,6 +1373,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 100,
                     output_tokens: 20,
+                    ..Default::default()
                 },
                 model: "mock".into(),
             })

@@ -550,6 +550,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 1,
                     output_tokens: 1,
+                    ..Default::default()
                 },
                 model: "mock".into(),
             })

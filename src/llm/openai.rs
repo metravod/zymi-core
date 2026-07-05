@@ -130,6 +130,14 @@ struct OaiChoice {
 struct OaiUsage {
     prompt_tokens: u32,
     completion_tokens: u32,
+    #[serde(default)]
+    prompt_tokens_details: Option<OaiPromptTokensDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OaiPromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -140,10 +148,7 @@ struct OaiUsage {
 /// `max_completion_tokens`) and do not accept custom `temperature`.
 fn is_reasoning_model(model: &str) -> bool {
     let m = model.to_lowercase();
-    m.starts_with("o1")
-        || m.starts_with("o3")
-        || m.starts_with("gpt-5")
-        || m.starts_with("gpt-4.5")
+    m.starts_with("o1") || m.starts_with("o3") || m.starts_with("gpt-5") || m.starts_with("gpt-4.5")
 }
 
 fn build_request(model: &str, request: &ChatRequest) -> OaiRequest {
@@ -171,11 +176,7 @@ fn build_request(model: &str, request: &ChatRequest) -> OaiRequest {
     };
 
     // Reasoning models only accept the default temperature (1).
-    let temperature = if reasoning {
-        None
-    } else {
-        request.temperature
-    };
+    let temperature = if reasoning { None } else { request.temperature };
 
     OaiRequest {
         model: model.into(),
@@ -285,8 +286,14 @@ fn parse_response(resp: OaiResponse) -> Result<ChatResponse, LlmError> {
     let usage = resp
         .usage
         .map(|u| TokenUsage {
+            // OpenAI's `prompt_tokens` already includes cached tokens.
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
+            cached_input_tokens: u
+                .prompt_tokens_details
+                .as_ref()
+                .map_or(0, |d| d.cached_tokens),
+            cache_creation_tokens: 0,
         })
         .unwrap_or_default();
 
@@ -403,6 +410,28 @@ mod tests {
     }
 
     #[test]
+    fn parse_response_cache_telemetry() {
+        let json = serde_json::json!({
+            "model": "gpt-4o",
+            "choices": [{
+                "message": {"role": "assistant", "content": "Hi"}
+            }],
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 5,
+                "prompt_tokens_details": {"cached_tokens": 750}
+            }
+        });
+        let oai_resp: OaiResponse = serde_json::from_value(json).unwrap();
+        let resp = parse_response(oai_resp).unwrap();
+        // prompt_tokens already includes cached tokens — no normalisation.
+        assert_eq!(resp.usage.input_tokens, 1000);
+        assert_eq!(resp.usage.cached_input_tokens, 750);
+        assert_eq!(resp.usage.cache_creation_tokens, 0);
+        assert!((resp.usage.cache_hit_rate() - 0.75).abs() < 1e-9);
+    }
+
+    #[test]
     fn parse_response_with_tool_calls() {
         let json = serde_json::json!({
             "model": "gpt-4o",
@@ -456,10 +485,7 @@ mod tests {
     #[test]
     fn request_serialization_roundtrip() {
         let req = ChatRequest {
-            messages: vec![
-                Message::System("sys".into()),
-                Message::User("hi".into()),
-            ],
+            messages: vec![Message::System("sys".into()), Message::User("hi".into())],
             tools: vec![ToolDefinition {
                 name: "t".into(),
                 description: "d".into(),
@@ -489,7 +515,13 @@ mod tests {
 
     #[test]
     fn reasoning_model_uses_max_completion_tokens_and_drops_temperature() {
-        for model in ["gpt-5-mini", "gpt-5", "o1-preview", "o3-mini", "gpt-4.5-preview"] {
+        for model in [
+            "gpt-5-mini",
+            "gpt-5",
+            "o1-preview",
+            "o3-mini",
+            "gpt-4.5-preview",
+        ] {
             let req = ChatRequest {
                 messages: vec![Message::User("hi".into())],
                 tools: vec![],
@@ -498,7 +530,11 @@ mod tests {
             };
             let oai = build_request(model, &req);
             assert_eq!(oai.max_tokens, None, "{model}: should not send max_tokens");
-            assert_eq!(oai.max_completion_tokens, Some(2048), "{model}: should send max_completion_tokens");
+            assert_eq!(
+                oai.max_completion_tokens,
+                Some(2048),
+                "{model}: should send max_completion_tokens"
+            );
             assert_eq!(oai.temperature, None, "{model}: should drop temperature");
         }
     }

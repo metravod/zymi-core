@@ -617,6 +617,7 @@ mod tests {
                 usage: Some(TokenUsage {
                     input_tokens: 0,
                     output_tokens: 0,
+                    ..Default::default()
                 }),
                 content_preview: Some(content.into()),
             },
@@ -713,6 +714,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 5,
+                    ..Default::default()
                 },
                 model: "mock".into(),
             })

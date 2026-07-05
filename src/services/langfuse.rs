@@ -425,6 +425,7 @@ mod tests {
                 usage: Some(TokenUsage {
                     input_tokens: 100,
                     output_tokens: 50,
+                    ..Default::default()
                 }),
                 content_preview: Some("hello world".into()),
             },
@@ -591,6 +592,7 @@ mod tests {
                 usage: Some(TokenUsage {
                     input_tokens: 200,
                     output_tokens: 80,
+                    ..Default::default()
                 }),
                 content_preview: None,
             },
@@ -661,6 +663,7 @@ mod tests {
                 usage: Some(TokenUsage {
                     input_tokens: 300,
                     output_tokens: 150,
+                    ..Default::default()
                 }),
                 content_preview: Some("Final answer".into()),
             },

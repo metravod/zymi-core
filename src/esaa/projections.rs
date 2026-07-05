@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
-use crate::types::Message;
 use crate::events::{Event, EventKind};
+use crate::types::Message;
 
 /// A projection rebuilds state from an event stream.
 /// Projections are pure functions of the event history — calling apply()
@@ -56,6 +56,7 @@ pub struct MetricsProjection {
     pub tool_calls: u64,
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
+    pub total_cached_input_tokens: u64,
     pub errors: u64,
 }
 
@@ -66,7 +67,17 @@ impl MetricsProjection {
             tool_calls: 0,
             total_input_tokens: 0,
             total_output_tokens: 0,
+            total_cached_input_tokens: 0,
             errors: 0,
+        }
+    }
+
+    /// Aggregate cache hit rate across all LLM calls, in `0.0..=1.0`.
+    pub fn cache_hit_rate(&self) -> f64 {
+        if self.total_input_tokens == 0 {
+            0.0
+        } else {
+            self.total_cached_input_tokens as f64 / self.total_input_tokens as f64
         }
     }
 }
@@ -85,6 +96,7 @@ impl Projection for MetricsProjection {
                 if let Some(u) = usage {
                     self.total_input_tokens += u.input_tokens as u64;
                     self.total_output_tokens += u.output_tokens as u64;
+                    self.total_cached_input_tokens += u.cached_input_tokens as u64;
                 }
             }
             EventKind::ToolCallCompleted { is_error, .. } => {
@@ -248,6 +260,8 @@ mod tests {
                 usage: Some(TokenUsage {
                     input_tokens: 100,
                     output_tokens: 50,
+                    cached_input_tokens: 60,
+                    ..Default::default()
                 }),
                 content_preview: None,
             },
@@ -285,6 +299,8 @@ mod tests {
                 usage: Some(TokenUsage {
                     input_tokens: 200,
                     output_tokens: 100,
+                    cached_input_tokens: 90,
+                    ..Default::default()
                 }),
                 content_preview: Some("hello world".into()),
             },
@@ -294,6 +310,8 @@ mod tests {
         assert_eq!(proj.tool_calls, 2);
         assert_eq!(proj.total_input_tokens, 300);
         assert_eq!(proj.total_output_tokens, 150);
+        assert_eq!(proj.total_cached_input_tokens, 150);
+        assert!((proj.cache_hit_rate() - 0.5).abs() < 1e-9);
         assert_eq!(proj.errors, 1);
     }
 
@@ -441,6 +459,7 @@ mod tests {
                     usage: Some(TokenUsage {
                         input_tokens: 50,
                         output_tokens: 10,
+                        ..Default::default()
                     }),
                     content_preview: None,
                 },

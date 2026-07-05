@@ -128,6 +128,10 @@ struct AnthResponse {
 struct AnthUsage {
     input_tokens: u32,
     output_tokens: u32,
+    #[serde(default)]
+    cache_read_input_tokens: u32,
+    #[serde(default)]
+    cache_creation_input_tokens: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -172,10 +176,8 @@ fn build_request(model: &str, request: &ChatRequest) -> AnthRequest {
                     blocks.push(ContentBlock::Text { text: text.clone() });
                 }
                 for tc in tool_calls {
-                    let input: serde_json::Value =
-                        serde_json::from_str(&tc.arguments).unwrap_or(serde_json::Value::Object(
-                            serde_json::Map::new(),
-                        ));
+                    let input: serde_json::Value = serde_json::from_str(&tc.arguments)
+                        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
                     blocks.push(ContentBlock::ToolUse {
                         id: tc.id.clone(),
                         name: tc.name.clone(),
@@ -233,8 +235,7 @@ fn parse_response(resp: AnthResponse) -> Result<ChatResponse, LlmError> {
                 tool_calls.push(ToolCallInfo {
                     id,
                     name,
-                    arguments: serde_json::to_string(&input)
-                        .unwrap_or_else(|_| "{}".into()),
+                    arguments: serde_json::to_string(&input).unwrap_or_else(|_| "{}".into()),
                 });
             }
             ContentBlock::ToolResult { .. } => {}
@@ -252,9 +253,15 @@ fn parse_response(resp: AnthResponse) -> Result<ChatResponse, LlmError> {
         tool_calls,
     };
 
+    // Anthropic's `input_tokens` EXCLUDES cache reads/writes; normalise to
+    // "total input" so the field means the same thing across providers.
     let usage = TokenUsage {
-        input_tokens: resp.usage.input_tokens,
+        input_tokens: resp.usage.input_tokens
+            + resp.usage.cache_read_input_tokens
+            + resp.usage.cache_creation_input_tokens,
         output_tokens: resp.usage.output_tokens,
+        cached_input_tokens: resp.usage.cache_read_input_tokens,
+        cache_creation_tokens: resp.usage.cache_creation_input_tokens,
     };
 
     Ok(ChatResponse {
@@ -391,6 +398,43 @@ mod tests {
     }
 
     #[test]
+    fn parse_response_cache_telemetry() {
+        let json = serde_json::json!({
+            "model": "claude-sonnet-4-20250514",
+            "content": [
+                {"type": "text", "text": "Hi"}
+            ],
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "cache_read_input_tokens": 900,
+                "cache_creation_input_tokens": 90
+            }
+        });
+        let anth_resp: AnthResponse = serde_json::from_value(json).unwrap();
+        let resp = parse_response(anth_resp).unwrap();
+        // input_tokens is normalised to total input (fresh + read + creation).
+        assert_eq!(resp.usage.input_tokens, 1000);
+        assert_eq!(resp.usage.cached_input_tokens, 900);
+        assert_eq!(resp.usage.cache_creation_tokens, 90);
+        assert!((resp.usage.cache_hit_rate() - 0.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_response_without_cache_fields_defaults_zero() {
+        let json = serde_json::json!({
+            "model": "claude-sonnet-4-20250514",
+            "content": [{"type": "text", "text": "Hi"}],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+        let anth_resp: AnthResponse = serde_json::from_value(json).unwrap();
+        let resp = parse_response(anth_resp).unwrap();
+        assert_eq!(resp.usage.input_tokens, 10);
+        assert_eq!(resp.usage.cached_input_tokens, 0);
+        assert_eq!(resp.usage.cache_hit_rate(), 0.0);
+    }
+
+    #[test]
     fn parse_response_with_tool_use() {
         let json = serde_json::json!({
             "model": "claude-sonnet-4-20250514",
@@ -428,10 +472,7 @@ mod tests {
     #[test]
     fn request_serialization_roundtrip() {
         let req = ChatRequest {
-            messages: vec![
-                Message::System("sys".into()),
-                Message::User("hi".into()),
-            ],
+            messages: vec![Message::System("sys".into()), Message::User("hi".into())],
             tools: vec![ToolDefinition {
                 name: "t".into(),
                 description: "d".into(),
