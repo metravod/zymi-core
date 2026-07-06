@@ -9,6 +9,30 @@ use crate::types::{Message, TokenUsage, ToolDefinition};
 
 pub use error::LlmError;
 
+/// Overall request timeout for a single LLM HTTP call.
+///
+/// Generous on purpose: extended-thinking / large-output generations can run
+/// for minutes, and cutting those off is worse than the failure mode this
+/// guards against. The point is to bound a *stalled* connection (a provider
+/// that accepts the socket and never responds), which otherwise hangs a
+/// pipeline step forever with nothing past `LlmCallStarted` in the log.
+const LLM_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Time allowed to establish the TCP+TLS connection before giving up.
+const LLM_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Build the shared `reqwest` client for LLM providers with bounded timeouts.
+///
+/// Falls back to a default client if the builder somehow fails, so provider
+/// construction stays infallible.
+pub(crate) fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(LLM_REQUEST_TIMEOUT)
+        .connect_timeout(LLM_CONNECT_TIMEOUT)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 /// Request for an LLM chat completion.
 #[derive(Debug, Clone)]
 pub struct ChatRequest {

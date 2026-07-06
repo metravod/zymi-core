@@ -20,7 +20,7 @@ pub struct AnthropicProvider {
 impl AnthropicProvider {
     pub fn new(base_url: String, api_key: String, model: String) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: super::http_client(),
             base_url,
             api_key,
             model,

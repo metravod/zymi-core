@@ -19,7 +19,7 @@ pub struct OpenAiProvider {
 impl OpenAiProvider {
     pub fn new(base_url: String, api_key: Option<String>, model: String) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: super::http_client(),
             base_url,
             api_key,
             model,
