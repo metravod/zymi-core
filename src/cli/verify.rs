@@ -35,8 +35,14 @@ pub fn exec(stream: Option<&str>, root: impl AsRef<Path>) -> Result<(), String> 
             let mut all_ok = true;
             for (stream_id, event_count) in &streams {
                 match rt.block_on(store.verify_chain(stream_id)) {
-                    Ok(verified) => {
-                        println!("  {stream_id}: {verified}/{event_count} events OK");
+                    Ok(v) if v.legacy > 0 => {
+                        println!(
+                            "  {stream_id}: {}/{event_count} events OK ({} legacy, pre-hash — exempt)",
+                            v.verified, v.legacy
+                        );
+                    }
+                    Ok(v) => {
+                        println!("  {stream_id}: {}/{event_count} events OK", v.verified);
                     }
                     Err(e) => {
                         println!("  {stream_id}: FAILED — {e}");
@@ -63,11 +69,26 @@ fn verify_stream(
     stream_id: &str,
 ) -> Result<(), String> {
     match rt.block_on(store.verify_chain(stream_id)) {
-        Ok(count) => {
-            if count == 0 {
+        Ok(v) => {
+            if v.total() == 0 {
                 println!("Stream '{stream_id}': empty (nothing to verify).");
+            } else if v.verified == 0 {
+                println!(
+                    "Stream '{stream_id}': {} legacy event(s) predating the hash chain — \
+                     exempt, nothing to verify.",
+                    v.legacy
+                );
+            } else if v.legacy > 0 {
+                println!(
+                    "Stream '{stream_id}': {} event(s) verified, hash chain intact \
+                     ({} legacy event(s) exempt).",
+                    v.verified, v.legacy
+                );
             } else {
-                println!("Stream '{stream_id}': {count} event(s) verified, hash chain intact.");
+                println!(
+                    "Stream '{stream_id}': {} event(s) verified, hash chain intact.",
+                    v.verified
+                );
             }
             Ok(())
         }

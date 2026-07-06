@@ -21,7 +21,7 @@ use tokio_postgres::NoTls;
 
 use crate::events::{Event, EventStoreError};
 
-use super::event_store::{EventStore, TailedEvent};
+use super::event_store::{ChainVerification, EventStore, TailedEvent};
 
 const SCHEMA_SQL: &str = r#"
     CREATE TABLE IF NOT EXISTS events (
@@ -299,7 +299,7 @@ impl EventStore for PostgresEventStore {
         Ok(c as u64)
     }
 
-    async fn verify_chain(&self, stream_id: &str) -> Result<u64, EventStoreError> {
+    async fn verify_chain(&self, stream_id: &str) -> Result<ChainVerification, EventStoreError> {
         let client = self.pool.get().await.map_err(err_conn)?;
         let rows = client
             .query(
@@ -312,12 +312,19 @@ impl EventStore for PostgresEventStore {
             .map_err(err_conn)?;
 
         let mut expected_prev_hash = String::new();
-        let mut count: u64 = 0;
+        let mut result = ChainVerification::default();
         for row in rows {
             let event_id: String = row.get("event_id");
             let data: String = row.get("data");
             let prev_hash: String = row.get("prev_hash");
             let stored_hash: String = row.get("hash");
+
+            // Legacy rows predate the hash chain (migration DEFAULT ''):
+            // exempt them rather than fail the stream. See ADR-0035.
+            if stored_hash.is_empty() {
+                result.legacy += 1;
+                continue;
+            }
 
             if prev_hash != expected_prev_hash {
                 return Err(EventStoreError::Connection(format!(
@@ -333,9 +340,9 @@ impl EventStore for PostgresEventStore {
                 )));
             }
             expected_prev_hash = stored_hash;
-            count += 1;
+            result.verified += 1;
         }
-        Ok(count)
+        Ok(result)
     }
 
     async fn list_streams(&self) -> Result<Vec<(String, u64)>, EventStoreError> {
@@ -510,8 +517,8 @@ mod tests {
             );
             store.append(&mut e).await.unwrap();
         }
-        let count = store.verify_chain("chain").await.unwrap();
-        assert_eq!(count, 3);
+        let result = store.verify_chain("chain").await.unwrap();
+        assert_eq!(result.verified, 3);
     }
 
     #[tokio::test]

@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 
 use crate::events::{Event, EventStoreError};
 
-use super::event_store::{EventStore, TailedEvent};
+use super::event_store::{ChainVerification, EventStore, TailedEvent};
 
 /// SQLite-backed event store. Persists every event with a hash chain
 /// per stream and an autoincrement global cursor used by the watcher.
@@ -304,7 +304,7 @@ impl EventStore for SqliteEventStore {
         .map_err(|e| EventStoreError::Connection(e.to_string()))?
     }
 
-    async fn verify_chain(&self, stream_id: &str) -> Result<u64, EventStoreError> {
+    async fn verify_chain(&self, stream_id: &str) -> Result<ChainVerification, EventStoreError> {
         let conn = self.conn.clone();
         let stream_id = stream_id.to_owned();
 
@@ -329,11 +329,21 @@ impl EventStore for SqliteEventStore {
                 .map_err(|e| EventStoreError::Connection(e.to_string()))?;
 
             let mut expected_prev_hash = String::new();
-            let mut count: u64 = 0;
+            let mut result = ChainVerification::default();
 
             for row in rows {
                 let (event_id, data, prev_hash, stored_hash) =
                     row.map_err(|e| EventStoreError::Connection(e.to_string()))?;
+
+                // Legacy rows predate the hash chain: they carry the migration
+                // DEFAULT '' in `hash`. They can't be verified, so exempt them
+                // (ADR-0035) rather than reporting the whole stream as broken.
+                // Such a row also leaves the expectation unchanged (empty), so
+                // the first genuinely-hashed event chains from a clean root.
+                if stored_hash.is_empty() {
+                    result.legacy += 1;
+                    continue;
+                }
 
                 if prev_hash != expected_prev_hash {
                     return Err(EventStoreError::Connection(format!(
@@ -351,10 +361,10 @@ impl EventStore for SqliteEventStore {
                 }
 
                 expected_prev_hash = stored_hash;
-                count += 1;
+                result.verified += 1;
             }
 
-            Ok(count)
+            Ok(result)
         })
         .await
         .map_err(|e| EventStoreError::Connection(e.to_string()))?
@@ -818,15 +828,55 @@ mod tests {
         store.append(&mut e2).await.unwrap();
         store.append(&mut e3).await.unwrap();
 
-        let count = store.verify_chain("s1").await.unwrap();
-        assert_eq!(count, 3);
+        let result = store.verify_chain("s1").await.unwrap();
+        assert_eq!(result.verified, 3);
+        assert_eq!(result.legacy, 0);
     }
 
     #[tokio::test]
     async fn hash_chain_empty_stream_is_valid() {
         let (_dir, store) = setup().await;
-        let count = store.verify_chain("nonexistent").await.unwrap();
-        assert_eq!(count, 0);
+        let result = store.verify_chain("nonexistent").await.unwrap();
+        assert_eq!(result.total(), 0);
+    }
+
+    #[tokio::test]
+    async fn hash_chain_exempts_legacy_rows() {
+        // Rows written before the hash feature carry the migration DEFAULT ''
+        // in prev_hash/hash. verify_chain must exempt them, not fail the stream,
+        // and a genuinely-hashed event appended afterwards must still verify.
+        let (_dir, store) = setup().await;
+
+        // Simulate a legacy row by inserting one directly with empty hashes,
+        // bypassing append()'s hashing.
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "INSERT INTO events (event_id, stream_id, sequence, timestamp, kind_tag, data, source, prev_hash, hash)
+                 VALUES ('legacy-1', 'mixed', 1, '2020-01-01T00:00:00Z', 'ResponseReady', '{}', 'legacy', '', '')",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Fully-legacy stream: exempted, not broken.
+        let legacy_only = store.verify_chain("mixed").await.unwrap();
+        assert_eq!(legacy_only.legacy, 1);
+        assert_eq!(legacy_only.verified, 0);
+
+        // Append a real (hashed) event after the legacy prefix.
+        let mut e = make_event(
+            "mixed",
+            EventKind::ResponseReady {
+                conversation_id: "mixed".into(),
+                content: "post-upgrade".into(),
+            },
+        );
+        store.append(&mut e).await.unwrap();
+
+        let mixed = store.verify_chain("mixed").await.unwrap();
+        assert_eq!(mixed.legacy, 1);
+        assert_eq!(mixed.verified, 1);
     }
 
     #[tokio::test]
@@ -848,8 +898,8 @@ mod tests {
         store.append(&mut e1).await.unwrap();
         store.append(&mut e2).await.unwrap();
 
-        assert_eq!(store.verify_chain("s1").await.unwrap(), 1);
-        assert_eq!(store.verify_chain("s2").await.unwrap(), 1);
+        assert_eq!(store.verify_chain("s1").await.unwrap().verified, 1);
+        assert_eq!(store.verify_chain("s2").await.unwrap().verified, 1);
     }
 
     #[tokio::test]

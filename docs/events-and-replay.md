@@ -10,7 +10,7 @@ Three things make this useful:
 2. **Forward debugging.** Re-play a failed run, fork from any step, change a config on disk, re-run only the descendants — without re-burning the expensive upstream steps.
 3. **Single source of truth.** Approvals, pipeline state, agent ReAct turns — all derive from the event stream, never from in-memory caches or sidecars.
 
-The full model is in ADR-0009 (event sourcing) and ADR-0018 (fork-resume).
+The full model lives across ADR-0018 (fork-resume), ADR-0022 (event-sourced approvals) and ADR-0035 (hash-chain verification).
 
 ## The event log
 
@@ -20,7 +20,7 @@ Every event has:
 - `sequence` — monotonic per-stream counter (1-based).
 - `kind` — the variant tag (`UserMessageReceived`, `WorkflowNodeCompleted`, `ApprovalRequested`, …). `EventKind` is `#[non_exhaustive]` so adding variants is non-breaking.
 - `payload` — kind-specific data (JSON-encoded).
-- `prev_hash` / `hash` — links to the previous event in the same stream (BLAKE3); enables `zymi verify` to detect tampering.
+- `prev_hash` / `hash` — links to the previous event in the same stream. `hash = SHA-256(event_id || payload || prev_hash)`, chained per stream; enables `zymi verify` to detect tampering.
 - `correlation_id` — optional cross-stream link (e.g. webhook → pipeline run).
 - `timestamp`, `source`.
 
@@ -47,6 +47,12 @@ zymi observe [--run STREAM_ID]
 ```
 
 `--raw` on `events` and `runs` produces one JSON document per line — pipe into `jq` for ad-hoc analysis.
+
+### What `zymi verify` does and does not catch
+
+- **Catches:** in-place modification of any hashed event (its recomputed hash won't match), and reordering or a break in the per-stream `prev_hash`/`hash` links.
+- **Does not (yet) catch:** truncation. Deleting the tail of a stream — or a whole stream — still verifies, because the chain has no externally-anchored head to compare against. Anchored heads are planned (tracked in ADR-0035); until then, treat `verify` as *modification*-evidence, not *completeness*-evidence.
+- **Legacy streams:** events written before the hash-chain feature carry no hash. `verify` exempts them (reported as "legacy, exempt") rather than flagging the stream as broken. They are not backfilled — signing history that was never chained would fake trust it never earned.
 
 ## Fork-resume
 
@@ -111,4 +117,4 @@ Beyond explicit fork-resume, the event store underpins automatic restart safety:
 - [CLI reference](cli.md) — `events`, `runs`, `verify`, `observe`, `resume` flags
 - [Approvals](approvals.md) — how approval events flow
 - [Store backends](store-backends.md) — where the log lives
-- ADR-0009 (event sourcing), ADR-0018 (fork-resume), ADR-0022 (event-sourced approvals)
+- ADR-0018 (fork-resume), ADR-0022 (event-sourced approvals), ADR-0035 (hash-chain verification)

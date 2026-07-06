@@ -99,13 +99,15 @@ impl PyEventStore {
     }
 
     /// Verify the hash chain integrity for a stream.
-    /// Returns the number of verified events.
+    /// Returns the number of verified (hash-checked) events. Legacy events
+    /// predating the hash chain are exempted and not included in the count.
     fn verify_chain(&self, py: Python<'_>, stream_id: &str) -> PyResult<u64> {
         let store = self.inner.clone();
         let stream_id = stream_id.to_owned();
         py.allow_threads(|| {
             runtime().block_on(store.verify_chain(&stream_id))
         })
+        .map(|v| v.verified)
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e}")))
     }
 

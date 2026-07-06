@@ -16,6 +16,29 @@ pub struct TailedEvent {
     pub event: Event,
 }
 
+/// Outcome of verifying one stream's hash chain.
+///
+/// `verified` counts events whose hash was recomputed and matched. `legacy`
+/// counts events written before the hash-chain feature existed (empty stored
+/// `hash` column): these cannot be verified and are *exempted* rather than
+/// flagged as broken. Backfilling their hashes was rejected on purpose — it
+/// would sign history that was never actually chained, turning an unverifiable
+/// prefix into a falsely-trusted one. See ADR-0035.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChainVerification {
+    /// Events whose hash was recomputed and matched.
+    pub verified: u64,
+    /// Legacy (pre-hash-chain) events, exempted from verification.
+    pub legacy: u64,
+}
+
+impl ChainVerification {
+    /// Total events walked (verified + legacy).
+    pub fn total(&self) -> u64 {
+        self.verified + self.legacy
+    }
+}
+
 /// Append-only event store. Events are immutable once written.
 #[async_trait]
 pub trait EventStore: Send + Sync {
@@ -63,9 +86,10 @@ pub trait EventStore: Send + Sync {
         kind_tag: Option<&str>,
     ) -> Result<u64, EventStoreError>;
 
-    /// Verify the hash chain for a stream. Returns Ok(count) if all hashes are valid,
-    /// or an error describing the first broken link.
-    async fn verify_chain(&self, stream_id: &str) -> Result<u64, EventStoreError>;
+    /// Verify the hash chain for a stream. Returns a [`ChainVerification`]
+    /// split into verified and exempted-legacy counts, or an error describing
+    /// the first broken link.
+    async fn verify_chain(&self, stream_id: &str) -> Result<ChainVerification, EventStoreError>;
 
     /// List all distinct stream IDs with their event counts.
     async fn list_streams(&self) -> Result<Vec<(String, u64)>, EventStoreError>;
