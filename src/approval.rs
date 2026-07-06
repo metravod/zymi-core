@@ -609,6 +609,29 @@ impl ApprovalChannel for TelegramApprovalChannel {
             .bind
             .parse()
             .map_err(|e| format!("invalid bind '{}': {e}", self.config.bind))?;
+
+        // The callback endpoint approves arbitrary pending actions, so an
+        // unauthenticated one reachable off-host is a hole. Fail closed:
+        // require a secret_token unless bound to loopback. (The recommended
+        // production setup binds loopback behind a tunnel, so this doesn't
+        // block the tunnel case — only a bare public bind.) See ADR-0037.
+        if self.config.secret_token.is_none() {
+            if bind.ip().is_loopback() {
+                log::warn!(
+                    "telegram approval channel bound to {bind} with no secret_token — \
+                     the callback endpoint is unauthenticated. Fine for local dev; set \
+                     `secret_token` before exposing it."
+                );
+            } else {
+                return Err(format!(
+                    "telegram approval channel refuses to bind non-loopback address {bind} \
+                     without a `secret_token`: the callback endpoint would approve any pending \
+                     action for anyone who can reach it. Set `secret_token` (Telegram's \
+                     X-Telegram-Bot-Api-Secret-Token) or bind loopback behind a tunnel."
+                ));
+            }
+        }
+
         let listener = tokio::net::TcpListener::bind(bind)
             .await
             .map_err(|e| format!("failed to bind {bind}: {e}"))?;
@@ -772,13 +795,16 @@ async fn telegram_callback_handler(
         .map(|u| format!("telegram:{u}"))
         .unwrap_or_else(|| "telegram".into());
 
-    // Find the originating ApprovalRequested so we can mirror its
-    // stream_id + correlation_id (same shape as the HTTP channel).
+    // Single pass over the store: find the originating ApprovalRequested (to
+    // mirror its stream_id + correlation_id, like the HTTP channel) AND detect
+    // whether this approval was already decided. We must scan past the request,
+    // since decisions are appended after it — so no early break.
     let store = state.bus.store();
     let mut from = 0u64;
     let batch = 1024usize;
     let mut originating: Option<(String, Option<uuid::Uuid>)> = None;
-    'walk: loop {
+    let mut already_decided = false;
+    loop {
         let tailed = match store.tail(from, batch).await {
             Ok(t) => t,
             Err(e) => {
@@ -790,17 +816,22 @@ async fn telegram_callback_handler(
             break;
         }
         for t in &tailed {
-            if let EventKind::ApprovalRequested {
-                approval_id: aid,
-                stream_id,
-                channel,
-                ..
-            } = &t.event.kind
-            {
-                if aid == approval_id && channel == &state.channel_name {
+            match &t.event.kind {
+                EventKind::ApprovalRequested {
+                    approval_id: aid,
+                    stream_id,
+                    channel,
+                    ..
+                } if aid == approval_id && channel == &state.channel_name => {
                     originating = Some((stream_id.clone(), t.event.correlation_id));
-                    break 'walk;
                 }
+                EventKind::ApprovalGranted { approval_id: aid, .. }
+                | EventKind::ApprovalDenied { approval_id: aid, .. }
+                    if aid == approval_id =>
+                {
+                    already_decided = true;
+                }
+                _ => {}
             }
         }
         if tailed.len() < batch {
@@ -812,6 +843,17 @@ async fn telegram_callback_handler(
     let Some((stream_id, correlation)) = originating else {
         return axum::http::StatusCode::NOT_FOUND;
     };
+
+    // Idempotency: first decision wins. A double-click, or a deny followed by
+    // an approve, must not publish a second contradictory decision into the
+    // audit trail. (The requester already honors the first decision it sees;
+    // this stops the log from recording the rest.)
+    if already_decided {
+        log::info!(
+            "telegram callback for already-decided approval {approval_id}: ignoring"
+        );
+        return axum::http::StatusCode::OK;
+    }
 
     let kind = if approved {
         EventKind::ApprovalGranted {
@@ -983,6 +1025,98 @@ mod telegram_tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A callback for an already-decided approval is ignored (idempotent):
+    /// returns OK but publishes no second, contradictory decision.
+    #[tokio::test]
+    async fn callback_handler_ignores_already_decided() {
+        let dir = TempDir::new().unwrap();
+        let store =
+            Arc::new(SqliteEventStore::new(&dir.path().join("tg_idem.db")).unwrap());
+        let bus = Arc::new(EventBus::new(store));
+
+        // Request + an existing decision already in the store.
+        bus.publish(Event::new(
+            "stream-y".into(),
+            EventKind::ApprovalRequested {
+                approval_id: "req-9".into(),
+                stream_id: "stream-y".into(),
+                description: "deploy".into(),
+                explanation: None,
+                channel: "ops_tg".into(),
+            },
+            "orchestrator".into(),
+        ))
+        .await
+        .unwrap();
+        bus.publish(Event::new(
+            "stream-y".into(),
+            EventKind::ApprovalDenied {
+                approval_id: "req-9".into(),
+                stream_id: "stream-y".into(),
+                decided_by: "telegram:bob".into(),
+                reason: None,
+            },
+            "approval_channel".into(),
+        ))
+        .await
+        .unwrap();
+
+        let mut rx = bus.subscribe().await;
+        let state = Arc::new(TelegramWebhookState {
+            channel_name: "ops_tg".into(),
+            bus: Arc::clone(&bus),
+            secret_token: None,
+        });
+        let app = telegram_router(state, "/cb".into());
+
+        // A contradictory "approve" click after the deny.
+        let body = serde_json::json!({
+            "callback_query": {"from": {"username": "bob"}, "data": "req-9:approve"}
+        });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/cb")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // No new decision should have been published.
+        let second =
+            tokio::time::timeout(Duration::from_millis(300), rx.recv()).await;
+        assert!(
+            second.is_err(),
+            "expected no second decision, got {second:?}"
+        );
+    }
+
+    /// A non-loopback bind without a secret_token must refuse to start.
+    #[tokio::test]
+    async fn start_refuses_public_bind_without_secret_token() {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(SqliteEventStore::new(&dir.path().join("tg_bind.db")).unwrap());
+        let bus = Arc::new(EventBus::new(store));
+
+        let channel = TelegramApprovalChannel::new(TelegramChannelConfig {
+            name: Some("ops_tg".into()),
+            bot_token: "x".into(),
+            chat_id: 1,
+            bind: "0.0.0.0:0".into(),
+            callback_path: "/cb".into(),
+            secret_token: None,
+        });
+        let err = match channel.start(bus).await {
+            Ok(_) => panic!("expected start to refuse public bind without secret_token"),
+            Err(e) => e,
+        };
+        assert!(err.contains("secret_token"), "unexpected error: {err}");
     }
 }
 
