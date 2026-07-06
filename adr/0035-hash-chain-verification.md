@@ -67,3 +67,6 @@ Consequences:
   (a per-stream head commitment checked on verify) so truncation and
   whole-stream deletion become detectable. That is a hash-format change and
   will land as a breaking minor release, tracked as a follow-up to this ADR.
+  **Done in ADR-0040** (versioned `v2:` hash covering the sequence + an
+  in-database `stream_heads` table). The remaining external/unreachable anchor
+  — for tamper-evidence against a DB-write attacker — stays future work.

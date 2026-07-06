@@ -16,7 +16,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use deadpool_postgres::{Config, Pool, Runtime};
-use sha2::{Digest, Sha256};
+use super::event_store::{compute_hash_v2, recompute_hash};
 use tokio_postgres::NoTls;
 
 use crate::events::{Event, EventStoreError};
@@ -44,6 +44,11 @@ const SCHEMA_SQL: &str = r#"
         ON events(correlation_id);
     CREATE INDEX IF NOT EXISTS idx_events_kind
         ON events(kind_tag);
+    CREATE TABLE IF NOT EXISTS stream_heads (
+        stream_id TEXT PRIMARY KEY,
+        last_sequence BIGINT NOT NULL,
+        last_hash TEXT NOT NULL
+    );
 "#;
 
 pub struct PostgresEventStore {
@@ -86,14 +91,6 @@ impl PostgresEventStore {
 
         Ok(Self { pool })
     }
-}
-
-fn compute_hash(event_id: &str, data: &str, prev_hash: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(event_id.as_bytes());
-    hasher.update(data.as_bytes());
-    hasher.update(prev_hash.as_bytes());
-    format!("{:x}", hasher.finalize())
 }
 
 fn parse_event(data: &str, sequence: i64) -> Result<Event, EventStoreError> {
@@ -150,7 +147,7 @@ impl EventStore for PostgresEventStore {
             .map_err(err_conn)?;
         let next_seq: i64 = row.get("next_seq");
         let prev_hash: String = row.get("prev_hash");
-        let hash = compute_hash(&event_id, &data, &prev_hash);
+        let hash = compute_hash_v2(&event_id, next_seq as u64, &data, &prev_hash);
 
         tx.execute(
             "INSERT INTO events
@@ -170,6 +167,19 @@ impl EventStore for PostgresEventStore {
                 &prev_hash,
                 &hash,
             ],
+        )
+        .await
+        .map_err(err_conn)?;
+
+        // Advance the stream head in the same transaction (ADR-0040) so verify
+        // can detect tail-truncation and whole-stream deletion.
+        tx.execute(
+            "INSERT INTO stream_heads (stream_id, last_sequence, last_hash)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (stream_id) DO UPDATE SET
+                 last_sequence = EXCLUDED.last_sequence,
+                 last_hash = EXCLUDED.last_hash",
+            &[&stream_id, &next_seq, &hash],
         )
         .await
         .map_err(err_conn)?;
@@ -303,7 +313,7 @@ impl EventStore for PostgresEventStore {
         let client = self.pool.get().await.map_err(err_conn)?;
         let rows = client
             .query(
-                "SELECT event_id, data, prev_hash, hash FROM events
+                "SELECT event_id, sequence, data, prev_hash, hash FROM events
                  WHERE stream_id = $1
                  ORDER BY sequence ASC",
                 &[&stream_id],
@@ -313,18 +323,23 @@ impl EventStore for PostgresEventStore {
 
         let mut expected_prev_hash = String::new();
         let mut result = ChainVerification::default();
+        let mut last_seq: u64 = 0;
+        let mut last_hash = String::new();
         for row in rows {
             let event_id: String = row.get("event_id");
+            let sequence: i64 = row.get("sequence");
             let data: String = row.get("data");
             let prev_hash: String = row.get("prev_hash");
             let stored_hash: String = row.get("hash");
 
             // Legacy rows predate the hash chain (migration DEFAULT ''):
             // exempt them rather than fail the stream. See ADR-0035.
-            if stored_hash.is_empty() {
+            let Some(computed) =
+                recompute_hash(&event_id, sequence as u64, &data, &prev_hash, &stored_hash)
+            else {
                 result.legacy += 1;
                 continue;
-            }
+            };
 
             if prev_hash != expected_prev_hash {
                 return Err(EventStoreError::Connection(format!(
@@ -332,17 +347,55 @@ impl EventStore for PostgresEventStore {
                      (expected '{expected_prev_hash}', got '{prev_hash}')"
                 )));
             }
-            let computed = compute_hash(&event_id, &data, &prev_hash);
             if computed != stored_hash {
                 return Err(EventStoreError::Connection(format!(
                     "Hash chain broken at event {event_id}: hash mismatch \
                      (computed '{computed}', stored '{stored_hash}')"
                 )));
             }
-            expected_prev_hash = stored_hash;
+            expected_prev_hash = stored_hash.clone();
+            last_seq = sequence as u64;
+            last_hash = stored_hash;
             result.verified += 1;
         }
+
+        // Truncation / deletion check (ADR-0040): head vs walked tail.
+        let head = client
+            .query_opt(
+                "SELECT last_sequence, last_hash FROM stream_heads WHERE stream_id = $1",
+                &[&stream_id],
+            )
+            .await
+            .map_err(err_conn)?;
+        if let Some(head_row) = head {
+            let head_seq: i64 = head_row.get("last_sequence");
+            let head_hash: String = head_row.get("last_hash");
+            let head_seq = head_seq as u64;
+            if result.verified == 0 {
+                return Err(EventStoreError::Connection(format!(
+                    "Stream truncated: head records sequence {head_seq} but no hashed \
+                     events remain (whole-stream deletion)"
+                )));
+            }
+            if last_seq != head_seq || last_hash != head_hash {
+                return Err(EventStoreError::Connection(format!(
+                    "Stream truncated: tail is sequence {last_seq} but head records \
+                     sequence {head_seq} (missing {} event(s))",
+                    head_seq.saturating_sub(last_seq)
+                )));
+            }
+        }
+
         Ok(result)
+    }
+
+    async fn head_stream_ids(&self) -> Result<Vec<String>, EventStoreError> {
+        let client = self.pool.get().await.map_err(err_conn)?;
+        let rows = client
+            .query("SELECT stream_id FROM stream_heads ORDER BY stream_id", &[])
+            .await
+            .map_err(err_conn)?;
+        Ok(rows.into_iter().map(|r| r.get("stream_id")).collect())
     }
 
     async fn list_streams(&self) -> Result<Vec<(String, u64)>, EventStoreError> {

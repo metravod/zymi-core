@@ -1,6 +1,54 @@
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
 
 use crate::events::{Event, EventStoreError};
+
+/// Version tag prefixing a v2 stored hash. v2 (0.8.0+, ADR-0040) covers the
+/// DB-assigned `sequence`; v1 (0.7.x) did not and stored a bare hex digest;
+/// an empty string is a legacy pre-hash-chain row (ADR-0035).
+pub const HASH_V2_PREFIX: &str = "v2:";
+
+/// v1 hash: `SHA-256(event_id || data || prev_hash)`, bare hex. Retained only
+/// to verify rows written before ADR-0040.
+pub fn compute_hash_v1(event_id: &str, data: &str, prev_hash: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(event_id.as_bytes());
+    hasher.update(data.as_bytes());
+    hasher.update(prev_hash.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// v2 hash: `SHA-256("v2" || event_id || sequence_le || data || prev_hash)`,
+/// stored as `v2:<hex>`. Covers the authoritative DB-assigned sequence so the
+/// ordering is no longer an unhashed column (ADR-0040).
+pub fn compute_hash_v2(event_id: &str, sequence: u64, data: &str, prev_hash: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"v2");
+    hasher.update(event_id.as_bytes());
+    hasher.update(sequence.to_le_bytes());
+    hasher.update(data.as_bytes());
+    hasher.update(prev_hash.as_bytes());
+    format!("{HASH_V2_PREFIX}{:x}", hasher.finalize())
+}
+
+/// Recompute the expected stored hash for a row, dispatching on the stored
+/// hash's version tag. Returns `None` for a legacy (empty) row, which the
+/// caller exempts rather than verifies.
+pub fn recompute_hash(
+    event_id: &str,
+    sequence: u64,
+    data: &str,
+    prev_hash: &str,
+    stored_hash: &str,
+) -> Option<String> {
+    if stored_hash.is_empty() {
+        None
+    } else if stored_hash.starts_with(HASH_V2_PREFIX) {
+        Some(compute_hash_v2(event_id, sequence, data, prev_hash))
+    } else {
+        Some(compute_hash_v1(event_id, data, prev_hash))
+    }
+}
 
 /// An event paired with a backend-assigned monotonic global cursor.
 ///
@@ -93,6 +141,14 @@ pub trait EventStore: Send + Sync {
 
     /// List all distinct stream IDs with their event counts.
     async fn list_streams(&self) -> Result<Vec<(String, u64)>, EventStoreError>;
+
+    /// Stream IDs that have a recorded head (ADR-0040). `zymi verify` unions
+    /// these with the event streams so a whole-stream deletion — every row
+    /// gone but the head remaining — is still detected. Backends without a
+    /// head table return empty.
+    async fn head_stream_ids(&self) -> Result<Vec<String>, EventStoreError> {
+        Ok(Vec::new())
+    }
 
     /// Find "orphaned" inbound events: events of `inbound_tag` whose correlation_id
     /// has no corresponding event of `completion_tag` in the store.
