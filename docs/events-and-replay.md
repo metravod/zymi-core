@@ -87,6 +87,8 @@ Beyond explicit fork-resume, the event store underpins automatic restart safety:
 - **Connector cursors** persist in `connectors.db` (sqlite) or `connector_cursors` table (postgres) so `http_poll` doesn't double-fire on restart.
 - **Multi-process `zymi serve` against a shared Postgres store** sees one cursor table and one event log — no double work.
 
+> **A run that was awaiting an approval when the process died is not auto-resumed.** Restart safety keeps the *approval* consistent — it is re-subscribed within the timeout, or sealed as `ApprovalDenied{reason: restart_timeout}`. But the pipeline run itself died with the process: even if a re-delivered prompt is then granted and `ApprovalGranted` is recorded, nothing executes it, because the awaiting run no longer exists. Re-trigger the run explicitly with `zymi resume <stream_id>` (it forks from the recorded state; the frozen prefix is not re-run). Automatic resume-on-approval after a crash is future work.
+
 ## Event kinds (selected)
 
 | Kind | Stream type | Meaning |

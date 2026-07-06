@@ -6,7 +6,7 @@ Event-sourced human-in-the-loop. A tool with `requires_approval: true` publishes
 
 Approvals live entirely on the event bus (ADR-0022). No in-memory pending map, no opaque handler state — the event store is the single source of truth for "who is waiting on what". This means:
 
-- Restart safety: a `zymi serve` restart re-subscribes to in-flight approvals from the store (within timeout) or seals them as `ApprovalDenied{reason: restart_timeout}`.
+- Restart safety: a `zymi serve` restart re-subscribes to in-flight approvals from the store (within timeout) or seals them as `ApprovalDenied{reason: restart_timeout}`. Note: this keeps the *approval* consistent, but the run that was awaiting it does not auto-resume after a crash — re-trigger it with `zymi resume` (see [events-and-replay](events-and-replay.md#replay--restart-safety)).
 - TUI / `zymi events` see every approval decision the same way they see any other event.
 - Hash-chained: decisions are tamper-evident.
 
