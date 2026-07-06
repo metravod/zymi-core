@@ -24,6 +24,7 @@ serde_yml = "0.0.12"
 schemars = { version = "0.8", features = ["derive"] }
 miette = { version = "7", features = ["fancy"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false, optional = true }
+percent-encoding = { version = "2", optional = true }
 pyo3 = { version = "0.22", features = ["extension-module", "abi3-py39"], optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 axum = { version = "0.7", optional = true }
@@ -45,7 +46,7 @@ croner = { version = "2", optional = true }
 default = []
 python = ["pyo3"]
 cli = ["clap", "runtime", "ratatui", "crossterm", "futures", "connectors", "dotenvy"]
-runtime = ["reqwest"]
+runtime = ["reqwest", "percent-encoding"]
 webhook = ["axum", "runtime"]
 services = ["runtime"]
 connectors = [

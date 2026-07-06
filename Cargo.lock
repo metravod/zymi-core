@@ -3419,6 +3419,7 @@ dependencies = [
  "log",
  "miette",
  "minijinja",
+ "percent-encoding",
  "pyo3",
  "ratatui",
  "regex",
