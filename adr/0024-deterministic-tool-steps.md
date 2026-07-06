@@ -2,6 +2,20 @@
 
 Date: 2026-05-04
 
+Status: Implemented, with two corrections (2026-07-06, from arikusi's review):
+
+1. **Event names in this ADR are pre-implementation placeholders.** The body
+   says `ToolCalled` / `ToolReturned` / `PipelineStepStarted|Completed|Failed`;
+   none of those exist in `EventKind`. The real events are
+   `ToolCallRequested` / `ToolCallCompleted` and
+   `WorkflowNodeStarted` / `WorkflowNodeCompleted`. Read the design intent, not
+   the identifiers.
+2. **"Fork-resume inherited for free" (Consequences) was not true.** Freezing a
+   step *downstream* of a tool step failed, because the frozen-output
+   reconstruction only understood `LlmCallCompleted` and a tool step's
+   sub-stream has none. Fixed in **ADR-0038** (tool-step output in
+   `extract_step_output`).
+
 ## Context
 
 Today every entry in `pipelines/*.yml::steps[]` routes through `agent: <name>` (`src/config/pipeline.rs:45-51`). The orchestrator builds an agent context, sends a `task:` prompt to the LLM, runs the ReAct loop, and only then dispatches whatever tool the agent decided to call. This is correct for reasoning steps but is the wrong shape for the cases that motivated this ADR:
