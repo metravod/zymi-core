@@ -50,9 +50,9 @@ zymi observe [--run STREAM_ID]
 
 ### What `zymi verify` does and does not catch
 
-- **Catches:** in-place modification of any hashed event (its recomputed hash won't match), and reordering or a break in the per-stream `prev_hash`/`hash` links.
-- **Does not (yet) catch:** truncation. Deleting the tail of a stream — or a whole stream — still verifies, because the chain has no externally-anchored head to compare against. Anchored heads are planned (tracked in ADR-0035); until then, treat `verify` as *modification*-evidence, not *completeness*-evidence.
-- **Legacy streams:** events written before the hash-chain feature carry no hash. `verify` exempts them (reported as "legacy, exempt") rather than flagging the stream as broken. They are not backfilled — signing history that was never chained would fake trust it never earned.
+- **Catches:** in-place modification of any hashed event (its recomputed hash won't match, and the sequence is covered by the hash since 0.8.0), reordering or a break in the per-stream `prev_hash`/`hash` links, and — for streams written by 0.8.0+ — tail-truncation or whole-stream deletion, via a per-stream head recorded alongside the events (ADR-0040).
+- **Does not catch:** tampering by an attacker who can already write the database. The head lives in the same store, so someone who edits `events` can also edit `stream_heads`. This closes the accidental/careless-deletion case and forces two edits, but real tamper-evidence against a DB-write attacker needs an external, unreachable anchor (signed or externally-published heads) — future work.
+- **Legacy streams:** events written before the hash-chain feature carry no hash. `verify` exempts them (reported as "legacy, exempt") rather than flagging the stream as broken. They are not backfilled — signing history that was never chained would fake trust it never earned. Streams from 0.7.x verify under the older v1 hash formula automatically.
 
 ## Fork-resume
 

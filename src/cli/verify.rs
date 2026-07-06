@@ -23,9 +23,27 @@ pub fn exec(stream: Option<&str>, root: impl AsRef<Path>) -> Result<(), String> 
     match stream {
         Some(stream_id) => verify_stream(&store, &rt, stream_id),
         None => {
-            let streams = rt
+            let mut streams = rt
                 .block_on(store.list_streams())
                 .map_err(|e| format!("failed to list streams: {e}"))?;
+
+            // Union in streams that have a recorded head but no rows: a
+            // whole-stream deletion leaves the head behind (ADR-0040), and we
+            // still want verify to flag it. Such a stream verifies with 0 rows
+            // against a non-empty head → truncation error.
+            let known: std::collections::HashSet<&str> =
+                streams.iter().map(|(s, _)| s.as_str()).collect();
+            let head_ids = rt
+                .block_on(store.head_stream_ids())
+                .map_err(|e| format!("failed to list stream heads: {e}"))?;
+            let missing: Vec<String> = head_ids
+                .into_iter()
+                .filter(|s| !known.contains(s.as_str()))
+                .collect();
+            for s in missing {
+                streams.push((s, 0));
+            }
+            streams.sort();
 
             if streams.is_empty() {
                 println!("No streams in the store. Nothing to verify.");

@@ -431,7 +431,7 @@ async fn execute_declarative_http(
             headers,
             body_template,
         } => {
-            let resolved_url = resolve_args(url, &args);
+            let resolved_url = resolve_args_url(url, &args);
 
             let client = reqwest::Client::new();
             let mut builder = match method {
@@ -447,7 +447,7 @@ async fn execute_declarative_http(
             }
 
             if let Some(template) = body_template {
-                let body = resolve_args(template, &args);
+                let body = resolve_args_json(template, &args);
                 builder = builder.body(body);
             }
 
@@ -492,11 +492,46 @@ pub(crate) fn parse_args_for_interpolation(arguments_json: &str) -> HashMap<Stri
     map
 }
 
-/// Resolve `${args.X}` placeholders in a template string.
+/// Resolve `${args.X}` placeholders in a template string, verbatim.
+///
+/// Safe for shell command templates only because the policy engine evaluates
+/// the *resolved* command (ADR-0014). Do NOT use for HTTP URLs or JSON bodies —
+/// LLM-controlled values would be spliced in unescaped. Use
+/// [`resolve_args_url`] / [`resolve_args_json`] there instead (ADR-0039).
 pub(crate) fn resolve_args(template: &str, args: &HashMap<String, String>) -> String {
     let mut result = template.to_string();
     for (key, value) in args {
         result = result.replace(&format!("${{args.{key}}}"), value);
+    }
+    result
+}
+
+/// Resolve `${args.X}` into a URL template, percent-encoding each value so a
+/// value cannot alter URL structure (extra path segments, query params, …).
+#[cfg(feature = "runtime")]
+fn resolve_args_url(template: &str, args: &HashMap<String, String>) -> String {
+    use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+    let mut result = template.to_string();
+    for (key, value) in args {
+        let encoded = utf8_percent_encode(value, NON_ALPHANUMERIC).to_string();
+        result = result.replace(&format!("${{args.{key}}}"), &encoded);
+    }
+    result
+}
+
+/// Resolve `${args.X}` into a JSON body template, escaping each value as JSON
+/// string content (no surrounding quotes) so a value cannot break out of its
+/// string and inject sibling keys — e.g. `"},"admin":true` becomes inert.
+/// Templates are expected to quote placeholders: `{"q":"${args.query}"}`.
+#[cfg(feature = "runtime")]
+fn resolve_args_json(template: &str, args: &HashMap<String, String>) -> String {
+    let mut result = template.to_string();
+    for (key, value) in args {
+        // serde_json quotes + escapes; strip the outer quotes to get the
+        // safe inner content for insertion inside an existing "..." literal.
+        let quoted = serde_json::Value::String(value.clone()).to_string();
+        let escaped = &quoted[1..quoted.len() - 1];
+        result = result.replace(&format!("${{args.{key}}}"), escaped);
     }
     result
 }
@@ -606,6 +641,32 @@ mod tests {
         let args = HashMap::new();
         let template = "https://example.com/api";
         assert_eq!(resolve_args(template, &args), template);
+    }
+
+    #[test]
+    fn resolve_args_json_neutralizes_breakout() {
+        // The reported attack: a value that closes the string and injects a key.
+        let mut args = HashMap::new();
+        args.insert("name".into(), r#"x"},"admin":true,"y":"z"#.into());
+        let template = r#"{"user":"${args.name}","role":"user"}"#;
+        let resolved = resolve_args_json(template, &args);
+
+        // Must still be a single JSON object with exactly the template's keys.
+        let v: serde_json::Value = serde_json::from_str(&resolved)
+            .expect("resolved body must be valid JSON");
+        assert_eq!(v["role"], "user");
+        assert!(v.get("admin").is_none(), "injected key must not appear: {resolved}");
+        assert_eq!(v["user"], r#"x"},"admin":true,"y":"z"#);
+    }
+
+    #[test]
+    fn resolve_args_url_percent_encodes() {
+        let mut args = HashMap::new();
+        args.insert("q".into(), "a&b=c /../etc".into());
+        let resolved = resolve_args_url("https://api.test/search?q=${args.q}", &args);
+        assert!(!resolved.contains("a&b"), "raw & leaked: {resolved}");
+        assert!(!resolved.contains(' '), "raw space leaked: {resolved}");
+        assert!(resolved.starts_with("https://api.test/search?q="));
     }
 
     #[test]

@@ -318,7 +318,8 @@ pub async fn handle(rt: &Runtime, cmd: ResumePipeline) -> Result<ResumeOutcome, 
         let output = extract_step_output(&events).ok_or_else(|| {
             format!(
                 "could not reconstruct output for frozen step '{step_id}' from parent \
-                 stream — missing terminal LlmCallCompleted event"
+                 stream — no terminal LlmCallCompleted (agent step) or ToolCallCompleted \
+                 (tool step) event found"
             )
         })?;
         frozen_outputs.insert(step_id.clone(), output);
@@ -413,29 +414,34 @@ fn transitive_dependents(pipeline: &PipelineConfig, root: &str) -> HashSet<Strin
     result
 }
 
-/// Extract the "output" of a completed agent step from its sub-stream:
-/// the content of the last `LlmCallCompleted` whose `has_tool_calls` is
-/// false (i.e. the iteration that produced the final answer). Falls back to
-/// `content_preview` for pre-enrichment events that have no
-/// `response_message`.
+/// Extract the "output" of a completed frozen step from its sub-stream.
+///
+/// Two step shapes produce two event shapes (ADR-0024):
+/// - **Agent step:** the answer is the last `LlmCallCompleted` with
+///   `has_tool_calls == false`. Its `response_message` content, or
+///   `content_preview` for pre-enrichment events.
+/// - **Deterministic tool step:** the sub-stream has no `LlmCallCompleted` at
+///   all, only `ToolCallRequested`/`ToolCallCompleted`. Its output is the last
+///   `ToolCallCompleted`'s `result` (untruncated), or `result_preview` when
+///   `result` is empty (pre-enrichment events).
+///
+/// Agent steps also contain `ToolCallCompleted` events (mid-ReAct tool calls),
+/// so the LLM path is tried first and the tool fallback only fires when there
+/// is no terminal LLM completion — i.e. a genuine tool step.
 fn extract_step_output(events: &[Event]) -> Option<String> {
-    let mut last: Option<&EventKind> = None;
+    let mut last_llm: Option<(&Option<Message>, &Option<String>)> = None;
     for ev in events {
         if let EventKind::LlmCallCompleted {
             has_tool_calls: false,
+            response_message,
+            content_preview,
             ..
         } = &ev.kind
         {
-            last = Some(&ev.kind);
+            last_llm = Some((response_message, content_preview));
         }
     }
-    let kind = last?;
-    if let EventKind::LlmCallCompleted {
-        response_message,
-        content_preview,
-        ..
-    } = kind
-    {
+    if let Some((response_message, content_preview)) = last_llm {
         if let Some(Message::Assistant {
             content: Some(text),
             ..
@@ -445,7 +451,26 @@ fn extract_step_output(events: &[Event]) -> Option<String> {
         }
         return content_preview.clone();
     }
-    None
+
+    // Tool step: no terminal LLM completion — use the last tool result.
+    let mut last_tool: Option<(&String, &String)> = None;
+    for ev in events {
+        if let EventKind::ToolCallCompleted {
+            result,
+            result_preview,
+            ..
+        } = &ev.kind
+        {
+            last_tool = Some((result, result_preview));
+        }
+    }
+    last_tool.map(|(result, preview)| {
+        if result.is_empty() {
+            preview.clone()
+        } else {
+            result.clone()
+        }
+    })
 }
 
 /// Append a freshly-built event directly to the store, no bus publish.
@@ -649,6 +674,53 @@ mod tests {
         assert_eq!(
             extract_step_output(std::slice::from_ref(&ev)).as_deref(),
             Some("pre-enrichment")
+        );
+    }
+
+    #[test]
+    fn extract_output_handles_tool_step() {
+        // A deterministic tool step's sub-stream: request + completion, no
+        // LlmCallCompleted. Output is the last ToolCallCompleted's result.
+        let mk_tool = |result: &str, preview: &str| Event {
+            id: Uuid::new_v4(),
+            stream_id: "s".into(),
+            sequence: 0,
+            timestamp: chrono::Utc::now(),
+            kind: EventKind::ToolCallCompleted {
+                call_id: "c1".into(),
+                result: result.into(),
+                result_preview: preview.into(),
+                is_error: false,
+                duration_ms: 3,
+                replayed: false,
+            },
+            correlation_id: None,
+            causation_id: None,
+            source: "engine".into(),
+        };
+        let req = Event {
+            id: Uuid::new_v4(),
+            stream_id: "s".into(),
+            sequence: 0,
+            timestamp: chrono::Utc::now(),
+            kind: EventKind::ToolCallRequested {
+                tool_name: "http_get".into(),
+                arguments: "{}".into(),
+                call_id: "c1".into(),
+            },
+            correlation_id: None,
+            causation_id: None,
+            source: "engine".into(),
+        };
+
+        let events = vec![req, mk_tool("full body", "full b…")];
+        assert_eq!(extract_step_output(&events).as_deref(), Some("full body"));
+
+        // Empty result → fall back to preview (pre-enrichment tool event).
+        let ev = mk_tool("", "just a preview");
+        assert_eq!(
+            extract_step_output(std::slice::from_ref(&ev)).as_deref(),
+            Some("just a preview")
         );
     }
 

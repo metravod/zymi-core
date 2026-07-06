@@ -31,11 +31,38 @@ pub struct RateLimitConfig {
     pub web_requests_per_minute: u32,
 }
 
+/// Built-in deny patterns applied to **both** file reads and writes, on top of
+/// any configured `deny_patterns`. Secrets must never be readable into the
+/// append-only event log (a `ToolCallCompleted.result` is persisted forever and
+/// fed to the LLM), nor writable. Secure-by-default: this holds even when the
+/// user configures no `deny_patterns` of their own. See ADR-0036.
+const BUILTIN_SECRET_DENY: &[&str] = &[
+    "*.env",
+    ".env",
+    ".env.*",
+    "*.key",
+    "*.pem",
+    "*.pfx",
+    "*.p12",
+    "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+    ".netrc",
+    ".pypirc",
+    ".npmrc",
+    "credentials",
+    "*.secret",
+];
+
 /// Boundary contract engine. Evaluates agent intentions against configured
 /// contracts before allowing execution.
 ///
 /// For shell commands, delegates to the existing PolicyEngine.
-/// For file writes, applies path-based contracts.
+/// For file reads and writes, applies path-based contracts: a built-in +
+/// configured secret deny-list (reads and writes), and an `allowed_dirs`
+/// boundary (writes). Paths are lexically normalized before matching so
+/// `..` traversal cannot escape the boundary.
 /// Extensible with rate limits and other contract types.
 pub struct ContractEngine {
     shell_policy: Arc<PolicyEngine>,
@@ -45,10 +72,11 @@ pub struct ContractEngine {
 
 impl ContractEngine {
     pub fn new(shell_policy: Arc<PolicyEngine>, file_contract: FileWriteContract) -> Self {
-        let deny_regexes = file_contract
-            .deny_patterns
+        let deny_regexes = BUILTIN_SECRET_DENY
             .iter()
-            .filter_map(|p| glob_to_regex(p))
+            .map(|p| (*p).to_string())
+            .chain(file_contract.deny_patterns.iter().cloned())
+            .filter_map(|p| glob_to_regex(&p))
             .collect();
 
         Self {
@@ -65,7 +93,7 @@ impl ContractEngine {
                 self.evaluate_shell_command(command)
             }
             Intention::WriteFile { path, .. } => self.evaluate_file_write(path),
-            Intention::ReadFile { .. } => IntentionVerdict::Approved,
+            Intention::ReadFile { path } => self.evaluate_file_read(path),
             Intention::WebSearch { .. } | Intention::WebScrape { .. } => {
                 IntentionVerdict::Approved
             }
@@ -87,13 +115,23 @@ impl ContractEngine {
         }
     }
 
+    /// Reads are permissive by default, but the secret deny-list (built-in +
+    /// configured) always applies: a denied file must never be read into the
+    /// event log or handed to the LLM.
+    fn evaluate_file_read(&self, path: &str) -> IntentionVerdict {
+        if let Some(reason) = self.denied_by_pattern(path) {
+            return IntentionVerdict::Denied {
+                reason: format!("File read denied ({reason}): {path}"),
+            };
+        }
+        IntentionVerdict::Approved
+    }
+
     fn evaluate_file_write(&self, path: &str) -> IntentionVerdict {
-        for regex in &self.deny_regexes {
-            if regex.is_match(path) {
-                return IntentionVerdict::Denied {
-                    reason: format!("File write denied by pattern: {path}"),
-                };
-            }
+        if let Some(reason) = self.denied_by_pattern(path) {
+            return IntentionVerdict::Denied {
+                reason: format!("File write denied ({reason}): {path}"),
+            };
         }
 
         if self.file_contract.allowed_dirs.is_empty() {
@@ -102,8 +140,11 @@ impl ContractEngine {
             };
         }
 
+        // Compare on lexically-normalized components so `..` traversal cannot
+        // smuggle a write out of an allowed dir (e.g. `./memory/../../etc`).
+        let target = normalize_components(path);
         for dir in &self.file_contract.allowed_dirs {
-            if path.starts_with(dir) {
+            if is_within(&target, &normalize_components(dir)) {
                 return IntentionVerdict::Approved;
             }
         }
@@ -112,6 +153,57 @@ impl ContractEngine {
             reason: format!("File write outside allowed directories: {path}"),
         }
     }
+
+    /// Returns `Some(pattern)` if the path (or its basename) matches any deny
+    /// regex. Matches on the normalized path and the last component so both
+    /// path-style (`secrets/*`) and name-style (`.env`, `*.key`) patterns work,
+    /// regardless of `..` traversal.
+    fn denied_by_pattern(&self, path: &str) -> Option<String> {
+        let normalized = normalize_string(path);
+        let basename = normalized.rsplit('/').next().unwrap_or(&normalized);
+        for regex in &self.deny_regexes {
+            if regex.is_match(&normalized) || regex.is_match(basename) {
+                return Some(regex.as_str().to_string());
+            }
+        }
+        None
+    }
+}
+
+/// Lexically normalize a path into components, resolving `.` and `..` without
+/// touching the filesystem (the target may not exist yet, and we must not
+/// follow symlinks here). Note: symlinks are *not* resolved — a symlink inside
+/// an allowed dir pointing elsewhere is out of scope for this lexical check
+/// (see ADR-0036).
+fn normalize_components(path: &str) -> Vec<String> {
+    let is_abs = path.starts_with('/');
+    let mut out: Vec<String> = Vec::new();
+    for comp in path.split('/') {
+        match comp {
+            "" | "." => {}
+            ".." => match out.last().map(String::as_str) {
+                Some(top) if top != ".." => {
+                    out.pop();
+                }
+                _ if !is_abs => out.push("..".into()),
+                _ => {} // `..` above filesystem root is a no-op
+            },
+            other => out.push(other.to_string()),
+        }
+    }
+    out
+}
+
+/// Normalized path as a string, preserving a leading `/` for absolute paths.
+fn normalize_string(path: &str) -> String {
+    let prefix = if path.starts_with('/') { "/" } else { "" };
+    format!("{prefix}{}", normalize_components(path).join("/"))
+}
+
+/// True if `target`'s components are prefixed by `dir`'s components — i.e. the
+/// target lies within `dir`. An empty `dir` (e.g. `./`) contains everything.
+fn is_within(target: &[String], dir: &[String]) -> bool {
+    target.len() >= dir.len() && target.iter().zip(dir).all(|(a, b)| a == b)
 }
 
 fn truncate(s: &str, max: usize) -> &str {
@@ -241,14 +333,57 @@ mod tests {
     }
 
     #[test]
-    fn read_file_always_approved() {
+    fn read_non_secret_approved() {
         let policy = make_policy(vec![], vec![], vec![]);
         let engine = ContractEngine::new(policy, FileWriteContract::default());
 
         let verdict = engine.evaluate(&Intention::ReadFile {
-            path: "/etc/passwd".into(),
+            path: "./docs/notes.md".into(),
         });
         assert_eq!(verdict, IntentionVerdict::Approved);
+    }
+
+    #[test]
+    fn read_secret_denied_by_default() {
+        // Secure by default: no deny_patterns configured, but the built-in
+        // secret list still blocks reading .env / private keys into the log.
+        let policy = make_policy(vec![], vec![], vec![]);
+        let engine = ContractEngine::new(policy, FileWriteContract::default());
+
+        for p in [".env", "./config/prod.env", "/home/u/.ssh/id_rsa", "app.key"] {
+            let verdict = engine.evaluate(&Intention::ReadFile { path: p.into() });
+            assert!(
+                matches!(verdict, IntentionVerdict::Denied { .. }),
+                "expected {p} to be denied, got {verdict:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn write_traversal_cannot_escape_allowed_dir() {
+        let policy = make_policy(vec![], vec![], vec![]);
+        let contract = FileWriteContract {
+            allowed_dirs: vec!["./memory/".into()],
+            deny_patterns: vec![],
+        };
+        let engine = ContractEngine::new(policy, contract);
+
+        // `..` traversal out of the allowed dir must NOT auto-approve.
+        let verdict = engine.evaluate(&Intention::WriteFile {
+            path: "./memory/../../home/user/.ssh/config".into(),
+            content: "pwn".into(),
+        });
+        assert!(
+            matches!(verdict, IntentionVerdict::RequiresHumanApproval { .. }),
+            "traversal escape should require approval, got {verdict:?}"
+        );
+
+        // A genuine in-dir write still approves.
+        let ok = engine.evaluate(&Intention::WriteFile {
+            path: "./memory/notes.md".into(),
+            content: "hi".into(),
+        });
+        assert_eq!(ok, IntentionVerdict::Approved);
     }
 
     #[test]

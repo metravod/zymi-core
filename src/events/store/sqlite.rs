@@ -2,13 +2,14 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use rusqlite::Connection;
-use sha2::{Digest, Sha256};
+use rusqlite::{Connection, OptionalExtension};
 use tokio::sync::Mutex;
 
 use crate::events::{Event, EventStoreError};
 
-use super::event_store::{ChainVerification, EventStore, TailedEvent};
+use super::event_store::{
+    compute_hash_v2, recompute_hash, ChainVerification, EventStore, TailedEvent,
+};
 
 /// SQLite-backed event store. Persists every event with a hash chain
 /// per stream and an autoincrement global cursor used by the watcher.
@@ -45,7 +46,12 @@ impl SqliteEventStore {
              CREATE INDEX IF NOT EXISTS idx_events_correlation
                  ON events(correlation_id);
              CREATE INDEX IF NOT EXISTS idx_events_kind
-                 ON events(kind_tag);",
+                 ON events(kind_tag);
+             CREATE TABLE IF NOT EXISTS stream_heads (
+                 stream_id TEXT PRIMARY KEY,
+                 last_sequence INTEGER NOT NULL,
+                 last_hash TEXT NOT NULL
+             );",
         )
         .map_err(|e| EventStoreError::Connection(e.to_string()))?;
 
@@ -75,14 +81,6 @@ impl SqliteEventStore {
     }
 }
 
-/// Compute SHA-256(event_id || data || prev_hash) as hex string.
-fn compute_hash(event_id: &str, data: &str, prev_hash: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(event_id.as_bytes());
-    hasher.update(data.as_bytes());
-    hasher.update(prev_hash.as_bytes());
-    format!("{:x}", hasher.finalize())
-}
 
 #[async_trait]
 impl EventStore for SqliteEventStore {
@@ -119,7 +117,7 @@ impl EventStore for SqliteEventStore {
                     )
                     .map_err(|e| EventStoreError::Connection(e.to_string()))?;
 
-                let hash = compute_hash(&event_id, &data, &prev_hash);
+                let hash = compute_hash_v2(&event_id, next_seq, &data, &prev_hash);
 
                 conn.execute(
                     "INSERT INTO events (event_id, stream_id, sequence, timestamp, kind_tag, data, correlation_id, causation_id, source, prev_hash, hash)
@@ -137,6 +135,19 @@ impl EventStore for SqliteEventStore {
                         prev_hash,
                         hash,
                     ],
+                )
+                .map_err(|e| EventStoreError::Connection(e.to_string()))?;
+
+                // Advance the stream head in the same transaction. verify uses
+                // this to detect tail-truncation and whole-stream deletion
+                // (ADR-0040): the events rows and the head then disagree.
+                conn.execute(
+                    "INSERT INTO stream_heads (stream_id, last_sequence, last_hash)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(stream_id) DO UPDATE SET
+                         last_sequence = excluded.last_sequence,
+                         last_hash = excluded.last_hash",
+                    rusqlite::params![stream_id, next_seq, hash],
                 )
                 .map_err(|e| EventStoreError::Connection(e.to_string()))?;
 
@@ -312,7 +323,7 @@ impl EventStore for SqliteEventStore {
             let conn = conn.blocking_lock();
             let mut stmt = conn
                 .prepare(
-                    "SELECT event_id, data, prev_hash, hash FROM events
+                    "SELECT event_id, sequence, data, prev_hash, hash FROM events
                      WHERE stream_id = ?1 ORDER BY sequence ASC",
                 )
                 .map_err(|e| EventStoreError::Connection(e.to_string()))?;
@@ -321,18 +332,21 @@ impl EventStore for SqliteEventStore {
                 .query_map([&stream_id], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
+                        row.get::<_, u64>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
                     ))
                 })
                 .map_err(|e| EventStoreError::Connection(e.to_string()))?;
 
             let mut expected_prev_hash = String::new();
             let mut result = ChainVerification::default();
+            let mut last_seq: u64 = 0;
+            let mut last_hash = String::new();
 
             for row in rows {
-                let (event_id, data, prev_hash, stored_hash) =
+                let (event_id, sequence, data, prev_hash, stored_hash) =
                     row.map_err(|e| EventStoreError::Connection(e.to_string()))?;
 
                 // Legacy rows predate the hash chain: they carry the migration
@@ -340,10 +354,12 @@ impl EventStore for SqliteEventStore {
                 // (ADR-0035) rather than reporting the whole stream as broken.
                 // Such a row also leaves the expectation unchanged (empty), so
                 // the first genuinely-hashed event chains from a clean root.
-                if stored_hash.is_empty() {
+                let Some(computed) =
+                    recompute_hash(&event_id, sequence, &data, &prev_hash, &stored_hash)
+                else {
                     result.legacy += 1;
                     continue;
-                }
+                };
 
                 if prev_hash != expected_prev_hash {
                     return Err(EventStoreError::Connection(format!(
@@ -352,7 +368,6 @@ impl EventStore for SqliteEventStore {
                     )));
                 }
 
-                let computed = compute_hash(&event_id, &data, &prev_hash);
                 if computed != stored_hash {
                     return Err(EventStoreError::Connection(format!(
                         "Hash chain broken at event {event_id}: hash mismatch \
@@ -360,8 +375,38 @@ impl EventStore for SqliteEventStore {
                     )));
                 }
 
-                expected_prev_hash = stored_hash;
+                expected_prev_hash = stored_hash.clone();
+                last_seq = sequence;
+                last_hash = stored_hash;
                 result.verified += 1;
+            }
+
+            // Truncation / deletion check (ADR-0040): compare the walked tail
+            // against the recorded head. A head ahead of the rows means the
+            // tail — or the whole stream — was removed.
+            let head: Option<(u64, String)> = conn
+                .query_row(
+                    "SELECT last_sequence, last_hash FROM stream_heads WHERE stream_id = ?1",
+                    [&stream_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(|e| EventStoreError::Connection(e.to_string()))?;
+
+            if let Some((head_seq, head_hash)) = head {
+                if result.verified == 0 {
+                    return Err(EventStoreError::Connection(format!(
+                        "Stream truncated: head records sequence {head_seq} but no hashed \
+                         events remain (whole-stream deletion)"
+                    )));
+                }
+                if last_seq != head_seq || last_hash != head_hash {
+                    return Err(EventStoreError::Connection(format!(
+                        "Stream truncated: tail is sequence {last_seq} but head records \
+                         sequence {head_seq} (missing {} event(s))",
+                        head_seq.saturating_sub(last_seq)
+                    )));
+                }
             }
 
             Ok(result)
@@ -390,6 +435,26 @@ impl EventStore for SqliteEventStore {
                 streams.push(row.map_err(|e| EventStoreError::Connection(e.to_string()))?);
             }
             Ok(streams)
+        })
+        .await
+        .map_err(|e| EventStoreError::Connection(e.to_string()))?
+    }
+
+    async fn head_stream_ids(&self) -> Result<Vec<String>, EventStoreError> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare("SELECT stream_id FROM stream_heads ORDER BY stream_id")
+                .map_err(|e| EventStoreError::Connection(e.to_string()))?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| EventStoreError::Connection(e.to_string()))?;
+            let mut ids = Vec::new();
+            for row in rows {
+                ids.push(row.map_err(|e| EventStoreError::Connection(e.to_string()))?);
+            }
+            Ok(ids)
         })
         .await
         .map_err(|e| EventStoreError::Connection(e.to_string()))?
@@ -877,6 +942,83 @@ mod tests {
         let mixed = store.verify_chain("mixed").await.unwrap();
         assert_eq!(mixed.legacy, 1);
         assert_eq!(mixed.verified, 1);
+    }
+
+    #[tokio::test]
+    async fn hash_chain_detects_tail_truncation() {
+        let (_dir, store) = setup().await;
+        for i in 0..3 {
+            let mut e = make_event(
+                "s1",
+                EventKind::ResponseReady {
+                    conversation_id: "s1".into(),
+                    content: format!("m{i}"),
+                },
+            );
+            store.append(&mut e).await.unwrap();
+        }
+        // Intact: verifies.
+        assert_eq!(store.verify_chain("s1").await.unwrap().verified, 3);
+
+        // Delete the last event but leave the head recording sequence 3.
+        {
+            let conn = store.conn.lock().await;
+            conn.execute("DELETE FROM events WHERE stream_id='s1' AND sequence=3", [])
+                .unwrap();
+        }
+        let err = store.verify_chain("s1").await.unwrap_err().to_string();
+        assert!(err.contains("truncated"), "expected truncation error: {err}");
+    }
+
+    #[tokio::test]
+    async fn hash_chain_detects_whole_stream_deletion() {
+        let (_dir, store) = setup().await;
+        let mut e = make_event(
+            "gone",
+            EventKind::ResponseReady {
+                conversation_id: "gone".into(),
+                content: "x".into(),
+            },
+        );
+        store.append(&mut e).await.unwrap();
+
+        {
+            let conn = store.conn.lock().await;
+            conn.execute("DELETE FROM events WHERE stream_id='gone'", []).unwrap();
+        }
+        // list_streams no longer sees it, but the head remains.
+        assert!(store.head_stream_ids().await.unwrap().contains(&"gone".to_string()));
+        let err = store.verify_chain("gone").await.unwrap_err().to_string();
+        assert!(
+            err.contains("whole-stream deletion"),
+            "expected deletion error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hash_chain_verifies_v1_rows() {
+        use super::super::event_store::compute_hash_v1;
+        // A row written by 0.7.x: bare-hex v1 hash, no version prefix, with a
+        // matching head. It must still verify under the v2-aware verifier.
+        let (_dir, store) = setup().await;
+        let v1 = compute_hash_v1("v1-evt", "{}", "");
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "INSERT INTO events (event_id, stream_id, sequence, timestamp, kind_tag, data, source, prev_hash, hash)
+                 VALUES ('v1-evt', 'old', 1, '2026-01-01T00:00:00Z', 'ResponseReady', '{}', 'engine', '', ?1)",
+                [&v1],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO stream_heads (stream_id, last_sequence, last_hash) VALUES ('old', 1, ?1)",
+                [&v1],
+            )
+            .unwrap();
+        }
+        let r = store.verify_chain("old").await.unwrap();
+        assert_eq!(r.verified, 1);
+        assert_eq!(r.legacy, 0);
     }
 
     #[tokio::test]
