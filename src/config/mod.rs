@@ -27,6 +27,20 @@ pub struct WorkspaceConfig {
     pub tools: HashMap<String, tool::ToolConfig>,
 }
 
+impl WorkspaceConfig {
+    /// True if any loaded pipeline contains an `agent:` step.
+    ///
+    /// Used to decide whether an LLM provider is required at build time
+    /// (ADR-0041): a workspace built entirely from tool steps runs without a
+    /// model, so it needs no `llm:` section.
+    pub fn has_agent_step(&self) -> bool {
+        self.pipelines
+            .values()
+            .flat_map(|p| p.steps.iter())
+            .any(|s| matches!(s.kind, pipeline::PipelineStepKind::Agent { .. }))
+    }
+}
+
 /// Load and validate an entire project directory.
 ///
 /// Expected layout:
@@ -335,5 +349,34 @@ output:
 
         let err = load_project_dir(dir.path()).unwrap_err();
         assert!(matches!(err, ConfigError::Validation { .. }));
+    }
+
+    fn workspace_with_pipeline(pipeline_yaml: &str) -> WorkspaceConfig {
+        let project: ProjectConfig = serde_yml::from_str("name: t").unwrap();
+        let pipeline: PipelineConfig = serde_yml::from_str(pipeline_yaml).unwrap();
+        WorkspaceConfig {
+            project,
+            agents: HashMap::new(),
+            pipelines: HashMap::from([(pipeline.name.clone(), pipeline)]),
+            tools: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn has_agent_step_true_when_any_step_is_agent() {
+        // ADR-0041: an agent step forces an LLM provider at build time.
+        let ws = workspace_with_pipeline(
+            "name: p\nsteps:\n  - id: a\n    agent: writer\n    task: go\n",
+        );
+        assert!(ws.has_agent_step());
+    }
+
+    #[test]
+    fn has_agent_step_false_for_tool_only_workspace() {
+        // ADR-0041: a pure tool DAG runs without a model — no `llm:` needed.
+        let ws = workspace_with_pipeline(
+            "name: p\nsteps:\n  - id: t\n    tool: deploy\n    args: {}\n",
+        );
+        assert!(!ws.has_agent_step());
     }
 }

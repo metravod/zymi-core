@@ -68,7 +68,10 @@ pub struct Runtime {
     project_root: PathBuf,
     store: Arc<dyn EventStore>,
     bus: Arc<EventBus>,
-    provider: Arc<dyn LlmProvider>,
+    /// `None` when the workspace has no `agent:` step and no `llm:` section
+    /// (ADR-0041): a deterministic-only project runs without a provider. An
+    /// agent step in any pipeline forces this to `Some` at build time.
+    provider: Option<Arc<dyn LlmProvider>>,
     contracts: Arc<ContractEngine>,
     orchestrator: Arc<Orchestrator>,
     /// Default approval channel name (ADR-0022). When set, intentions
@@ -130,8 +133,11 @@ impl Runtime {
         &self.bus
     }
 
-    pub fn provider(&self) -> &Arc<dyn LlmProvider> {
-        &self.provider
+    /// The LLM provider, if one was built. `None` for a deterministic-only
+    /// workspace (no `agent:` step, no `llm:` section) — see ADR-0041. Any
+    /// agent step guarantees `Some` via build-time validation.
+    pub fn provider(&self) -> Option<&Arc<dyn LlmProvider>> {
+        self.provider.as_ref()
     }
 
     pub fn contracts(&self) -> &Arc<ContractEngine> {
@@ -581,21 +587,29 @@ impl RuntimeBuilder {
         ));
         let orchestrator = Arc::new(Orchestrator::new(Arc::clone(&contracts), Arc::clone(&bus)));
 
-        // 3. LLM provider. Required: a Runtime that cannot run any pipeline
-        //    is not a useful Runtime, so fail at build time rather than at
-        //    first command dispatch. Tests may inject a mock via
-        //    `with_llm_provider`, in which case `project.llm` is not consulted.
-        let provider: Arc<dyn LlmProvider> = match provider_override {
-            Some(p) => p,
-            None => {
-                let llm_config = workspace.project.llm.as_ref().ok_or(
-                    "no 'llm' section in project.yml — configure a provider to run pipelines",
-                )?;
-                Arc::from(
+        // 3. LLM provider (ADR-0041). Required only when a loaded pipeline has
+        //    an `agent:` step — a deterministic-only workspace (pure tool DAG)
+        //    runs without a model and needs no `llm:` section. When an agent
+        //    step exists we still fail at build time rather than at first
+        //    dispatch, preserving fail-fast. If `llm:` is present it is always
+        //    built (so a misconfiguration surfaces early, even with no agent
+        //    step yet). Tests may inject a mock via `with_llm_provider`.
+        let provider: Option<Arc<dyn LlmProvider>> = match provider_override {
+            Some(p) => Some(p),
+            None => match workspace.project.llm.as_ref() {
+                Some(llm_config) => Some(Arc::from(
                     llm::create_provider(llm_config)
                         .map_err(|e| format!("failed to create LLM provider: {e}"))?,
-                )
-            }
+                )),
+                None => {
+                    if workspace.has_agent_step() {
+                        return Err("no 'llm' section in project.yml — a pipeline has an \
+                             agent step; configure a provider to run it"
+                            .into());
+                    }
+                    None
+                }
+            },
         };
 
         // 4. Tool catalog — built-in tools + declarative tools from
@@ -1304,5 +1318,53 @@ while True:
         assert_eq!(policy.backoff_secs, vec![2, 4, 8]);
         assert_eq!(policy.init_timeout, Duration::from_secs(5));
         assert_eq!(policy.call_timeout, Duration::from_secs(30));
+    }
+}
+
+#[cfg(test)]
+mod provider_gating_tests {
+    use super::*;
+    use crate::config::{PipelineConfig, ProjectConfig, WorkspaceConfig};
+    use std::collections::HashMap;
+
+    fn workspace_with_pipeline(pipeline_yaml: &str) -> WorkspaceConfig {
+        let project: ProjectConfig = serde_yml::from_str("name: t").unwrap();
+        let pipeline: PipelineConfig = serde_yml::from_str(pipeline_yaml).unwrap();
+        WorkspaceConfig {
+            project,
+            agents: HashMap::new(),
+            pipelines: HashMap::from([(pipeline.name.clone(), pipeline)]),
+            tools: HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_only_workspace_builds_without_llm() {
+        // ADR-0041: a deterministic-only workspace (pure tool DAG) needs no
+        // `llm:` section and builds with no provider. `build()` is sync but
+        // constructs a shell pool that needs a Tokio reactor in context.
+        let dir = tempfile::tempdir().unwrap();
+        let ws = workspace_with_pipeline(
+            "name: p\nsteps:\n  - id: t\n    tool: deploy\n    args: {}\n",
+        );
+        let rt = Runtime::builder(ws, dir.path())
+            .build()
+            .expect("tool-only workspace should build with no llm provider");
+        assert!(rt.provider().is_none());
+    }
+
+    #[tokio::test]
+    async fn agent_workspace_without_llm_fails_to_build() {
+        // ADR-0041: an agent step still requires a provider at build time
+        // (fail-fast preserved), with a message that names the cause.
+        let dir = tempfile::tempdir().unwrap();
+        let ws = workspace_with_pipeline(
+            "name: p\nsteps:\n  - id: a\n    agent: writer\n    task: go\n",
+        );
+        let err = Runtime::builder(ws, dir.path())
+            .build()
+            .err()
+            .expect("agent step with no llm must fail at build");
+        assert!(err.contains("agent step"), "unexpected error: {err}");
     }
 }
