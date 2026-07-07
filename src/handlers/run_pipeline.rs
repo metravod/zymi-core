@@ -258,7 +258,10 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
                 }
             }
 
-            let provider = Arc::clone(rt.provider());
+            // `None` only for a deterministic-only workspace (ADR-0041); the
+            // agent arm below unwraps it, and build-time validation guarantees
+            // any workspace with an agent step has a provider.
+            let provider = rt.provider().cloned();
             let orchestrator = Arc::clone(rt.orchestrator());
             let bus = Arc::clone(rt.bus());
             let store = Arc::clone(rt.store());
@@ -294,6 +297,14 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
                             format!("agent '{agent_name}' not found for step '{step_id}'")
                         })?
                         .clone();
+                    // Unreachable for a validly-loaded workspace: an agent step
+                    // forces an LLM provider at build time (ADR-0041). Defensive.
+                    let provider = provider.clone().ok_or_else(|| {
+                        format!(
+                            "step '{step_id}' runs agent '{agent_name}' but no LLM \
+                             provider is configured; add an `llm:` section to project.yml"
+                        )
+                    })?;
                     let task = resolve_task_template(raw_task, &cmd.inputs, &step_outputs);
                     let context = build_step_context(step_id, &step.depends_on, &step_outputs);
                     let context_mode = step

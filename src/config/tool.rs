@@ -46,15 +46,30 @@ pub enum ImplementationConfig {
         body_template: Option<String>,
     },
 
-    /// Shell command. `${args.X}` placeholders in `command_template` are
-    /// resolved at call time. Runs through the persistent
+    /// Shell command. Template resolution happens in two stages:
+    ///
+    /// - **Load time** (when the tool YAML is parsed): `${env.X}`, `${var}`
+    ///   and `${project.name|version}` are substituted, same as any other
+    ///   config field. So `${env.REPO_ROOT}` in a `command_template` works —
+    ///   it just resolves once, at load, not per call.
+    /// - **Call time** (per invocation): only `${args.X}` placeholders are
+    ///   substituted, from the tool's arguments.
+    ///
+    /// **Working directory:** the command runs with cwd = the **project
+    /// root** (the directory containing `project.yml`), so relative paths
+    /// like `./scripts/deploy.sh` resolve against it — no need to pass or
+    /// compute the repo root yourself.
+    ///
+    /// Runs through the persistent
     /// [`ShellSessionPool`](crate::runtime::ShellSessionPool) (same pool
     /// as the built-in `execute_shell_command`).
     ///
     /// **Default `requires_approval: true`** — see ADR-0014 §4.
     #[serde(rename = "shell")]
     Shell {
-        /// Command template with `${args.X}` placeholders.
+        /// Command template. `${args.X}` is resolved per call; `${env.X}`,
+        /// `${var}`, `${project.*}` are resolved once at load time. Runs with
+        /// cwd = project root.
         command_template: String,
         /// Per-command timeout in seconds (default: 30).
         #[serde(default)]
