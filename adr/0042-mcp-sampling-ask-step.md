@@ -1,8 +1,8 @@
-# Ask the calling MCP client's model instead of a second API round-trip
+# Delegate a reasoning step to the calling agent via park/ask/resume
 
 Date: 2026-07-08
 
-Status: Proposed — **on hold pending SEP-2577** (see Addendum 2026-07-08)
+Status: Proposed (supersedes the sampling-based draft below — see History)
 
 ## Context
 
@@ -10,245 +10,205 @@ A zymi pipeline can be exposed as an MCP tool (`zymi mcp serve`, ADR-0033) and
 driven by a host that is *itself* an LLM agent — Claude Code, Claude Desktop,
 etc. When such a pipeline hits an `agent:` step, the runtime builds an
 `LlmProvider` (`src/llm/mod.rs`) and makes an **outbound HTTP call to a model
-provider** — a second, independent model, billed and keyed separately from the
-host that invoked the tool.
+provider** — a second, independently-keyed-and-billed model, even though the
+host that invoked the tool is already a capable model one JSON-RPC frame away.
 
-That is often the right thing: the pipeline author wants a *specific*,
-deterministic model with known parameters, independent of whoever calls the
-tool. But sometimes it is plainly redundant — the caller is already a capable
-model sitting one JSON-RPC frame away. Paying for, keying, and configuring a
-whole `llm:` provider just to ask "summarize this diff" or "does this output
-look right?" — when the thing that called us could answer directly — is the
-odd shape the user flagged: *why reach out over the API when there's already a
-neural net right here?*
+For genuinely deterministic reasoning (a pinned model with known parameters,
+independent of the caller) that is correct. But for the common "the caller
+could just answer this" case — *summarize this diff*, *does this output look
+right?* — configuring, keying, and paying for a whole `llm:` provider is
+redundant when the thing that called us could answer directly. That is the
+odd shape to remove: *why reach out over the API when there's already a neural
+net right here?*
 
-MCP has a purpose-built primitive for exactly this inversion:
-**`sampling/createMessage`** — the server asks the *client* to run a
-completion on the server's behalf. It is the mirror image of the
-`elicitation/create` bridge we already ship (ADR-0033 2b-sync): server→client
-request, correlated by JSON-RPC id, awaited inline. ADR-0023 explicitly parked
-sampling ("out of scope for v1 ... a separate follow-up ADR once we see
-demand"). This is that follow-up.
+### The dead end this ADR walked out of
 
-### What we already have
+The obvious mechanism was MCP's `sampling/createMessage` (server asks the
+client to run a completion on its behalf). Investigation killed it:
 
-Everything the transport needs is built:
+- **SEP-2577 deprecates sampling** in the `2026-07-28` spec RC (advisory-only,
+  functional ≥1 year, but **no replacement** offered). Rationale: low adoption
+  vs. implementation complexity. Building a new, permanent, user-facing step on
+  a just-deprecated primitive with no successor is a bad bet.
+- **Elicitation survives but is not a substitute.** It returns *user-entered
+  form data*, not a model completion — a host answers it by prompting a human.
+- The broader signal: **MCP is going stateless, away from server→client model
+  invocation.** "A model-less server borrows the caller's brain mid-call" is a
+  pattern the whole ecosystem is retreating from; each participant is expected
+  to bring its own model access. Switching to another protocol (A2A, etc.)
+  would hit the same wall — those assume every agent has its own brain too.
 
-- `McpClientLink` (`src/mcp/server/link.rs`) issues server→client requests and
-  awaits the correlated response while the read loop keeps pumping. It already
-  carries a `OnceLock<ClientCaps>` and a `supports_elicitation()` accessor.
-- `ClientCaps` / `parse_client_caps` (`src/mcp/server/protocol.rs`) read the
-  client's advertised capabilities at `initialize`. Adding `sampling` is one
-  field and one `.get("sampling")` probe.
-- `LlmProvider` is an object-safe trait behind `Option<Arc<dyn LlmProvider>>`
-  on the Runtime (ADR-0041), created by a single factory
-  (`llm::create_provider`).
+### The reframe
 
-### The constraint that shapes the whole decision
+The need was mis-stated as "invoke the caller's model." The real need is:
+**the pipeline must pause, ask the caller a question, and resume with the
+caller's answer.** zymi *already does exactly this* for approvals (ADR-0022):
+the orchestrator publishes `ApprovalRequested` on the bus, parks, and awaits
+`ApprovalGranted` / `ApprovalDenied` (`src/events/mod.rs:137-163`); a run can
+be resumed from its event stream (ADR-0018, `handlers/resume_pipeline.rs`).
 
-**MCP sampling has no tool-use.** A `sampling/createMessage` message carries
-text / image / audio content only; there is no way for the model to emit a
-`tool_use` block back through the client, and no way for us to feed
-`tool_result` in. Our `agent:` step is a **ReAct loop** — `ChatRequest` ships
-`tools: Vec<ToolDefinition>` and the whole point is that the agent plans tool
-calls (`PipelineStepKind::Agent`, `src/config/pipeline.rs:218`). Those two
-models do not compose. A sampling call can serve a **single-shot,
-tool-less completion**, and nothing more.
+An approval today carries a *decision* (approve/deny). Generalize it to carry
+a *value*: a prompt in, free text out. Route that to the connected agent, and
+the agent's own loop supplies the answer — no model callback, no deprecated
+primitive, no new transport. This is pure request/response tools, the most
+durable part of MCP.
 
-This is the fork in the road, and it is why the naive framing ("make sampling
-just another provider so agent steps use it transparently") is wrong: an agent
-step with a non-empty tool list handed to a sampling provider would have to
-either silently drop the tools (breaking the step's contract) or error at
-first call. Sampling is not a drop-in `LlmProvider`; it is a *different step
-shape*.
+### One mechanism, not two
+
+An earlier framing split "reasoning mid-DAG" from "reasoning at the pipeline
+boundary" and asked whether the boundary case deserved a simpler design. It
+does not. The real discriminator is **whether the answer re-enters zymi**:
+
+- If the answer is recorded in the event store / hash chain, feeds a later
+  step, or drives a branch → the run **must** resume to receive it. A terminal
+  reasoning gate still needs resume purely to *record* the answer. This is the
+  general park/ask/resume mechanism regardless of DAG position.
+- If the answer never re-enters zymi (pure hand-back to the caller) → no resume
+  is needed, but then zymi *does nothing* with the reasoning and the step is
+  outside the audit trail — antithetical to zymi's reason to exist (ADR-0035,
+  ADR-0040). Where that's acceptable, the work arguably shouldn't route through
+  zymi at all.
+
+So there is one feature to build. "Boundary" is just the terminal special case
+of it, not a separate, simpler thing.
 
 ## Decision
 
-Add a dedicated single-shot pipeline step that poses a prompt to the calling
-client's model over `sampling/createMessage`, and captures the text answer as
-the step's output. Call it an **`ask:` step**.
+Add an **`ask:` step**: a pipeline step that parks the run, surfaces a prompt
+to the connected caller as a *reasoning request*, and resumes with the caller's
+text answer as the step output. It is the approval mechanism generalized from
+`decision` to `value`.
 
 ```yaml
 steps:
   - id: summarize
     ask: "Summarize this deploy diff in two sentences:\n${steps.diff.output}"
-    # optional knobs, all with safe defaults:
-    system: "You are a terse release engineer."
-    max_tokens: 512
+    # optional: which channel answers this (defaults to the caller under serve)
+    channel: mcp_reasoning
+  - id: gate
+    tool: shell
+    args: { command: "./ship.sh" }
+    depends_on: [summarize]        # answer re-enters zymi and drives later steps
 ```
 
 Semantics:
 
 1. **`ask:` is a third `PipelineStepKind`** alongside `Agent` and `Tool`,
    mutually exclusive with them at the YAML layer (same detection pattern as
-   `agent:` vs `tool:` in `PipelineStep::deserialize`). It takes a templated
-   prompt string (`${inputs.*}` / `${steps.*.output}` substituted first, like
-   every other step) and optional `system` / `max_tokens` / `temperature`.
-2. **It resolves through the MCP client**, not an HTTP provider. When a step
-   dispatches, the orchestrator issues `sampling/createMessage` via
-   `McpClientLink` and blocks on the response, exactly as the elicitation
-   bridge blocks on `elicitation/create`. The text of the returned message
-   becomes the step output; it flows into downstream `${steps.summarize.output}`
-   like any tool output.
-3. **It is gated on `capabilities.sampling`.** `ClientCaps` gains a `sampling`
-   bool; `McpClientLink` gains `supports_sampling()`. If a pipeline with an
-   `ask:` step is loaded and the connected client did **not** advertise
-   sampling, the step fails with a clear `statusMessage` — same fail-closed
-   posture as an async pipeline hitting an approval with no elicitation-capable
-   client (ADR-0033 §6).
-4. **It requires no `llm:` block.** An `ask:`-only pipeline is model-free from
-   the runtime's point of view — the model lives in the host. This composes
-   cleanly with ADR-0041: `has_agent_step()` stays the trigger for a *required*
-   provider; `ask:` steps do **not** set it. A pure `tool:` + `ask:` pipeline
-   builds with no provider and runs entirely off the caller's model.
-5. **`ask:` only works under `zymi mcp serve`.** There is no client to sample
-   from under `zymi run` / `zymi serve` / cron. A workspace with an `ask:` step
-   loaded outside the MCP-server context fails fast at build with a message
-   pointing the author at `zymi mcp serve` (or at using an `agent:` step with
-   an `llm:` provider instead). We do **not** silently fall back to an HTTP
-   provider — the whole value is *not* reaching for the API, and a hidden
-   fallback would reintroduce the config/keying burden this removes.
+   `agent:` vs `tool:` in `PipelineStep::deserialize`, `src/config/pipeline.rs`).
+   Its body is a templated prompt (`${inputs.*}` / `${steps.*.output}`
+   substituted first, like every step) plus an optional answering `channel`.
+2. **On dispatch it publishes a reasoning request on the bus and parks**,
+   structurally identical to `ApprovalRequested`. A new event pair —
+   `ReasoningRequested { request_id, stream_id, prompt, channel }` and
+   `ReasoningAnswered { request_id, stream_id, answer, answered_by }` —
+   sits beside the approval events. The orchestrator awaits the answer, exactly
+   as it awaits `ApprovalGranted`. The `answer` becomes the step output and
+   flows into downstream `${steps.summarize.output}` like any tool output. It
+   is recorded in the event stream, so it is inside the audit trail and the
+   hash chain by construction.
+3. **Under `zymi mcp serve` the answering channel is the connected agent.**
+   The pipeline is invoked as a task; when it parks on a reasoning request, the
+   `tools/call` returns an outcome the calling agent can act on
+   (`{ status: needs_reasoning, prompt, resume_token }`), and the agent — mid
+   its own loop — reasons and calls a `resume` tool with the answer. This reuses
+   the async task + resume surface (ADR-0033 2a, ADR-0018); it is plain
+   stateless request/response, no `sampling`, no `elicitation`. A `ReasoningChannel`
+   bridges the bus request to this task/resume flow, mirroring how
+   `McpElicitationApprovalChannel` bridges an approval to `elicitation/create`
+   (`src/mcp/server/elicitation.rs`), but answering from the caller's *model*
+   rather than a human form.
+4. **Outside `serve`, `ask:` uses a configured reasoning channel or fails
+   closed.** Like approvals, an `ask:` step routes to a named `channel`. With no
+   channel able to answer (e.g. a headless `zymi run` with none configured), the
+   step fails closed with a clear message — the same posture as an approval with
+   no channel (fail-closed, ADR-0022). No silent fallback to an HTTP provider:
+   the whole point is *not* reaching for the API.
+5. **It requires no `llm:` block.** An `ask:`-only pipeline is model-free from
+   the runtime's view — reasoning lives in whoever answers the channel. Composes
+   with ADR-0041: `has_agent_step()` stays the trigger for a *required* provider;
+   `ask:` steps do **not** set it. A pure `tool:` + `ask:` pipeline builds with
+   no provider.
 
-### Why a new step kind, not a `provider: mcp_sampling`
+### Why park/ask/resume, not a sampling provider or a boundary hand-back
 
-Rejected: expressing this as `llm: { provider: mcp_sampling }` so existing
-`agent:` steps route to the client transparently.
-
-- **Tool-use mismatch (the killer).** As above, sampling can't serve a ReAct
-  loop. A sampling-backed `LlmProvider` would have to reject any `ChatRequest`
-  with a non-empty `tools` list — i.e. reject the exact thing `agent:` steps
-  are for. The provider abstraction would be a lie.
-- **Wrong lifetime.** `LlmProvider` is built at `Runtime::build`, but the
-  `McpClientLink` is created *after* `build_async()` returns
-  (`src/cli/mcp.rs:120-128`) and its `ClientCaps` are only known after the
-  client's `initialize`. A provider that depends on a not-yet-existing link is
-  an ordering hazard. A step kind resolved at *dispatch* time sidesteps it —
-  the link is live by the time any `tools/call` runs.
-- **Honest surface.** `ask:` names what it is — "pose a question to whoever
-  called you" — and reads differently from `agent:` (a tool-using worker) on
-  purpose. Authors should see the two as distinct, because they are: one is
-  deterministic-and-tool-capable against a pinned model, the other is
-  cheap-and-tool-less against the caller's model.
-
-### Deferred: sampling as a fallback provider for tool-less agent steps
-
-An `agent:` step whose agent happens to have an empty tool list is,
-functionally, a single-shot completion and *could* be served by sampling. We
-deliberately do **not** special-case that here — it couples two independent
-concepts (agent identity/context policy vs. transport) and invites the
-"silently drop tools" trap the moment someone adds a tool to that agent. If
-demand appears, it is a clean follow-up: detect tool-less agent steps and,
-under `serve` with a sampling-capable client, offer sampling as an opt-in
-resolution. Out of scope now.
+- **vs. sampling (`provider: mcp_sampling` or a sampling-backed `ask:`):**
+  deprecated by SEP-2577 with no successor; against MCP's stateless direction;
+  requires a sampling-capable host; and MCP sampling has no tool-use anyway, so
+  it could never back a tool-using agent step. Rejected outright — not even as a
+  time-boxed bridge, because it would need self-deprecation within a year.
+- **vs. a separate "boundary hand-back" feature:** not a distinct design. Either
+  the answer re-enters zymi (then it needs resume — this mechanism) or it does
+  not (then it is outside the audit trail and arguably not zymi's job). Building
+  a second, "simpler" path would duplicate the parking machinery for a case that
+  either collapses into this one or shouldn't exist.
+- **vs. keeping only `agent:` + HTTP `llm:`:** that stays available and is the
+  right tool when a pinned, reproducible model matters. `ask:` is the complement
+  for "let whoever called me reason," not a replacement.
 
 ## Consequences
 
 - **Pros:**
   - Removes the redundant second model hop and its `llm:` block / API key for
-    the common "the caller can just answer this" case. Matches the deploy/ops
-    and MCP-tool story: a pipeline exposed to Claude Code can lean on Claude
-    Code's model with zero provider config.
-  - Reuses the entire 2b-sync side-channel (`McpClientLink`, capability
-    gating, inline await). No new transport, no new bidirectional machinery.
-  - Composes with ADR-0041: `ask:`-only pipelines stay model-free; the
-    `has_agent_step()` fail-fast contract is untouched.
-  - Capability-gated and fail-closed — an `ask:` step against a
-    non-sampling client fails loudly, never silently degrades.
+    the "the caller can just answer this" case, using the model already on the
+    other end of the connection.
+  - **No deprecated primitives.** Pure stateless tools + park/resume — aligned
+    with where MCP is investing, not what it is sunsetting. Survives a protocol
+    change because it stands on request/response tools, not a special channel.
+  - **Works mid-DAG.** A real pause/resume, so a reasoning answer can feed later
+    deterministic steps and branches — not just the pipeline boundary.
+  - **Fully audited.** The prompt and answer are events in the stream and the
+    hash chain, unlike a transparent model callback whose I/O would bypass the
+    log.
+  - **Host-agnostic.** Any caller that runs a tool loop can answer; no
+    `capabilities.sampling` requirement.
+  - Reuses ADR-0022 approval parking, ADR-0018 resume, and ADR-0033 2a tasks —
+    little genuinely new machinery.
 - **Cons / limitations:**
-  - **Determinism drops.** The pipeline no longer controls which model answers
-    or how it's parameterized — MCP sampling lets the server only *hint*
-    (`modelPreferences`, `systemPrompt`, `temperature`), and the host may
-    ignore hints, substitute a model, or gate on human approval. `ask:` steps
-    are therefore unsuitable where a pinned, reproducible model matters; those
-    keep using `agent:` + `llm:`. This trade-off must be documented at the
-    step, not buried.
-  - **No tool-use, by construction.** `ask:` is single-shot text-in/text-out.
-    Anything needing the agent to *act* stays an `agent:` step.
-  - **`serve`-only.** An `ask:` step is meaningless without a connected client;
-    the build-time guard prevents accidental use in headless runs but does mean
-    a pipeline mixing `ask:` and headless execution can't exist. Acceptable —
-    they're genuinely different execution contexts.
-  - **New surface area in the hot path.** A third step kind touches the
-    deserializer, DAG validation, the orchestrator dispatch match, and the
-    observability/graph renderers that pattern-match on step kind. All are
-    finite, enumerated `match`es today, so the compiler flags every site.
+  - **Multi-turn.** The caller must be an agent that loops and can call a resume
+    tool (Claude Code can). A non-agentic MCP client can't answer an `ask:` step
+    — but neither would sampling have helped there.
+  - **Determinism moves to the caller.** Which model answers, and how well, is
+    the caller's business. Where reproducibility matters, use `agent:` + `llm:`.
+    Documented at the step, not buried.
+  - **New step kind + event pair** touch the deserializer, DAG validation, the
+    orchestrator dispatch match, the resume path, and the observability/graph
+    renderers. All are enumerated `match`es, so the compiler flags every site.
+  - **Resume-token surface.** Exposing park/resume to the caller widens the MCP
+    tool surface (a `resume`-style call) and its idempotency/security story
+    (ADR-0018 already covers idempotent resume; reuse it).
 
 ## Implementation notes
 
-- **Protocol:** add `sampling: bool` to `ClientCaps`; probe
-  `capabilities.sampling` in `parse_client_caps`
-  (`src/mcp/server/protocol.rs`). Add `supports_sampling()` to `McpClientLink`.
-- **Config:** add `PipelineStepKind::Ask { prompt, system, max_tokens,
-  temperature }` and the matching optional fields to `PipelineStepRaw`; extend
-  the `(has_agent, has_tool, has_ask)` mutual-exclusion check in
-  `PipelineStep::deserialize` (`src/config/pipeline.rs`). `ask:` must **not**
-  count toward `WorkspaceConfig::has_agent_step()` (ADR-0041).
-- **Sampling call:** a small helper that builds `sampling/createMessage`
-  params (`messages: [{ role: "user", content: { type: "text", text } }]`,
-  optional `systemPrompt`, `maxTokens`, `temperature`) and maps the result's
-  `content.text` to a step output string. Errors (`link closed`, client
-  `error`, non-text content) surface as a failed step with a clear message.
-- **Dispatch wiring:** the orchestrator needs the `McpClientLink` to resolve an
-  `ask:` step, but the link is `serve`-specific. Thread an optional
-  sampling resolver into the runtime (mirroring how the elicitation approval
-  channel is handed the link in `src/cli/mcp.rs`), `None` outside `serve`; an
-  `ask:` dispatch with `None` resolver is the build-guarded-unreachable
-  internal error.
-- **Build guard:** at `Runtime::build`, if the workspace has an `ask:` step and
-  no sampling resolver was injected, fail with a message pointing at
-  `zymi mcp serve`. Parallels the ADR-0041 agent-step provider guard.
+- **Events:** add `ReasoningRequested` / `ReasoningAnswered` beside the approval
+  variants in `EventKind` (`src/events/mod.rs`); wire their `kind_str` arms and
+  any store/observability matches the compiler surfaces.
+- **Config:** add `PipelineStepKind::Ask { prompt, channel }` and matching raw
+  fields; extend the `(has_agent, has_tool, has_ask)` mutual-exclusion check in
+  `PipelineStep::deserialize`. `ask:` must **not** count toward
+  `WorkspaceConfig::has_agent_step()` (ADR-0041).
+- **Orchestrator:** on an `ask:` step, publish `ReasoningRequested`, park, and
+  await `ReasoningAnswered` — the same await pattern the approval path uses;
+  record the answer as the step output.
+- **Channel:** a `ReasoningChannel` trait sibling to `ApprovalChannel`. Under
+  `serve`, its MCP implementation surfaces the parked request as a task outcome
+  (`needs_reasoning` + resume token) and maps the caller's `resume` call to a
+  `ReasoningAnswered` publish — mirroring `McpElicitationApprovalChannel` wiring
+  in `src/cli/mcp.rs`.
+- **Resume:** reuse `handlers/resume_pipeline.rs` (ADR-0018) for the answer path
+  and its idempotency guarantees; the reasoning answer is the resume input.
 - **Tests:** (1) `ask:` + `tool:` mutual exclusion rejected at parse;
   (2) an `ask:`-only workspace builds with no `llm:` provider;
-  (3) under a mock link advertising sampling, an `ask:` step round-trips a
-  `sampling/createMessage` and captures the reply as output;
-  (4) a sampling-incapable client fails the step closed;
-  (5) an `ask:` workspace built without a resolver fails at build.
+  (3) a parked `ask:` step resumes with a supplied answer and exposes it as
+  `${steps.X.output}` to a downstream step (mid-DAG);
+  (4) prompt and answer appear in the event stream / hash chain;
+  (5) an `ask:` step with no answering channel fails closed.
 
-## Addendum 2026-07-08 — SEP-2577 deprecates the primitive this ADR rests on
+## History
 
-Before implementation, a check of the MCP spec direction turned up
-**SEP-2577 (*Deprecate Roots, Sampling, and Logging*)**, landing in the
-`2026-07-28` spec release candidate. It changes the ground under this ADR:
-
-- **`sampling/createMessage` is deprecated.** Stated rationale: *low adoption
-  relative to implementation complexity* (human-in-the-loop, model selection,
-  security). This is the exact primitive the `ask:` step is built on.
-- **Advisory-only, not removed.** No wire-level change; sampling keeps working
-  in this release and is guaranteed functional in every spec version published
-  **within one year** of `2026-07-28`. So a build today has a real but
-  time-boxed runway.
-- **No replacement is offered.** The SEP recommends nothing in sampling's
-  place; the broader signal is MCP moving *stateless*, away from server→client
-  model invocation.
-- **Elicitation is explicitly NOT deprecated.** The bidirectional side-channel
-  (`McpClientLink`, ADR-0033 2b-sync) survives — but only for
-  `elicitation/create`, which returns *user-entered form data*, **not a model
-  completion**. It is therefore **not** a drop-in substitute for `ask:`: a host
-  answers an elicitation by prompting a human, not by running its model.
-
-### Implication
-
-Shipping `ask:` as a first-class, permanent step kind on a primitive the spec
-has just deprecated with no successor is a poor bet: the feature would be
-"dead on arrival" per the spec's stated direction, would need self-deprecation
-inside a year, and can't be salvaged by pivoting to elicitation. The `1-year
-functional` guarantee makes a *time-boxed* build defensible, but not a
-load-bearing one.
-
-### Options on the table (decision deferred to maintainer)
-
-1. **Reject.** Do not build server→client model invocation into zymi; follow
-   MCP's stateless direction. Closes this ADR as `Rejected`.
-2. **Accept with an exit plan.** Ship `ask:` anyway, clearly marked
-   experimental, gated on the (deprecated) `capabilities.sampling`, with a
-   documented removal trigger tied to the one-year window. Status → `Accepted
-   (time-boxed / experimental)`.
-3. **Pivot off the callback entirely.** Keep the *goal* ("let the calling
-   agent's model do the cheap reasoning") but drop `sampling/createMessage`.
-   Instead, structure the pipeline's **tool result** so the calling agent —
-   already mid-loop — does the completion itself at the tool boundary. This is
-   stateless-friendly and depends on no deprecated primitive, but only works at
-   pipeline entry/exit, not mid-DAG, and cedes control flow to the caller. Would
-   supersede this ADR with a new one.
-
-Until this is decided, Status stays **on hold** and no implementation lands.
+- **2026-07-08 (v1, withdrawn):** first draft proposed `ask:` backed by MCP
+  `sampling/createMessage`. Withdrawn on discovering SEP-2577 deprecates
+  sampling with no replacement, and on the reframe that the requirement is
+  park/ask/resume (which zymi already has for approvals), not a model callback.
+  The sampling approach — including as a time-boxed experimental bridge — is
+  rejected. This document is the replacement design.
