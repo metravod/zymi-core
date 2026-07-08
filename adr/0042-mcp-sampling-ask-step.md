@@ -2,7 +2,7 @@
 
 Date: 2026-07-08
 
-Status: Proposed
+Status: Proposed — **on hold pending SEP-2577** (see Addendum 2026-07-08)
 
 ## Context
 
@@ -203,3 +203,52 @@ resolution. Out of scope now.
   `sampling/createMessage` and captures the reply as output;
   (4) a sampling-incapable client fails the step closed;
   (5) an `ask:` workspace built without a resolver fails at build.
+
+## Addendum 2026-07-08 — SEP-2577 deprecates the primitive this ADR rests on
+
+Before implementation, a check of the MCP spec direction turned up
+**SEP-2577 (*Deprecate Roots, Sampling, and Logging*)**, landing in the
+`2026-07-28` spec release candidate. It changes the ground under this ADR:
+
+- **`sampling/createMessage` is deprecated.** Stated rationale: *low adoption
+  relative to implementation complexity* (human-in-the-loop, model selection,
+  security). This is the exact primitive the `ask:` step is built on.
+- **Advisory-only, not removed.** No wire-level change; sampling keeps working
+  in this release and is guaranteed functional in every spec version published
+  **within one year** of `2026-07-28`. So a build today has a real but
+  time-boxed runway.
+- **No replacement is offered.** The SEP recommends nothing in sampling's
+  place; the broader signal is MCP moving *stateless*, away from server→client
+  model invocation.
+- **Elicitation is explicitly NOT deprecated.** The bidirectional side-channel
+  (`McpClientLink`, ADR-0033 2b-sync) survives — but only for
+  `elicitation/create`, which returns *user-entered form data*, **not a model
+  completion**. It is therefore **not** a drop-in substitute for `ask:`: a host
+  answers an elicitation by prompting a human, not by running its model.
+
+### Implication
+
+Shipping `ask:` as a first-class, permanent step kind on a primitive the spec
+has just deprecated with no successor is a poor bet: the feature would be
+"dead on arrival" per the spec's stated direction, would need self-deprecation
+inside a year, and can't be salvaged by pivoting to elicitation. The `1-year
+functional` guarantee makes a *time-boxed* build defensible, but not a
+load-bearing one.
+
+### Options on the table (decision deferred to maintainer)
+
+1. **Reject.** Do not build server→client model invocation into zymi; follow
+   MCP's stateless direction. Closes this ADR as `Rejected`.
+2. **Accept with an exit plan.** Ship `ask:` anyway, clearly marked
+   experimental, gated on the (deprecated) `capabilities.sampling`, with a
+   documented removal trigger tied to the one-year window. Status → `Accepted
+   (time-boxed / experimental)`.
+3. **Pivot off the callback entirely.** Keep the *goal* ("let the calling
+   agent's model do the cheap reasoning") but drop `sampling/createMessage`.
+   Instead, structure the pipeline's **tool result** so the calling agent —
+   already mid-loop — does the completion itself at the tool boundary. This is
+   stateless-friendly and depends on no deprecated primitive, but only works at
+   pipeline entry/exit, not mid-DAG, and cedes control flow to the caller. Would
+   supersede this ADR with a new one.
+
+Until this is decided, Status stays **on hold** and no implementation lands.
