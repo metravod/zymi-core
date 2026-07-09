@@ -23,6 +23,7 @@ pub mod handlers;
 pub mod link;
 pub mod observability;
 pub mod protocol;
+pub mod reasoning;
 pub mod tasks;
 
 use handlers::{
@@ -156,6 +157,19 @@ where
     let filter = Arc::new(PipelineFilter::from_config(&config)?);
     let store = Arc::new(TaskStore::new());
 
+    // ADR-0042: bridge parked `ask:` steps to the caller via the task/resume
+    // surface. The channel flips the owning task to InputRequired; the
+    // `zymi/reasoning/resume` method (verified with `signer`) supplies the
+    // answer. The runtime routes `ask:` steps to CHANNEL_NAME (set in the
+    // serve entrypoint via `with_reasoning_channel`).
+    let signer = Arc::new(reasoning::ResumeTokenSigner::random());
+    let reasoning_handle = {
+        use crate::reasoning::ReasoningChannel;
+        let channel =
+            reasoning::McpTaskReasoningChannel::new(Arc::clone(&store), Arc::clone(&signer));
+        channel.start(Arc::clone(runtime.bus())).await?
+    };
+
     // The writer task owns the wire; everyone emits frames via the mpsc.
     let writer_task = tokio::spawn(writer_loop(writer, outbound_rx));
 
@@ -174,12 +188,22 @@ where
             continue;
         }
 
-        dispatch_inbound(&runtime, &filter, &store, &link, &observability, &outbound, trimmed);
+        dispatch_inbound(
+            &runtime,
+            &filter,
+            &store,
+            &signer,
+            &link,
+            &observability,
+            &outbound,
+            trimmed,
+        );
     };
 
     // Client gone: stop writing. Any in-flight response was already flushed
     // (the client reads each before sending the next or closing).
     writer_task.abort();
+    reasoning_handle.abort_all();
     result
 }
 
@@ -208,6 +232,7 @@ fn dispatch_inbound(
     runtime: &Arc<Runtime>,
     filter: &Arc<PipelineFilter>,
     store: &Arc<TaskStore>,
+    signer: &Arc<reasoning::ResumeTokenSigner>,
     link: &Arc<McpClientLink>,
     observability: &SharedObservability,
     outbound: &tokio::sync::mpsc::UnboundedSender<Outbound>,
@@ -286,6 +311,7 @@ fn dispatch_inbound(
     let runtime = Arc::clone(runtime);
     let filter = Arc::clone(filter);
     let store = Arc::clone(store);
+    let signer = Arc::clone(signer);
     let link = Arc::clone(link);
     let observability = observability.clone();
     let outbound = outbound.clone();
@@ -294,6 +320,7 @@ fn dispatch_inbound(
             &runtime,
             &filter,
             &store,
+            &signer,
             &link,
             &observability,
             &request,
@@ -331,10 +358,12 @@ async fn handle_notification(store: &Arc<TaskStore>, request: &RpcRequest) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_method(
     runtime: &Arc<Runtime>,
     filter: &Arc<PipelineFilter>,
     store: &Arc<TaskStore>,
+    signer: &Arc<reasoning::ResumeTokenSigner>,
     link: &Arc<McpClientLink>,
     observability: &SharedObservability,
     request: &RpcRequest,
@@ -384,6 +413,12 @@ async fn handle_method(
         "tasks/cancel" => handle_tasks_cancel(store, require_params()?)
             .await
             .map(MethodOutcome::just),
+        // ADR-0042: the caller answers a parked `ask:` step.
+        "zymi/reasoning/resume" => {
+            handlers::handle_reasoning_resume(runtime, store, signer, require_params()?)
+                .await
+                .map(MethodOutcome::just)
+        }
         // `ping` is part of every MCP spec rev; handle as no-op {} for
         // keepalive purposes. Cheap and harmless.
         "ping" => Ok(MethodOutcome::just(serde_json::json!({}))),

@@ -1,6 +1,6 @@
 # Pipelines
 
-A pipeline is a DAG of steps. Each step is either an **agent step** (LLM ReAct loop) or a **deterministic tool step** (direct tool dispatch with templated args, no LLM). Steps wait for their `depends_on` to complete; independent steps run in parallel.
+A pipeline is a DAG of steps. Each step is an **agent step** (LLM ReAct loop), a **deterministic tool step** (direct tool dispatch with templated args, no LLM), or an **ask step** (delegate a reasoning question to whoever called the pipeline — ADR-0042). Steps wait for their `depends_on` to complete; independent steps run in parallel.
 
 ## Overview
 
@@ -30,6 +30,11 @@ steps:                      # required. One or more steps.
       city: "${inputs.topic}"   # ${…} substitution only — no Jinja filters here
     depends_on: [research]
 
+  - id: sanity              # ask step (ADR-0042): the caller answers this.
+    ask: "Does this look right?\n${steps.research.output}"
+    channel: mcp_reasoning  # optional; defaults to the connected caller / terminal
+    depends_on: [research]
+
   - id: write_up
     agent: writer
     task: |
@@ -47,7 +52,7 @@ approval_channel: ops_tg    # optional. Per-pipeline override of project's
 
 ## Step kinds
 
-A step is **either** an agent step or a tool step — declaring both keys (`agent:` and `tool:`) at once is rejected at parse time, as is declaring neither.
+A step is **exactly one** of an agent step, a tool step, or an ask step — declaring more than one of `agent:` / `tool:` / `ask:` is rejected at parse time, as is declaring none.
 
 ### Agent step
 
@@ -79,6 +84,25 @@ The agent runs its ReAct loop bounded by its `max_iterations`. The step's `outpu
 Tool steps dispatch via the same catalogue agents use (declarative / Python / MCP). They emit the same `WorkflowNodeStarted/Completed` + `ToolCallRequested/Completed` events, so they show up in `zymi observe` and `zymi events` indistinguishably from agent-driven calls.
 
 Templated args resolve `${inputs.*}`, `${steps.<id>.output}`, and `${env.*}` on string leaves; the resolved value is then converted to JSON for catalog dispatch.
+
+### Ask step ([ADR-0042](../adr/0042-mcp-sampling-ask-step.md))
+
+```yaml
+- id: summarize
+  ask: "Summarize this deploy diff in two sentences:\n${steps.diff.output}"
+  channel: mcp_reasoning    # optional. Which channel answers; defaults to the
+                            # connected caller under serve, else "terminal".
+  depends_on: [diff]
+```
+
+An **ask step delegates a reasoning question to whoever called the pipeline** instead of reaching for an `llm:` provider. The run **parks**, surfaces the (templated) prompt as a *reasoning request*, and resumes with the answer as the step's `output` — the approval mechanism (ADR-0022) generalized from a *decision* to a *value*. Use it for "the caller can just answer this" work (*summarize this*, *does this look right?*) when the thing that invoked the pipeline is already a capable model.
+
+- **No `llm:` required.** An `ask:` step does **not** count toward the "needs a provider" check (ADR-0041), so a pure tool + ask pipeline builds with no model configured.
+- **Who answers, by context:**
+  - Under **`zymi mcp serve`** — the connected agent. The parked step surfaces on the task as `input_required` with `{ status: needs_reasoning, prompt, resume_token }`; the caller reasons and calls `zymi/reasoning/resume { resume_token, answer }`. See [ADR-0033](../adr/0033-mcp-server-pipelines-as-tools.md) and [ADR-0042](../adr/0042-mcp-sampling-ask-step.md).
+  - Under **`zymi run` / `zymi resume`** — a human at the terminal (the zero-config reasoning channel), or any configured reasoning channel.
+- **Fails closed.** No channel able to answer, or the caller never answers within the timeout → the step fails closed with a clear message (never a silent fallback to an HTTP model). The prompt and answer are recorded as `ReasoningRequested` / `ReasoningAnswered` events, so a replay reads the recorded answer back and **never re-asks** (byte-identical, ADR-0018/0040).
+- **Security — the answer is untrusted.** An ask answer is model-generated free text over often attacker-influenced context. It becomes an ordinary step output and flows into downstream `${steps.<id>.output}` through the *same* path as any tool output — so the same sink guards apply (shell/HTTP template-escaping, file deny-list). Treat it as data, never trusted step output: don't splice it into a raw `execute_shell_command` any more than you would a tool output.
 
 ## Interpolation
 
@@ -292,5 +316,5 @@ steps:
 
 ## See also
 
-- [Agents](agents.md), [Tools](tools.md), [Events and replay](events-and-replay.md)
-- ADR-0018 (fork-resume), ADR-0024 (deterministic tool steps), ADR-0028 (conditional DAG edges)
+- [Agents](agents.md), [Tools](tools.md), [Approvals](approvals.md), [Events and replay](events-and-replay.md)
+- ADR-0018 (fork-resume), ADR-0024 (deterministic tool steps), ADR-0028 (conditional DAG edges), ADR-0042 (ask steps / reasoning delegation)

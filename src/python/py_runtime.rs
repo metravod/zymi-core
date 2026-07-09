@@ -162,12 +162,40 @@ impl PyRuntime {
                 )));
             }
         }
+        // ADR-0042: `ask:` steps route to the zero-config terminal reasoning
+        // channel, independent of the approval mode.
+        builder = builder.with_reasoning_channel("terminal");
 
         let runtime = builder
             .build()
             .map_err(|e| PyRuntimeError::new_err(format!("failed to build runtime: {e}")))?;
 
         let mut approval_channels: Vec<ChannelHandle> = Vec::new();
+
+        // ADR-0042: spawn the terminal reasoning channel + replay dangling
+        // `ask:` requests. Handles live in the same Vec — Drop aborts all.
+        {
+            use crate::reasoning::ReasoningChannel;
+            let bus = Arc::clone(runtime.bus());
+            let channel = crate::reasoning::TerminalReasoningChannel::new("terminal");
+            let handle = shared_tokio()
+                .block_on(channel.start(Arc::clone(&bus)))
+                .map_err(|e| {
+                    PyRuntimeError::new_err(format!(
+                        "failed to start terminal reasoning channel: {e}"
+                    ))
+                })?;
+            approval_channels.push(handle);
+            if let Err(e) = shared_tokio().block_on(
+                crate::reasoning::replay_unfulfilled_reasoning(
+                    bus,
+                    crate::approval::DEFAULT_APPROVAL_TIMEOUT,
+                ),
+            ) {
+                log::warn!("reasoning replay skipped: {e}");
+            }
+        }
+
         if want_terminal_channel {
             let bus = Arc::clone(runtime.bus());
             let channel = TerminalApprovalChannel::new("terminal");

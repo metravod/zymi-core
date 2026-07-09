@@ -79,9 +79,9 @@ Full setup in [docs/getting-started.md](docs/getting-started.md). Connector deep
 
 ## What's in the box
 
-### Pipelines — DAGs, agent steps, deterministic tool steps
+### Pipelines — DAGs, agent steps, deterministic tool steps, ask steps
 
-A pipeline is a list of steps with `depends_on:` edges. Independent steps run in parallel. Each step is either an **agent step** (LLM ReAct loop) or a **deterministic tool step** ([ADR-0024](adr/0024-deterministic-tool-steps.md)) — direct dispatch with templated args, no LLM hop, but the same event envelope.
+A pipeline is a list of steps with `depends_on:` edges. Independent steps run in parallel. Each step is an **agent step** (LLM ReAct loop), a **deterministic tool step** ([ADR-0024](adr/0024-deterministic-tool-steps.md)) — direct dispatch with templated args, no LLM hop, but the same event envelope — or an **ask step** ([ADR-0042](adr/0042-mcp-sampling-ask-step.md)): delegate a reasoning question to whoever called the pipeline instead of configuring a second, separately-billed model. The run parks, asks the caller, and resumes with the answer (a human at the terminal under `zymi run`; the connected agent under `zymi mcp serve`).
 
 Mix them freely:
 
@@ -95,6 +95,10 @@ steps:
     agent: classifier
     task: "${steps.fetch.output}"
     depends_on: [fetch]
+
+  - id: sanity                           # ask — the caller answers, no llm: needed
+    ask: "Does this classification look right?\n${steps.classify.output}"
+    depends_on: [classify]
 ```
 
 **Conditional branches** ([ADR-0028](adr/0028-conditional-dag-edges.md)) — a step can gate on an upstream output. Skipped branches cascade to descendants and emit `StepSkipped` events, so routing decisions land in the trace, not in the LLM's head:
@@ -161,11 +165,13 @@ zymi mcp serve --include 'research_*' --exclude '*_internal'
 
 **Human approvals render in the calling agent's UI.** A pipeline step that trips an [approval](#approvals--event-sourced-restart-safe) sends a server-initiated `elicitation/create` back through the live `tools/call` — in Claude Code that's a native approve/deny form. Approve and the pipeline continues; deny and it halts with the decision in the audit trail; a client without elicitation support fail-closes (`ApprovalDenied{reason: client_no_elicitation}`). Verified live against Claude Code.
 
+**The pipeline can borrow the caller's brain.** An [`ask:` step](docs/pipelines.md#ask-step-adr-0042) ([ADR-0042](adr/0042-mcp-sampling-ask-step.md)) delegates a reasoning question back to the calling agent instead of configuring a second model. On a task-augmented call the run parks, the task goes `input_required` carrying `{ prompt, resume_token }`, and the caller reasons in its own loop and calls `zymi/reasoning/resume { resume_token, answer }` — no `sampling`, no deprecated primitives, just tools + park/resume. The prompt and answer are recorded, so replay reads the answer back byte-identical. A pure tool + ask pipeline needs no `llm:` at all. Verified live against `zymi mcp serve`.
+
 **The agent can debug its own runs.** `zymi mcp serve --expose-observability` adds four read-only tools — `zymi.runs.list` / `.get` / `.events` / `.step_io` ([ADR-0034](adr/0034-mcp-observability-tools.md)). Ask the agent *"why did the last run fail?"* and it pulls the event trace and answers with the exact policy verdict and approval decision — introspection other stacks can't expose because the per-step event granularity isn't there. Scoped to the serve session by default; `--observability-scope all` opens the whole store for single-user dev.
 
 **Current limitations (honest list):**
 
-- **Async tasks don't pause for approvals.** The interactive approval bridge above is sync-mode; `input_required` + related-task elicitation on a *task-augmented* call waits on host adoption, so an approval inside an async task times out (auto-deny). Sync calls are fully interactive.
+- **Async tasks don't pause for *approvals*.** The interactive approval (elicitation) bridge above is sync-mode; an approval inside a *task-augmented* call waits on host adoption and times out (auto-deny). Note this is specific to approvals — *reasoning delegation* (`ask:` steps, ADR-0042) works precisely *because* it rides the task `input_required` + resume surface, so an `ask:` inside an async task is answered via `zymi/reasoning/resume`. Sync calls are fully interactive for both.
 - **Cancellation is best-effort:** the task is aborted, but pipeline steps already in flight (and their side effects) may run to completion.
 - **Arguments cross the boundary as strings** — pipelines expecting string `inputs:` are fine; richly typed inputs are stringified.
 - Async mode needs a SEP-1686-capable client; `zymi mcp serve` is Unix-only for now (stdio); tasks live for the server process lifetime (no TTL eviction). Hosts may normalise dotted tool names — Claude Code shows `zymi.runs.list` as `zymi_runs_list`.

@@ -156,9 +156,20 @@ See [the canonical telegram scaffold](../src/cli/init.rs) (`zymi init --example 
 - **Terminal channels lock stdin globally.** Don't run two `zymi run` processes against terminal in parallel — the prompts will interleave.
 - **Approvals are emitted to the bus regardless of channel availability.** Removing `requires_approval: true` doesn't mute the trail; downstream observers still see the unapproved call.
 
+## Reasoning delegation — the sibling mechanism (ADR-0042)
+
+The **`ask:` step** is the same park/await machinery generalized from a *decision* (approve/deny) to a *value* (free text in, free text out). Instead of `ApprovalRequested` → `ApprovalGranted`/`Denied`, an `ask:` step publishes `ReasoningRequested` → `ReasoningAnswered`, routed to a **reasoning channel** rather than an approval channel:
+
+- Zero-config **`terminal`** reasoning channel under `zymi run` (a human types the answer).
+- The **connected caller** under `zymi mcp serve` — the parked task goes `input_required` with a `resume_token`, and the caller answers via `zymi/reasoning/resume`.
+- Same fail-closed posture, same restart-replay (a dangling `ReasoningRequested` is sealed on restart, exactly like a dangling approval), same audit trail.
+
+See [Pipelines → Ask step](pipelines.md#ask-step-adr-0042) and ADR-0042. A reasoning answer is **untrusted** (model-generated free text) — it takes the ordinary tool-output guard path before any sink.
+
 ## See also
 
+- [Pipelines](pipelines.md) — the `ask:` step (reasoning delegation)
 - [Tools](tools.md) — `requires_approval:` per-tool override and per-tool defaults
 - [Project YAML](project-yaml.md) — `approvals:` placement
 - [Events and replay](events-and-replay.md) — observing approval decisions
-- ADR-0022 (event-sourced approvals)
+- ADR-0022 (event-sourced approvals), ADR-0042 (ask steps / reasoning delegation)

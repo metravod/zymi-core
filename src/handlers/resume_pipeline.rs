@@ -264,6 +264,8 @@ fn collect_shadowed_tools(
                 .get(agent)
                 .map(|a| a.tools.iter().map(|s| s.as_str()).collect())
                 .unwrap_or_default(),
+            // ADR-0042: an ask step invokes no tools, so nothing to shadow.
+            PipelineStepKind::Ask { .. } => vec![],
         };
         for tool in candidate_tools {
             if is_no_resume(tool) {

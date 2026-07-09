@@ -69,6 +69,9 @@ pub fn exec(root: impl AsRef<Path>) -> Result<(), String> {
                         crate::config::pipeline::PipelineStepKind::Tool { tool, .. } => {
                             format!("tool:{tool}")
                         }
+                        crate::config::pipeline::PipelineStepKind::Ask { channel, .. } => {
+                            format!("ask:{}", channel.as_deref().unwrap_or("caller"))
+                        }
                     };
                     println!(
                         "    {DIM}·{RESET} {} {DIM}({}){RESET}{deps}",

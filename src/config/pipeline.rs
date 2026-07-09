@@ -212,7 +212,7 @@ pub enum StepContextMode {
     Fresh,
 }
 
-/// Step body. The two variants are mutually exclusive at the YAML level.
+/// Step body. The variants are mutually exclusive at the YAML level.
 #[derive(Debug, Clone)]
 pub enum PipelineStepKind {
     /// LLM ReAct step: the agent plans tool calls itself.
@@ -223,22 +223,37 @@ pub enum PipelineStepKind {
         tool: String,
         args: serde_yml::Value,
     },
+    /// Reasoning-delegation step (ADR-0042): parks the run and surfaces the
+    /// templated `prompt` to the connected caller as a *reasoning request*,
+    /// resuming with the caller's text answer as the step output. It is the
+    /// approval mechanism generalized from `decision` to `value`.
+    ///
+    /// Requires no `llm:` provider — an `ask:` step deliberately does **not**
+    /// count toward [`crate::config::WorkspaceConfig::has_agent_step`]
+    /// (ADR-0041): reasoning lives in whoever answers the channel, not in a
+    /// runtime-owned model. `channel` names the answering channel; `None`
+    /// defaults to the connected caller under `zymi mcp serve`.
+    Ask {
+        prompt: String,
+        channel: Option<String>,
+    },
 }
 
 impl PipelineStep {
     /// Convenience for legacy callers / tests that only care about agent
-    /// steps. `None` for tool steps.
+    /// steps. `None` for tool and ask steps.
     pub fn agent_name(&self) -> Option<&str> {
         match &self.kind {
             PipelineStepKind::Agent { agent, .. } => Some(agent.as_str()),
-            PipelineStepKind::Tool { .. } => None,
+            PipelineStepKind::Tool { .. } | PipelineStepKind::Ask { .. } => None,
         }
     }
 }
 
-/// Wire format. Both arms' fields are optional so we can detect ambiguous
-/// (`agent:` + `tool:`) and empty configs ourselves with a clear error
-/// message instead of relying on serde's "did not match any variant" output.
+/// Wire format. Every discriminating field is optional so we can detect
+/// ambiguous (`agent:` + `tool:` + `ask:`) and empty configs ourselves with a
+/// clear error message instead of relying on serde's "did not match any
+/// variant" output.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 struct PipelineStepRaw {
     pub id: String,
@@ -251,6 +266,14 @@ struct PipelineStepRaw {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Option<serde_json::Value>")]
     pub args: Option<serde_yml::Value>,
+    /// `ask:` step body — a templated reasoning prompt (ADR-0042).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ask: Option<String>,
+    /// Optional answering channel for an `ask:` step (ADR-0042). Only
+    /// meaningful alongside `ask:`; defaults to the connected caller under
+    /// `zymi mcp serve`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -265,20 +288,28 @@ impl<'de> Deserialize<'de> for PipelineStep {
         let raw = PipelineStepRaw::deserialize(d)?;
         let has_agent = raw.agent.is_some() || raw.task.is_some();
         let has_tool = raw.tool.is_some() || raw.args.is_some();
-        let kind = match (has_agent, has_tool) {
-            (true, true) => {
+        // `channel:` is a modifier on `ask:`, not a discriminator — an `ask:`
+        // step is detected purely by the `ask:` key so a stray `channel:`
+        // elsewhere falls into the "must specify" error rather than a
+        // confusing "more than one".
+        let has_ask = raw.ask.is_some();
+        let kind = match (has_agent, has_tool, has_ask) {
+            // Any two present → ambiguous.
+            (true, true, _) | (true, _, true) | (_, true, true) => {
                 return Err(D::Error::custom(format!(
-                    "step `{}`: cannot specify both `agent:` and `tool:` (ADR-0024)",
+                    "step `{}`: specify exactly one of `agent:` + `task:`, `tool:`, \
+                     or `ask:` (ADR-0024, ADR-0042)",
                     raw.id
                 )));
             }
-            (false, false) => {
+            (false, false, false) => {
                 return Err(D::Error::custom(format!(
-                    "step `{}`: must specify either `agent:` + `task:` or `tool:` (ADR-0024)",
+                    "step `{}`: must specify one of `agent:` + `task:`, `tool:`, \
+                     or `ask:` (ADR-0024, ADR-0042)",
                     raw.id
                 )));
             }
-            (true, false) => {
+            (true, false, false) => {
                 let agent = raw.agent.ok_or_else(|| {
                     D::Error::custom(format!("step `{}`: `agent:` is required", raw.id))
                 })?;
@@ -290,7 +321,7 @@ impl<'de> Deserialize<'de> for PipelineStep {
                 })?;
                 PipelineStepKind::Agent { agent, task }
             }
-            (false, true) => {
+            (false, true, false) => {
                 let tool = raw.tool.ok_or_else(|| {
                     D::Error::custom(format!(
                         "step `{}`: `tool:` is required for tool steps",
@@ -299,6 +330,15 @@ impl<'de> Deserialize<'de> for PipelineStep {
                 })?;
                 let args = raw.args.unwrap_or(serde_yml::Value::Null);
                 PipelineStepKind::Tool { tool, args }
+            }
+            (false, false, true) => {
+                let prompt = raw.ask.ok_or_else(|| {
+                    D::Error::custom(format!("step `{}`: `ask:` is required", raw.id))
+                })?;
+                PipelineStepKind::Ask {
+                    prompt,
+                    channel: raw.channel,
+                }
             }
         };
         Ok(PipelineStep {
@@ -320,6 +360,8 @@ impl Serialize for PipelineStep {
                 task: Some(task.clone()),
                 tool: None,
                 args: None,
+                ask: None,
+                channel: None,
                 depends_on: self.depends_on.clone(),
                 when: self.when.clone(),
                 context: self.context.clone(),
@@ -330,6 +372,20 @@ impl Serialize for PipelineStep {
                 task: None,
                 tool: Some(tool.clone()),
                 args: Some(args.clone()),
+                ask: None,
+                channel: None,
+                depends_on: self.depends_on.clone(),
+                when: self.when.clone(),
+                context: self.context.clone(),
+            },
+            PipelineStepKind::Ask { prompt, channel } => PipelineStepRaw {
+                id: self.id.clone(),
+                agent: None,
+                task: None,
+                tool: None,
+                args: None,
+                ask: Some(prompt.clone()),
+                channel: channel.clone(),
                 depends_on: self.depends_on.clone(),
                 when: self.when.clone(),
                 context: self.context.clone(),
@@ -541,7 +597,7 @@ steps:
 "#;
         let path = write_file(&dir, "pipeline.yml", yaml);
         let err = load_pipeline(&path, &HashMap::new()).unwrap_err();
-        assert!(matches!(err, ConfigError::Parse { detail, .. } if detail.contains("both")));
+        assert!(matches!(err, ConfigError::Parse { detail, .. } if detail.contains("exactly one")));
     }
 
     #[test]
@@ -555,7 +611,80 @@ steps:
 "#;
         let path = write_file(&dir, "pipeline.yml", yaml);
         let err = load_pipeline(&path, &HashMap::new()).unwrap_err();
-        assert!(matches!(err, ConfigError::Parse { detail, .. } if detail.contains("either")));
+        assert!(matches!(err, ConfigError::Parse { detail, .. } if detail.contains("must specify one")));
+    }
+
+    #[test]
+    fn ask_step_parses() {
+        let dir = TempDir::new().unwrap();
+        let yaml = r#"
+name: reason
+steps:
+  - id: summarize
+    ask: "Summarize this: ${steps.diff.output}"
+"#;
+        let path = write_file(&dir, "pipeline.yml", yaml);
+        let config = load_pipeline(&path, &HashMap::new()).unwrap();
+        match &config.steps[0].kind {
+            PipelineStepKind::Ask { prompt, channel } => {
+                assert!(prompt.contains("${steps.diff.output}"));
+                assert!(channel.is_none());
+            }
+            _ => panic!("expected ask step"),
+        }
+        // An ask step exposes no agent name — it never counts as an agent step.
+        assert_eq!(config.steps[0].agent_name(), None);
+    }
+
+    #[test]
+    fn ask_step_with_channel_parses() {
+        let dir = TempDir::new().unwrap();
+        let yaml = r#"
+name: reason
+steps:
+  - id: summarize
+    ask: "Summarize the deploy"
+    channel: mcp_reasoning
+"#;
+        let path = write_file(&dir, "pipeline.yml", yaml);
+        let config = load_pipeline(&path, &HashMap::new()).unwrap();
+        match &config.steps[0].kind {
+            PipelineStepKind::Ask { channel, .. } => {
+                assert_eq!(channel.as_deref(), Some("mcp_reasoning"));
+            }
+            _ => panic!("expected ask step"),
+        }
+    }
+
+    #[test]
+    fn step_with_ask_and_tool_rejected() {
+        let dir = TempDir::new().unwrap();
+        let yaml = r#"
+name: bad
+steps:
+  - id: s
+    ask: "reason about it"
+    tool: shell
+"#;
+        let path = write_file(&dir, "pipeline.yml", yaml);
+        let err = load_pipeline(&path, &HashMap::new()).unwrap_err();
+        assert!(matches!(err, ConfigError::Parse { detail, .. } if detail.contains("exactly one")));
+    }
+
+    #[test]
+    fn step_with_ask_and_agent_rejected() {
+        let dir = TempDir::new().unwrap();
+        let yaml = r#"
+name: bad
+steps:
+  - id: s
+    ask: "reason"
+    agent: a
+    task: t
+"#;
+        let path = write_file(&dir, "pipeline.yml", yaml);
+        let err = load_pipeline(&path, &HashMap::new()).unwrap_err();
+        assert!(matches!(err, ConfigError::Parse { detail, .. } if detail.contains("exactly one")));
     }
 
     #[test]

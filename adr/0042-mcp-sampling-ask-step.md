@@ -2,7 +2,7 @@
 
 Date: 2026-07-08
 
-Status: Proposed (supersedes the sampling-based draft below — see History)
+Status: Accepted (supersedes the sampling-based draft below — see History)
 
 ## Context
 
@@ -118,9 +118,12 @@ Semantics:
    `McpElicitationApprovalChannel` bridges an approval to `elicitation/create`
    (`src/mcp/server/elicitation.rs`), but answering from the caller's *model*
    rather than a human form. The `resume_token` is **opaque and integrity-
-   protected** (signed/encrypted), carries the parked `request_id` + `stream_id`
-   + an expiry, and is shaped to be a drop-in for SEP-2322 `requestState` (see
-   *Alignment with SEP-2322*).
+   protected** (signed/encrypted), carrying the parked `request_id` +
+   `stream_id` + an expiry. We deliberately do **not** shape it against the
+   unreleased SEP-2322 `requestState` — that spec is a moving target and
+   building to its current draft would be premature. MRTR is tracked as a
+   *future migration*, not a design constraint on v1 (see *Alignment with
+   SEP-2322*).
 4. **A parked `ask:` has a bounded lifetime and fails closed on expiry.**
    Unlike an approval — whose answerer is a human who will come back — an `ask:`
    answerer is an automated caller, so a caller that never resumes (non-agentic,
@@ -209,13 +212,17 @@ opaque `requestState` the client must echo back unmodified, and the re-issued
 `resume` call ≈ retrying the original request with `inputResponses`. Two
 consequences, one good and one to state plainly:
 
-- **Design for a drop-in migration (the good part).** MRTR is the stateless
-  successor MCP is standardizing for server→client interaction, so shape the
-  wire forms now to map 1:1: make `resume_token` opaque + integrity-protected
-  (MRTR *SHOULD*s an encrypted/signed `requestState` — AES-GCM or a signed JWT),
-  never let the caller inspect or mutate it, and key any future multi-request
-  batch identically. Then adopting the standard envelope later is a form change,
-  not a redesign.
+- **Stay migration-friendly without building to the draft (the good part).**
+  MRTR is the stateless successor MCP is standardizing for server→client
+  interaction. We do **not** shape v1's wire forms against its current draft —
+  that RC still moves, and coding to it now would be premature coupling.
+  Instead we keep the token choices that make a *later* migration a form change
+  rather than a redesign, because they are good hygiene regardless of MRTR:
+  `resume_token` opaque + integrity-protected (signed/encrypted — AES-GCM or a
+  signed JWT), never caller-inspectable or mutable. That happens to line up
+  with MRTR's `requestState` *SHOULD*, but we adopt it because it is the right
+  token design, not to conform to an unreleased spec. When MRTR lands, revisit
+  and map onto the standard envelope then.
 - **The bespoke handshake is a real compliance risk until then (the honest
   part).** A conformant MRTR client auto-resolves the round-trip in its SDK; our
   hand-rolled version instead relies on the *model* correctly playing a custom
@@ -296,6 +303,13 @@ to `approvals:`. If review prefers a single word end-to-end, unify on `ask`
 (`AskRequested` / `AskAnswered`, `ask` channel) — either is fine as long as it
 is one conscious choice, not two drifting ones.
 
+**Resolution (v4):** keep the split — `ask:` as the authored verb, `reasoning`
+as the recorded/observable noun (events `ReasoningRequested` / `ReasoningAnswered`,
+`reasoning` channel). The one collision point (author writes `ask:` but names a
+`reasoning` channel) is judged tolerable in practice; we ship it and let real
+usage tell us whether it confuses anyone before spending a rename. Not a
+blocker.
+
 ## Implementation notes
 
 - **Events:** add `ReasoningRequested` / `ReasoningAnswered` beside the approval
@@ -338,6 +352,25 @@ is one conscious choice, not two drifting ones.
 
 ## History
 
+- **2026-07-09 (v5, implemented):** shipped in three slices on `feat/ask-step`.
+  Concrete wire choices made during build, all consistent with this ADR:
+  the caller answers a parked step via the JSON-RPC method
+  **`zymi/reasoning/resume`** `{ resume_token, answer }`; the parked task is
+  surfaced through the existing SEP-1686 `TaskStatus::InputRequired`, and
+  `tasks/get` carries the `{ status: needs_reasoning, prompt, resume_token }`
+  payload under an **`inputRequest`** field. The `resume_token` is HMAC-SHA256
+  over a per-process random key (implemented with `sha2` only, since
+  `hmac`/`hex`/`subtle` are `connectors`-gated but the server compiles under
+  bare `runtime`), opaque + expiring, **not** shaped against SEP-2322 (per v4).
+  The untrusted-output guard resolved to a *no-op by construction*: an `ask:`
+  answer flows through the identical `${steps.*}` → `${args.*}` substitution as
+  any tool output, and every sink guard (ADR-0039 `resolve_args_json`/`_url`,
+  the ADR-0014 policy engine for shell `command_template`) operates on the
+  resolved value provenance-agnostically — so no taint tag was added (adding
+  one would be redundant); a regression test pins that ask output is not a
+  trusted step-output path. Verified end-to-end by driving `zymi mcp serve`:
+  task-augmented `tools/call` → park → `input_required` + token → resume →
+  answer flows to the pipeline output; tampered token rejected.
 - **2026-07-08 (v1, withdrawn):** first draft proposed `ask:` backed by MCP
   `sampling/createMessage`. Withdrawn on discovering SEP-2577 deprecates
   sampling with no replacement, and on the reframe that the requirement is
@@ -345,6 +378,14 @@ is one conscious choice, not two drifting ones.
   The sampling approach — including as a time-boxed experimental bridge — is
   rejected.
 - **2026-07-08 (v2):** park/ask/resume design (this document).
+- **2026-07-09 (v4, accepted — implementation starting):** two decisions
+  locked before build. (1) Do **not** shape the `resume_token` against the
+  unreleased SEP-2322 `requestState`; v1 uses a plain opaque + signed + expiry
+  token, with MRTR tracked as a *future* migration rather than a present design
+  constraint (Decision §3, *Alignment with SEP-2322*). (2) Keep the
+  `ask` (verb) / `reasoning` (noun) vocabulary split; the one config-surface
+  collision is tolerable and will be revisited from real usage, not pre-emptively
+  renamed (*A note on vocabulary*). Status moved Proposed → Accepted.
 - **2026-07-08 (v3, review response):** incorporated review. Added the
   **Security** section (untrusted `ask:` output must take the tool-output
   taint/guard path before any sink — the strongest gap); a bounded park lifetime

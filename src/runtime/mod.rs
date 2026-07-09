@@ -78,9 +78,13 @@ pub struct Runtime {
     /// tagged `RequiresHumanApproval` are routed via the bus to a
     /// channel plugin matching this name. `None` = fail-closed.
     approval_channel: Option<String>,
-    /// Per-request timeout for bus-path approvals. Resolved from
-    /// `project.yml`-level config in the future; today this is the
-    /// crate default.
+    /// Default reasoning channel name (ADR-0042). An `ask:` step with no
+    /// step-level `channel:` routes here. `None` = fail-closed (e.g. under
+    /// `serve` before Slice 3 wires the caller channel).
+    reasoning_channel: Option<String>,
+    /// Per-request timeout for bus-path approvals. Reused for the `ask:` park
+    /// (ADR-0042 Decision §4). Resolved from `project.yml`-level config in the
+    /// future; today this is the crate default.
     approval_timeout: std::time::Duration,
     action_executor: Arc<dyn ActionExecutor>,
     tool_catalog: Arc<ToolCatalog>,
@@ -110,6 +114,7 @@ impl Runtime {
             store: None,
             bus: None,
             approval_channel: None,
+            reasoning_channel: None,
             approval_timeout: None,
             action_executor: None,
             tail_policy: None,
@@ -158,7 +163,15 @@ impl Runtime {
         self.approval_channel.as_deref()
     }
 
-    /// Per-request timeout for bus-path approvals.
+    /// Configured default reasoning channel name (ADR-0042). `Some` under
+    /// `zymi run` (zero-config `"terminal"`); `None` fail-closes an `ask:`
+    /// step that names no channel of its own.
+    pub fn reasoning_channel(&self) -> Option<&str> {
+        self.reasoning_channel.as_deref()
+    }
+
+    /// Per-request timeout for bus-path approvals (and the `ask:` park,
+    /// ADR-0042 Decision §4).
     pub fn approval_timeout(&self) -> std::time::Duration {
         self.approval_timeout
     }
@@ -272,6 +285,7 @@ pub struct RuntimeBuilder {
     store: Option<Arc<dyn EventStore>>,
     bus: Option<Arc<EventBus>>,
     approval_channel: Option<String>,
+    reasoning_channel: Option<String>,
     approval_timeout: Option<std::time::Duration>,
     action_executor: Option<Arc<dyn ActionExecutor>>,
     tail_policy: Option<TailWatcherPolicy>,
@@ -304,6 +318,17 @@ impl RuntimeBuilder {
     /// separately; the runtime only stores the routing name.
     pub fn with_approval_channel(mut self, name: impl Into<String>) -> Self {
         self.approval_channel = Some(name.into());
+        self
+    }
+
+    /// Configure a default reasoning channel name (ADR-0042). An `ask:` step
+    /// with no step-level `channel:` routes here; the orchestrator publishes
+    /// `ReasoningRequested { channel: name }` and awaits a matching
+    /// `ReasoningAnswered`. The channel plugin (e.g. `TerminalReasoningChannel`
+    /// under `zymi run`) must be started separately; the runtime only stores
+    /// the routing name.
+    pub fn with_reasoning_channel(mut self, name: impl Into<String>) -> Self {
+        self.reasoning_channel = Some(name.into());
         self
     }
 
@@ -533,6 +558,7 @@ impl RuntimeBuilder {
             store,
             bus,
             approval_channel,
+            reasoning_channel,
             approval_timeout,
             action_executor,
             tail_policy,
@@ -686,6 +712,7 @@ impl RuntimeBuilder {
             contracts,
             orchestrator,
             approval_channel,
+            reasoning_channel,
             approval_timeout: approval_timeout
                 .unwrap_or(crate::approval::DEFAULT_APPROVAL_TIMEOUT),
             action_executor,

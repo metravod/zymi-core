@@ -95,6 +95,8 @@ pub fn indent_level(kind: &EventKind) -> u8 {
         | EventKind::ApprovalRequested { .. }
         | EventKind::ApprovalGranted { .. }
         | EventKind::ApprovalDenied { .. }
+        | EventKind::ReasoningRequested { .. }
+        | EventKind::ReasoningAnswered { .. }
         | EventKind::IntentionEmitted { .. }
         | EventKind::IntentionEvaluated { .. } => 2,
     }
@@ -337,6 +339,39 @@ pub fn format_event(event: &Event) -> FormattedEvent {
                 short_detail: short,
                 full_detail: full,
                 color: EventColor::Failure,
+                indent,
+            }
+        }
+
+        EventKind::ReasoningRequested {
+            request_id,
+            prompt,
+            channel,
+            ..
+        } => FormattedEvent {
+            icon: "?",
+            label: "Reasoning".into(),
+            short_detail: format!("{}: {}", channel, truncate(prompt, 70)),
+            full_detail: format!("id: {request_id}\nchannel: {channel}\n{prompt}"),
+            color: EventColor::Warning,
+            indent,
+        },
+        EventKind::ReasoningAnswered {
+            request_id,
+            answer,
+            answered_by,
+            is_error,
+            ..
+        } => {
+            let full = format!(
+                "id: {request_id}\nanswered_by: {answered_by}\n{answer}"
+            );
+            FormattedEvent {
+                icon: if *is_error { "✗" } else { "↳" },
+                label: if *is_error { "Reasoning failed".into() } else { "Reasoned".into() },
+                short_detail: format!("by {answered_by}: {}", truncate(answer, 60)),
+                full_detail: full,
+                color: if *is_error { EventColor::Failure } else { EventColor::Success },
                 indent,
             }
         }
