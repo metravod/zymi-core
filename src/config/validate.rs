@@ -218,6 +218,45 @@ fn validate_pipeline_refs(
                     }
                 }
             }
+            PipelineStepKind::Ask { prompt, .. } => {
+                // ADR-0042: an `ask:` prompt is templated exactly like a tool
+                // step's args, so any `${steps.<other>.output}` it interpolates
+                // must be declared in depends_on (else it races an unrelated
+                // branch) and must name a real step.
+                let mut referenced = Vec::new();
+                extract_step_refs(prompt, &mut referenced);
+                for other in referenced {
+                    if other == step.id {
+                        continue;
+                    }
+                    if !step.depends_on.iter().any(|d| d == &other) {
+                        return Err(ConfigError::Validation {
+                            message: format!(
+                                "ask step `{}` references `${{steps.{}.output}}` in its prompt but `{}` is not in depends_on",
+                                step.id, other, other
+                            ),
+                            help: format!(
+                                "add `{}` to step `{}`'s depends_on list",
+                                other, step.id
+                            ),
+                            path: path.clone(),
+                        });
+                    }
+                    if !step_ids.contains(other.as_str()) {
+                        return Err(ConfigError::Validation {
+                            message: format!(
+                                "ask step `{}` references unknown step `${{steps.{}.output}}`",
+                                step.id, other
+                            ),
+                            help: format!(
+                                "available steps: {}",
+                                step_ids.iter().copied().collect::<Vec<_>>().join(", ")
+                            ),
+                            path: path.clone(),
+                        });
+                    }
+                }
+            }
         }
 
         // Check depends_on references valid step IDs.

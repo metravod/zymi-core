@@ -161,6 +161,40 @@ pub enum EventKind {
         decided_by: String,
         reason: Option<String>,
     },
+    /// Reasoning delegated to the connected caller (ADR-0042). Published by
+    /// the orchestrator when it dispatches an `ask:` step: the run parks and a
+    /// `ReasoningChannel` keyed by `channel` surfaces `prompt` to whoever
+    /// answers (the calling agent under `zymi mcp serve`, a human on a manual
+    /// channel, or a configured service).
+    /// The orchestrator awaits a matching [`EventKind::ReasoningAnswered`] on
+    /// the bus. Structurally the `ApprovalRequested` of a *value* rather than a
+    /// *decision*.
+    ReasoningRequested {
+        request_id: String,
+        stream_id: String,
+        prompt: String,
+        /// `name:` of the answering channel. Resolved per-pipeline → project
+        /// default → the connected caller under `serve` → fail-closed.
+        channel: String,
+    },
+    /// The caller's answer to a [`EventKind::ReasoningRequested`] (ADR-0042).
+    /// `answer` becomes the `ask:` step output and flows into downstream
+    /// `${steps.*.output}` like any tool output — and carries the same taint:
+    /// it is untrusted, model-generated free text and MUST pass the tool-output
+    /// guard discipline before reaching a sink (ADR-0036/0039). `answered_by`
+    /// is a free-form channel-supplied identifier, mirroring
+    /// `ApprovalGranted::decided_by`. A synthesised answer with `is_error:
+    /// true` seals an abandoned/timed-out request so the audit trail closes.
+    ReasoningAnswered {
+        request_id: String,
+        stream_id: String,
+        answer: String,
+        answered_by: String,
+        /// `true` when the answer is a fail-closed synthetic (timeout,
+        /// restart-timeout, no channel) rather than a real caller answer.
+        #[serde(default)]
+        is_error: bool,
+    },
     ToolCallCompleted {
         call_id: String,
         /// Full tool output, untruncated (ADR-0016 §1a).
@@ -361,6 +395,8 @@ impl EventKind {
             EventKind::ApprovalRequested { .. } => "approval_requested",
             EventKind::ApprovalGranted { .. } => "approval_granted",
             EventKind::ApprovalDenied { .. } => "approval_denied",
+            EventKind::ReasoningRequested { .. } => "reasoning_requested",
+            EventKind::ReasoningAnswered { .. } => "reasoning_answered",
             EventKind::ToolCallCompleted { .. } => "tool_call_completed",
             EventKind::IntentionEmitted { .. } => "intention_emitted",
             EventKind::IntentionEvaluated { .. } => "intention_evaluated",

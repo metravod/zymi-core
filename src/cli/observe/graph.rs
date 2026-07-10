@@ -78,6 +78,11 @@ impl Graph {
                 crate::config::pipeline::PipelineStepKind::Tool { tool, .. } => {
                     format!("tool:{tool}")
                 }
+                // ADR-0042: an ask step delegates reasoning to the caller;
+                // label it by its answering channel (or "caller" default).
+                crate::config::pipeline::PipelineStepKind::Ask { channel, .. } => {
+                    format!("ask:{}", channel.as_deref().unwrap_or("caller"))
+                }
             };
             nodes.push(GraphNode {
                 id: step.id.clone(),

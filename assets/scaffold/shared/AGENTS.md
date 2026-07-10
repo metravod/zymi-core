@@ -11,10 +11,15 @@ zymi runs them.
   `agents/`, `pipelines/`, `tools/`, `.zymi/`.
 - **Agent** — an LLM with a system_prompt and a list of tools. Lives in
   `agents/<name>.yml`.
-- **Pipeline** — a DAG of steps. Each step is either an agent invocation
-  OR a deterministic tool call. Lives in `pipelines/<name>.yml`.
+- **Pipeline** — a DAG of steps. Each step is an agent invocation, a
+  deterministic tool call, or an ask (delegate a question to the caller).
+  Lives in `pipelines/<name>.yml`.
 - **Step** — one node of a pipeline DAG. `agent: <name>` runs an agent
-  loop; `tool: <name>` calls a tool directly with templated args, no LLM.
+  loop; `tool: <name>` calls a tool directly with templated args, no LLM;
+  `ask: "<prompt>"` parks the run and asks whoever called the pipeline
+  (the connected agent under `zymi mcp serve`, else a human at the
+  terminal), resuming with their answer as the step output — no `llm:`
+  needed (ADR-0042).
 - **Tool** — something callable from an agent. Four kinds:
   - **Declarative** (`tools/<name>.yml`, `kind: http` or `kind: shell`)
   - **Python** (`tools/<name>.py` with `@tool` from `zymi`, sync or async)
@@ -78,6 +83,7 @@ ADR-0032 explains the install model in full.
 | Add a new agent | `agents/<name>.yml` | docs/agents.md |
 | Add a pipeline | `pipelines/<name>.yml` | docs/pipelines.md |
 | Add a non-LLM (deterministic) step | In a pipeline step use `tool: <name>` instead of `agent: <name>` | docs/pipelines.md#tool-steps |
+| Ask the calling agent (or a human) to reason mid-pipeline | In a pipeline step use `ask: "<prompt>"` — parks and resumes with the caller's answer; no `llm:` needed | docs/pipelines.md#ask-step-adr-0042 |
 | Make a step run conditionally (branching) | Add `when: "${steps.<router>.output} == 'label'"` on the step; needs `depends_on` | docs/pipelines.md#conditional-branching |
 | Add an HTTP tool | `tools/<name>.yml` with `kind: http` | docs/tools.md#declarative-http |
 | Add a shell tool | `tools/<name>.yml` with `kind: shell` | docs/tools.md#declarative-shell |

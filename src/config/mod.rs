@@ -379,4 +379,23 @@ output:
         );
         assert!(!ws.has_agent_step());
     }
+
+    #[test]
+    fn has_agent_step_false_for_ask_only_workspace() {
+        // ADR-0042 §Decision 7: an `ask:` step delegates reasoning to the
+        // caller, so it does NOT force an LLM provider — a pure tool + ask
+        // pipeline builds with no `llm:` block, composing with ADR-0041.
+        let ws = workspace_with_pipeline(
+            "name: p\nsteps:\n  - id: r\n    ask: \"summarize ${inputs.x}\"\n",
+        );
+        assert!(!ws.has_agent_step());
+    }
+
+    #[test]
+    fn has_agent_step_false_for_mixed_tool_and_ask() {
+        let ws = workspace_with_pipeline(
+            "name: p\nsteps:\n  - id: t\n    tool: deploy\n    args: {}\n  - id: r\n    ask: \"ok?\"\n    depends_on: [t]\n",
+        );
+        assert!(!ws.has_agent_step());
+    }
 }

@@ -685,6 +685,55 @@ async fn replay_pending_approvals(bus: Arc<crate::events::bus::EventBus>) {
     }
 }
 
+/// Pure resolution of the default reasoning channel name (ADR-0042). Today
+/// there is one reasoning channel type (terminal), so an `ask:` step with no
+/// step-level `channel:` routes to the zero-config `"terminal"` channel that
+/// [`start_reasoning_channels`] spawns. `serve` supplies its own caller
+/// channel instead (Slice 3) and does not call this.
+pub(crate) fn pre_resolve_reasoning(_project: &crate::config::ProjectConfig) -> Option<String> {
+    Some("terminal".into())
+}
+
+/// Spawn the zero-config terminal reasoning channel and replay any dangling
+/// `ask:` requests left by a previous crash. Mirrors the approval equivalents
+/// ([`start_approval_channels`] + [`replay_pending_approvals`]).
+pub(crate) async fn start_reasoning_channels(
+    bus: Arc<crate::events::bus::EventBus>,
+) -> Result<Vec<crate::approval::ChannelHandle>, String> {
+    use crate::reasoning::ReasoningChannel;
+    let channel = crate::reasoning::TerminalReasoningChannel::new("terminal");
+    let handles = vec![channel.start(Arc::clone(&bus)).await?];
+    replay_pending_reasoning(bus).await;
+    Ok(handles)
+}
+
+/// Best-effort replay of `ask:` requests left dangling by a previous crash
+/// (ADR-0042). Logs on store-read failure rather than aborting startup.
+async fn replay_pending_reasoning(bus: Arc<crate::events::bus::EventBus>) {
+    match crate::reasoning::replay_unfulfilled_reasoning(
+        bus,
+        crate::approval::DEFAULT_APPROVAL_TIMEOUT,
+    )
+    .await
+    {
+        Ok(report) => {
+            if !report.expired.is_empty() {
+                log::info!(
+                    "reasoning replay: sealed {} expired request(s) with restart_timeout",
+                    report.expired.len()
+                );
+            }
+            if !report.redelivered.is_empty() {
+                log::info!(
+                    "reasoning replay: redelivered {} in-flight request(s) to live channels",
+                    report.redelivered.len()
+                );
+            }
+        }
+        Err(e) => log::warn!("reasoning replay skipped: {e}"),
+    }
+}
+
 /// Create a tokio runtime for async operations.
 pub(crate) fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()

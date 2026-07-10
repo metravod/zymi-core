@@ -27,6 +27,7 @@ use super::protocol::{
     related_task_meta, task_augmentation, MethodOutcome, Notification, RpcError, Task, TaskStatus,
     ERR_INTERNAL, ERR_INVALID_PARAMS, ERR_METHOD_NOT_FOUND,
 };
+use super::reasoning::{self, ResumeTokenSigner};
 use super::tasks::{TaskHandle, TaskState, TaskStore};
 
 /// Server-side protocol version advertised in `initialize`. Tracks the
@@ -269,6 +270,9 @@ async fn spawn_pipeline_task(
     let rt = Arc::clone(runtime);
     let state_for_task = Arc::clone(&state);
     let pipeline_for_task = pipeline_name.clone();
+    // `stream_id` is moved into the wrapper below; keep a copy for the handle
+    // so the reasoning bridge can map a park back to this task (ADR-0042).
+    let stream_id_for_handle = stream_id.clone();
     let join = tokio::spawn(async move {
         let res = run_pipeline::handle(&rt, cmd).await;
 
@@ -322,6 +326,7 @@ async fn spawn_pipeline_task(
     let handle = Arc::new(TaskHandle {
         task_id,
         pipeline: pipeline_name,
+        stream_id: stream_id_for_handle,
         request_id: request_id.clone(),
         ttl,
         created_at: now,
@@ -345,6 +350,15 @@ pub async fn handle_tasks_get(store: &Arc<TaskStore>, params: &Value) -> Result<
     let mut v = serde_json::to_value(&task).map_err(internal_error)?;
     if let Value::Object(ref mut m) = v {
         m.insert("_meta".into(), related_task_meta(&task_id));
+        // ADR-0042: when the run parked on an `ask:` step, surface the
+        // `{ status: needs_reasoning, prompt, resume_token }` payload the
+        // reasoning bridge stashed, so the caller can reason and resume.
+        let s = handle.state.lock().await;
+        if s.status == TaskStatus::InputRequired {
+            if let Some(payload) = s.result.clone() {
+                m.insert("inputRequest".into(), payload);
+            }
+        }
     }
     Ok(v)
 }
@@ -383,6 +397,35 @@ pub async fn handle_tasks_result(
 /// `tasks/list` → all tasks, single page (2a does not paginate).
 pub async fn handle_tasks_list(store: &Arc<TaskStore>) -> Value {
     json!({ "tasks": store.list().await })
+}
+
+/// `zymi/reasoning/resume` (ADR-0042): the caller supplies its reasoning
+/// answer for a parked `ask:` step. Params: `{ resume_token, answer }`. Verify
+/// the token, publish the answer so the parked run continues, and ack.
+///
+/// The answer is untrusted model output re-entering zymi as a step output; the
+/// sink guards (ADR-0039/0036) apply downstream — it is not sanitized here.
+pub async fn handle_reasoning_resume(
+    runtime: &Arc<Runtime>,
+    store: &Arc<TaskStore>,
+    signer: &ResumeTokenSigner,
+    params: &Value,
+) -> Result<Value, RpcError> {
+    let token = params
+        .get("resume_token")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError::new(ERR_INVALID_PARAMS, "missing `resume_token`"))?;
+    let answer = params
+        .get("answer")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError::new(ERR_INVALID_PARAMS, "missing `answer`"))?;
+    match reasoning::resume(runtime.bus(), store, signer, token, answer).await {
+        Ok(claims) => Ok(json!({ "ok": true, "requestId": claims.request_id })),
+        Err(e) => Err(RpcError::new(
+            ERR_INVALID_PARAMS,
+            format!("resume rejected: {e}"),
+        )),
+    }
 }
 
 /// `tasks/cancel` (capability-gated explicit cancel). Idempotent ack.

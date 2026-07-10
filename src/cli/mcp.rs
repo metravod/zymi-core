@@ -120,6 +120,13 @@ pub fn exec_serve(
         let runtime = Arc::new(
             Runtime::builder(workspace, root.clone())
                 .with_approval_channel(default_channel)
+                // ADR-0042: route `ask:` steps to the serve reasoning bridge,
+                // which `serve_with_link` starts on the bus. An `ask:` step
+                // with no explicit `channel:` is then answered by the connected
+                // caller via `zymi/reasoning/resume`.
+                .with_reasoning_channel(
+                    crate::mcp::server::reasoning::CHANNEL_NAME,
+                )
                 .build_async()
                 .await?,
         );

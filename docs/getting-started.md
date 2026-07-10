@@ -96,9 +96,9 @@ See [docs/events-and-replay.md](events-and-replay.md) for the event-sourcing mod
 ## Next steps
 
 - [Project YAML reference](project-yaml.md) — every key in `project.yml`.
-- [Pipelines](pipelines.md) — DAGs, agent steps, deterministic tool steps.
+- [Pipelines](pipelines.md) — DAGs, agent steps, deterministic tool steps, ask steps.
 - [Tools](tools.md) — declarative HTTP/shell, Python `@tool`, MCP servers.
-- [Approvals](approvals.md) — gate sensitive tools behind a human decision.
+- [Approvals](approvals.md) — gate sensitive tools behind a human decision; reasoning delegation (`ask:`) is the sibling mechanism.
 - [CLI reference](cli.md) — every `zymi` subcommand with flags.
 
 ## See also

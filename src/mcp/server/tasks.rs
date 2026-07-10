@@ -38,6 +38,10 @@ pub struct TaskState {
 pub struct TaskHandle {
     pub task_id: String,
     pub pipeline: String,
+    /// The event-store stream the backgrounded run records under
+    /// (`mcp-task-<task_id>`). Lets the reasoning bridge (ADR-0042) map a
+    /// parked `ReasoningRequested` back to its task.
+    pub stream_id: String,
     /// JSON-RPC id of the originating `tools/call`, so a later
     /// `notifications/cancelled { requestId }` can find this task (§4.8.1).
     pub request_id: Value,
@@ -99,6 +103,17 @@ impl TaskStore {
             .await
             .values()
             .find(|h| &h.request_id == request_id)
+            .cloned()
+    }
+
+    /// Find a task by the event-store stream its run records under. Used by
+    /// the reasoning bridge (ADR-0042) to route a parked `ask:` to its task.
+    pub async fn find_by_stream_id(&self, stream_id: &str) -> Option<Arc<TaskHandle>> {
+        self.inner
+            .lock()
+            .await
+            .values()
+            .find(|h| h.stream_id == stream_id)
             .cloned()
     }
 

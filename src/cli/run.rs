@@ -55,11 +55,15 @@ pub fn exec(
     let _guard = rt.enter();
 
     let default_channel = super::pre_resolve_approval(approval_mode, &workspace.project);
+    let reasoning_default = super::pre_resolve_reasoning(&workspace.project);
     let project_for_spawn = workspace.project.clone();
 
     let mut builder = Runtime::builder(workspace, root.to_path_buf());
     if let Some(name) = default_channel.as_deref() {
         builder = builder.with_approval_channel(name);
+    }
+    if let Some(name) = reasoning_default.as_deref() {
+        builder = builder.with_reasoning_channel(name);
     }
     let runtime = rt.block_on(builder.build_async())?;
 
@@ -68,6 +72,9 @@ pub fn exec(
         &project_for_spawn,
         std::sync::Arc::clone(runtime.bus()),
         callback_url,
+    ))?;
+    let reasoning_channels = rt.block_on(super::start_reasoning_channels(
+        std::sync::Arc::clone(runtime.bus()),
     ))?;
 
     let cmd = RunPipeline::new(pipeline.to_string(), inputs);
@@ -81,6 +88,9 @@ pub fn exec(
     rt.block_on(runtime.shutdown_connectors());
     rt.block_on(runtime.shutdown_mcp());
     for handle in approval_channels {
+        rt.block_on(handle.shutdown());
+    }
+    for handle in reasoning_channels {
         rt.block_on(handle.shutdown());
     }
 

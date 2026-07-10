@@ -17,6 +17,7 @@ pub mod mcp;
 pub mod llm;
 pub mod plugin;
 pub mod policy;
+pub mod reasoning;
 #[cfg(feature = "python")]
 #[allow(clippy::useless_conversion)]
 pub mod python;

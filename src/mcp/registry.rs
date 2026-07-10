@@ -192,7 +192,7 @@ impl McpRegistry {
 
     /// Best-effort shutdown of every server in the registry.
     pub async fn shutdown_all(&self, grace: Duration) {
-        for (_, entry) in self.servers.iter() {
+        for entry in self.servers.values() {
             let conn = entry.conn.read().await.clone();
             conn.shutdown(grace).await;
         }
