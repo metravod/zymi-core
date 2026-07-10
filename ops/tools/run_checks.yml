@@ -1,8 +1,12 @@
 name: run_checks
 description: >-
-  Run the pre-push checks that match CI: clippy with -D warnings on the
-  full cli+python feature set, then the lib test suite. Also refreshes
-  Cargo.lock after the version bump so the release commit can include it.
+  Run the pre-push checks that mirror CI EXACTLY (.github/workflows/ci.yml
+  "rust" job): `cargo test --features services,webhook`, then
+  `cargo clippy --all-features -- -D warnings`. These are the real gate —
+  a narrower feature set (e.g. `--features cli`) misses lints that only fire
+  under `--all-features` (that reddened the v0.9.0 PR). Running cargo here
+  also refreshes Cargo.lock after the version bump so the release commit can
+  include it.
 parameters:
   type: object
   properties: {}
@@ -11,6 +15,6 @@ parameters:
 implementation:
   kind: shell
   command_template: >-
-    cargo clippy --manifest-path ../Cargo.toml --lib --features cli --features python -- -D warnings
-    && cargo test --manifest-path ../Cargo.toml --lib --features cli
-  timeout_secs: 900
+    cargo test --manifest-path ../Cargo.toml --features services,webhook
+    && cargo clippy --manifest-path ../Cargo.toml --all-features -- -D warnings
+  timeout_secs: 1200
