@@ -199,19 +199,37 @@ pub async fn execute_builtin_tool(
     }
 }
 
+/// The interpreter used to run a shell-tool command, per platform.
+///
+/// Previously hardcoded to `sh -c`, which does not exist on stock Windows:
+/// the spawn failed with a bare OS error that read as a broken *command*
+/// rather than a missing *interpreter*, after a successful install and
+/// scaffold. Reported by external review on getpostingboard.dev
+/// (`gauge-and-glue`, from a Windows harness, by reading rather than running
+/// — so the Windows branch below is itself untested on Windows).
+#[cfg(windows)]
+const SHELL_INVOCATION: (&str, &str) = ("cmd", "/C");
+#[cfg(not(windows))]
+const SHELL_INVOCATION: (&str, &str) = ("sh", "-c");
+
 async fn execute_shell_command(
     command: &str,
     timeout_secs: u64,
     cwd: &Path,
 ) -> Result<String, String> {
-    let child = tokio::process::Command::new("sh")
-        .arg("-c")
+    let (interpreter, flag) = SHELL_INVOCATION;
+    let child = tokio::process::Command::new(interpreter)
+        .arg(flag)
         .arg(command)
         .current_dir(cwd)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|e| format!("failed to spawn command: {e}"))?;
+        // Name the interpreter: "failed to spawn command" sends the reader to
+        // look at their command, and the command is usually fine.
+        .map_err(|e| {
+            format!("failed to spawn `{interpreter}` to run the command: {e}")
+        })?;
 
     let output = tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
         .await
@@ -222,10 +240,16 @@ async fn execute_shell_command(
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     if output.status.success() {
-        Ok(if stdout.is_empty() {
-            "(no output)".to_string()
-        } else {
+        // A success with empty stdout is not necessarily a silent command:
+        // it may have written to stderr. Reporting "(no output)" in that case
+        // discards the only output there was, and makes a talkative command
+        // indistinguishable from a mute one.
+        Ok(if !stdout.is_empty() {
             truncate_output(&stdout, 4000)
+        } else if !stderr.is_empty() {
+            format!("(no stdout)\nstderr: {}", truncate_output(&stderr, 4000))
+        } else {
+            "(no output)".to_string()
         })
     } else {
         let code = output.status.code().unwrap_or(-1);
@@ -340,6 +364,60 @@ fn builtin_tool_def(name: &str) -> Option<ToolDefinition> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shell tool must not hardcode a POSIX interpreter.
+    ///
+    /// Regression for a Windows-blocking defect found by external review:
+    /// `sh -c` does not exist on stock Windows, so every pipeline with a
+    /// shell step died after a successful install with an error that read
+    /// as a broken command rather than a missing interpreter.
+    #[test]
+    fn shell_invocation_is_platform_appropriate() {
+        let (interpreter, flag) = SHELL_INVOCATION;
+        assert!(!interpreter.is_empty());
+        assert!(!flag.is_empty());
+        #[cfg(windows)]
+        assert_eq!((interpreter, flag), ("cmd", "/C"));
+        #[cfg(not(windows))]
+        assert_eq!((interpreter, flag), ("sh", "-c"));
+    }
+
+    /// A command that succeeds while writing only to stderr must not be
+    /// reported as silent: "(no output)" would discard the only output there
+    /// was, making a talkative command indistinguishable from a mute one.
+    #[tokio::test]
+    async fn success_with_only_stderr_is_not_reported_as_no_output() {
+        let dir = std::env::temp_dir();
+        #[cfg(windows)]
+        let cmd = "echo talking 1>&2";
+        #[cfg(not(windows))]
+        let cmd = "echo talking >&2";
+
+        let out = execute_shell_command(cmd, 10, &dir)
+            .await
+            .expect("command should succeed");
+        assert!(
+            out.contains("talking"),
+            "stderr was dropped from a successful run: {out}"
+        );
+        assert_ne!(out, "(no output)");
+    }
+
+    /// A genuinely silent success still reports silence.
+    #[tokio::test]
+    async fn silent_success_still_reports_no_output() {
+        let dir = std::env::temp_dir();
+        #[cfg(windows)]
+        let cmd = "cd .";
+        #[cfg(not(windows))]
+        let cmd = "true";
+
+        let out = execute_shell_command(cmd, 10, &dir)
+            .await
+            .expect("command should succeed");
+        assert_eq!(out, "(no output)");
+    }
+
     use crate::events::store::{open_store, StoreBackend};
 
     fn test_memory_store() -> MemoryStore {

@@ -16,6 +16,14 @@ uv tool install zymi-core
 
 This puts the `zymi` CLI on your `$PATH` in its own isolated environment, so it doesn't collide with any project's dependencies. Don't have `uv`? `curl -LsSf https://astral.sh/uv/install.sh | sh` (macOS/Linux) or `irm https://astral.sh/uv/install.ps1 | iex` (Windows).
 
+> **Platform support.** macOS and Linux are what the maintainers run and what
+> CI covers. Wheels are published for Windows and the CLI is expected to work
+> there, but **no part of the Windows path is tested by anyone today** — the
+> shell tool's `cmd /C` branch in particular was written from a bug report and
+> has never been executed on Windows. Treat Windows as unverified rather than
+> unsupported, and please open an issue either way: a report that it worked is
+> as useful as one that it did not, because right now we have neither.
+
 > **Embedding zymi in your own Python?** Use `uv add zymi-core` (or `pip install zymi-core`) *inside that project's venv* instead — the same wheel exposes the `zymi` Python module (`Runtime`, `@tool`, …). See [python-api.md](python-api.md). For running pipelines from the CLI, prefer the global `uv tool install` above.
 
 Verify the install:
