@@ -243,14 +243,17 @@ impl ApprovalChannel for TerminalApprovalChannel {
                 // typing at the prompt can't pin the bus subscriber.
                 tokio::spawn(async move {
                     let _guard = lock.lock().await;
-                    let approved = tokio::task::spawn_blocking(move || {
+                    // A panic in the blocking task, or a prompt that could not
+                    // be rendered, is itself an absent channel rather than a
+                    // human decision — so it denies *and says so*.
+                    let outcome = tokio::task::spawn_blocking(move || {
                         terminal_prompt_blocking(&description, explanation.as_deref())
-                            .unwrap_or(false)
+                            .unwrap_or(TerminalOutcome::NoInputChannel)
                     })
                     .await
-                    .unwrap_or(false);
+                    .unwrap_or(TerminalOutcome::NoInputChannel);
 
-                    let decision = if approved {
+                    let decision = if outcome.approved() {
                         EventKind::ApprovalGranted {
                             approval_id,
                             stream_id: stream_id_owned.clone(),
@@ -262,7 +265,7 @@ impl ApprovalChannel for TerminalApprovalChannel {
                             approval_id,
                             stream_id: stream_id_owned.clone(),
                             decided_by: format!("terminal:{channel_name_owned}"),
-                            reason: None,
+                            reason: outcome.denial_reason(),
                         }
                     };
                     let mut decision_event =
@@ -1330,10 +1333,56 @@ mod replay_tests {
     }
 }
 
+/// Outcome of a terminal approval prompt.
+///
+/// A bare `bool` collapsed three distinct cases into one: a human who read the
+/// prompt and declined, a closed stdin (no human present at all), and an IO
+/// error on the channel. All three denied the action — correctly — but all
+/// three also produced an identical `ApprovalDenied{reason: None}`, so an
+/// audit could not tell "a person refused" from "there was nobody to ask".
+/// A non-interactive run left a trail reading as a considered human refusal.
+///
+/// Reported by external review on getpostingboard.dev; enum shape proposed by
+/// `local-qwen-wanderer`, who noted this is per-call context rather than state
+/// that must survive a restart, so it stays out of the event log's own state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TerminalOutcome {
+    /// A human answered affirmatively.
+    Approved,
+    /// A human answered, and the answer was not affirmative.
+    DeniedByHuman,
+    /// stdin reached EOF: no human was present to ask.
+    NoInputChannel,
+    /// stdin returned an IO error; carries the kind for the audit trail.
+    ChannelError(std::io::ErrorKind),
+}
+
+impl TerminalOutcome {
+    /// Did the action get approved?
+    pub(crate) fn approved(&self) -> bool {
+        matches!(self, TerminalOutcome::Approved)
+    }
+
+    /// Stable machine-readable token for `ApprovalDenied.reason`.
+    ///
+    /// `None` for a human denial: the field stays absent exactly as before,
+    /// so existing consumers see no change on the path they already handle.
+    /// The two non-human cases become distinguishable without a schema change
+    /// (`reason` is already `Option<String>`), which keeps stored events
+    /// readable by older readers.
+    pub(crate) fn denial_reason(&self) -> Option<String> {
+        match self {
+            TerminalOutcome::Approved | TerminalOutcome::DeniedByHuman => None,
+            TerminalOutcome::NoInputChannel => Some("no_input_channel".into()),
+            TerminalOutcome::ChannelError(kind) => Some(format!("channel_error:{kind:?}")),
+        }
+    }
+}
+
 fn terminal_prompt_blocking(
     description: &str,
     explanation: Option<&str>,
-) -> Result<bool, String> {
+) -> Result<TerminalOutcome, String> {
     use std::io::{self, BufRead, Write};
 
     {
@@ -1351,19 +1400,75 @@ fn terminal_prompt_blocking(
 
     let stdin = io::stdin();
     let mut line = String::new();
+    // Every arm denies except an explicit yes. The distinction being preserved
+    // is *why*, not *whether*: fail-closed behaviour is unchanged.
     match stdin.lock().read_line(&mut line) {
-        Ok(0) => Ok(false), // EOF — deny
+        Ok(0) => Ok(TerminalOutcome::NoInputChannel), // EOF — nobody to ask
         Ok(_) => {
             let answer = line.trim().to_ascii_lowercase();
-            Ok(matches!(answer.as_str(), "y" | "yes"))
+            Ok(if matches!(answer.as_str(), "y" | "yes") {
+                TerminalOutcome::Approved
+            } else {
+                TerminalOutcome::DeniedByHuman
+            })
         }
-        Err(_) => Ok(false), // IO error — deny
+        Err(e) => Ok(TerminalOutcome::ChannelError(e.kind())),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The three denial paths must be distinguishable in the recorded event.
+    ///
+    /// Regression for the defect found by external review: EOF, an IO error,
+    /// and a human typing `n` all produced `ApprovalDenied{reason: None}`, so
+    /// a CI run with no tty left a trail reading as a considered refusal.
+    #[test]
+    fn denial_reason_distinguishes_absent_channel_from_human_refusal() {
+        assert_eq!(TerminalOutcome::DeniedByHuman.denial_reason(), None);
+        assert_eq!(
+            TerminalOutcome::NoInputChannel.denial_reason().as_deref(),
+            Some("no_input_channel")
+        );
+        assert_eq!(
+            TerminalOutcome::ChannelError(std::io::ErrorKind::BrokenPipe)
+                .denial_reason()
+                .as_deref(),
+            Some("channel_error:BrokenPipe")
+        );
+
+        // The pairwise distinction is the point: no two denial sources may
+        // serialise to the same reason.
+        let reasons = [
+            TerminalOutcome::DeniedByHuman.denial_reason(),
+            TerminalOutcome::NoInputChannel.denial_reason(),
+            TerminalOutcome::ChannelError(std::io::ErrorKind::BrokenPipe).denial_reason(),
+        ];
+        for (i, a) in reasons.iter().enumerate() {
+            for b in reasons.iter().skip(i + 1) {
+                assert_ne!(a, b, "two denial sources share a reason");
+            }
+        }
+    }
+
+    /// Fail-closed is unchanged: only an explicit approval approves.
+    #[test]
+    fn only_approved_is_approved() {
+        assert!(TerminalOutcome::Approved.approved());
+        assert!(!TerminalOutcome::DeniedByHuman.approved());
+        assert!(!TerminalOutcome::NoInputChannel.approved());
+        assert!(!TerminalOutcome::ChannelError(std::io::ErrorKind::UnexpectedEof).approved());
+    }
+
+    /// An approval carries no reason, so existing consumers of the granted
+    /// path see byte-identical events.
+    #[test]
+    fn approval_carries_no_reason() {
+        assert_eq!(TerminalOutcome::Approved.denial_reason(), None);
+    }
+
     use crate::events::store::SqliteEventStore;
     use tempfile::TempDir;
 

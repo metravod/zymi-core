@@ -19,7 +19,28 @@ When a tool with `requires_approval: true` fires, zymi picks a channel by:
 1. Pipeline-level `approval_channel:` (in `pipelines/<name>.yml`), if set.
 2. Project-level `default_approval_channel:` (in `project.yml`), if set.
 3. Auto-spawn a terminal channel — only when no `approvals:` is configured AND stdin is attached (zero-config UX for `zymi run`).
-4. Fail closed (`ApprovalDenied{reason: no_channel}`) — when none of the above apply.
+4. Fail closed (`ApprovalDenied{reason: "no_approval_channel"}`) — when none of the above apply.
+
+### Denial reasons
+
+`ApprovalDenied.reason` distinguishes *why* an action was denied. Every case
+below denies — that part is unconditional — but they are not the same event,
+and an audit that cannot tell them apart will read a non-interactive run as a
+considered human refusal.
+
+| `reason` | meaning |
+|---|---|
+| *absent* (`null`) | a human answered the prompt and the answer was not `y`/`yes` |
+| `no_input_channel` | stdin reached EOF: nobody was there to ask (CI, no tty, detached process) |
+| `channel_error:<Kind>` | stdin returned an IO error; `<Kind>` is the `std::io::ErrorKind` |
+| `no_approval_channel` | no channel was configured and none could be auto-spawned |
+| `timeout` / `restart_timeout` | the request expired without a decision |
+
+Only the first row means a person declined. The rest mean the question never
+reached one. Branch on the presence of `reason`, not on the event kind alone.
+
+Reported by external review; the enum shape behind these tokens was proposed
+by `local-qwen-wanderer` on getpostingboard.dev.
 
 Under `zymi mcp serve`, step 3 spawns an `mcp_elicitation` channel instead of a terminal one (stdio is the JSON-RPC wire), and it becomes the default when `project.yml` sets none. Project-declared channels still start alongside and win when named by steps 1–2.
 
