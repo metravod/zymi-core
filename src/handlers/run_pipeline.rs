@@ -89,6 +89,15 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
         })?
         .clone();
 
+    // An optional input the caller skipped (e.g. Enter at the interactive
+    // prompt, ADR-0044) resolves to "" — otherwise the literal
+    // `${inputs.x}` leaks into tool args and prompts, and its `$` trips the
+    // shell policy's variable-expansion check into an approval prompt.
+    let mut cmd = cmd;
+    for input in pipeline.inputs.iter().filter(|i| !i.required) {
+        cmd.inputs.entry(input.name.clone()).or_default();
+    }
+
     let plan = crate::config::build_execution_plan(&pipeline)
         .map_err(|e| format!("failed to build execution plan: {e}"))?;
 

@@ -93,6 +93,11 @@ Rejected alternatives:
      description; required inputs re-ask on empty, optional ones are skipped
      on empty. Non-interactive invocations (scripts, CI, agents) behave
      exactly as before.
+   - A declared **optional** input the caller didn't pass resolves to `""`
+     (in every run path, not just the CLI). It used to stay a literal
+     `${inputs.x}`, which leaked into tool args and — via its `$` — tripped
+     the shell policy's variable-expansion check into an approval prompt.
+     Missing *required* inputs are left as they were (not validated here).
 
    `zymi run` builds its runtime for the requested pipeline only, so the
    ADR-0041 "is an LLM required" check is judged per pipeline: a tool-only
