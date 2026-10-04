@@ -1,10 +1,14 @@
 use std::collections::HashMap;
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::Path;
 
 use crate::commands::RunPipeline;
-use crate::config::load_project_dir;
+use crate::config::pipeline::PipelineInputType;
+use crate::config::{load_project_dir, PipelineConfig};
 use crate::handlers::run_pipeline;
 use crate::runtime::Runtime;
+
+use super::event_fmt::{DIM, RESET};
 
 pub fn exec(
     pipeline: &str,
@@ -22,10 +26,10 @@ pub fn exec(
         ));
     }
 
-    let workspace =
+    let mut workspace =
         load_project_dir(root).map_err(|e| format!("failed to load project: {e}"))?;
 
-    let pipeline_config = workspace.pipelines.get(pipeline).ok_or_else(|| {
+    let pipeline_config = workspace.pipelines.get(pipeline).cloned().ok_or_else(|| {
         let available: Vec<&str> = workspace.pipelines.keys().map(|s| s.as_str()).collect();
         format!(
             "pipeline '{pipeline}' not found. Available: {}",
@@ -50,6 +54,18 @@ pub fn exec(
             .ok_or_else(|| format!("invalid input '{raw}': expected KEY=VALUE format"))?;
         inputs.insert(key.to_string(), value.to_string());
     }
+
+    // Ask for what `-i` didn't cover, but only for a human at a terminal —
+    // scripts, CI and agents keep the non-interactive contract (ADR-0044).
+    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        prompt_missing_inputs(&pipeline_config, &mut inputs)?;
+    }
+
+    // Build the runtime for this pipeline only: whether an LLM is required
+    // (ADR-0041) is then judged by the pipeline being run, so a tool-only
+    // pipeline still runs from a library that also holds agent pipelines
+    // and has no `llm:` (ADR-0044).
+    workspace.pipelines.retain(|name, _| name == pipeline);
 
     let rt = super::runtime();
     let _guard = rt.enter();
@@ -111,5 +127,52 @@ pub fn exec(
         return Err("pipeline had failing steps".into());
     }
 
+    Ok(())
+}
+
+/// Prompt on stderr for each declared input not already supplied. Required
+/// inputs re-ask on an empty answer; optional ones are skipped by it.
+fn prompt_missing_inputs(
+    cfg: &PipelineConfig,
+    inputs: &mut HashMap<String, String>,
+) -> Result<(), String> {
+    let missing: Vec<_> = cfg
+        .inputs
+        .iter()
+        .filter(|i| !inputs.contains_key(&i.name))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    let mut lines = std::io::stdin().lock().lines();
+    for input in missing {
+        if let Some(desc) = &input.description {
+            eprintln!("{DIM}{}{RESET}", desc.trim());
+        }
+        let ty = match input.ty {
+            PipelineInputType::String => String::new(),
+            other => format!(" ({})", other.as_schema_str()),
+        };
+        let hint = if input.required { "" } else { " [Enter to skip]" };
+        loop {
+            eprint!("{}{ty}{hint}: ", input.name);
+            std::io::stderr().flush().ok();
+            let line = match lines.next() {
+                Some(line) => line.map_err(|e| format!("failed to read input: {e}"))?,
+                None => return Err(format!("input '{}' not provided (stdin closed)", input.name)),
+            };
+            let value = line.trim();
+            if !value.is_empty() {
+                inputs.insert(input.name.clone(), value.to_string());
+                break;
+            }
+            if !input.required {
+                break;
+            }
+            eprintln!("  {DIM}'{}' is required{RESET}", input.name);
+        }
+    }
+    eprintln!();
     Ok(())
 }

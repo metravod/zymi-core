@@ -2,7 +2,7 @@
 
 Date: 2026-07-07
 
-Status: Accepted
+Status: Accepted. Amended by 0044 (`zymi run` judges the LLM requirement for the pipeline being run, not the whole workspace)
 
 ## Context
 

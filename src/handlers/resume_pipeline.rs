@@ -837,6 +837,7 @@ mod tests {
                 version: None,
                 variables: HashMap::new(),
                 llm: None,
+                llm_error: None,
                 services: Some(ServicesConfig::default()),
                 policy: PolicyConfig::default(),
                 contracts: ContractsConfig::default(),

@@ -2,7 +2,7 @@
 
 Date: 2026-05-19
 
-Status: Accepted.
+Status: Accepted. Amended by 0044 (venv is detected at the resolved project root, which may be the home project `$ZYMI_HOME`).
 
 ## Context
 

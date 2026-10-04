@@ -11,6 +11,19 @@ zymi --help
 
 Most commands accept `-d, --dir <PATH>` to point at a project root other than the current directory.
 
+### Which project a command uses
+
+Project-scoped commands (`run`, `serve`, `resume`, `ls`, `pipelines`, `events`, `runs`, `observe`, `verify`, `fetch`, `mcp serve`) resolve their project as (ADR-0044):
+
+1. `--dir`, if given;
+2. the current directory, if it has a `project.yml`;
+3. the **home project** — `$ZYMI_HOME`, default `~/.zymi` — if it has a `project.yml`. Announced on stderr: `zymi: no project.yml here — using home project …`;
+4. otherwise the current directory (and the usual "no project.yml" error).
+
+The home project is your personal pipeline library: create it once with `zymi init --home`, then `zymi ls` / `zymi run <name>` work from any directory that is not itself a project.
+
+`.env` files are loaded from the resolved project, then the current directory, then `$ZYMI_HOME/.env` — earlier wins, and real environment variables always win over all of them. Machine-wide keys (e.g. for [named providers](project-yaml.md#named-providers)) belong in `~/.zymi/.env`.
+
 ## `zymi init`
 
 Initialize a new zymi project in the current directory.
@@ -18,12 +31,16 @@ Initialize a new zymi project in the current directory.
 ```bash
 zymi init [-n NAME]
 zymi init --example telegram [-n NAME]
+zymi init --home                             # personal library at ~/.zymi
 ```
 
 | Flag | Description |
 |------|-------------|
-| `-n, --name NAME` | Project name. Defaults to the directory name. |
+| `-n, --name NAME` | Project name. Defaults to the directory name (`home` with `--home`). |
 | `--example NAME` | Scaffold from a built-in example. Currently only `telegram`. |
+| `--home` | Scaffold the home project at `$ZYMI_HOME` (default `~/.zymi`) instead of the current directory. |
+
+`--home` drops a lean library: `project.yml` with no `llm:` and an enabled shell policy, `providers.yml` (commented), `.env.example`, a tool-only `pipelines/hello.yml` + `tools/say.yml`, `AGENTS.md` and `pyproject.toml`. Worth keeping in a private git repo; `.env` is gitignored.
 
 Drops `project.yml`, `agents/`, `pipelines/`, `tools/`, `.zymi/`, and `AGENTS.md`. The `--example telegram` scaffold also drops `agents/{assistant,reviewer}.yml`, `pipelines/chat.yml`, two declarative tool stubs, two Python tool stubs, an approval-gated `broadcast` tool, and `.env.example`.
 
@@ -42,6 +59,10 @@ zymi run <pipeline> -i key=value [-i key=value …]
 | `--approval terminal\|webhook` | Override approval routing. Default: use `approvals:` from `project.yml`. |
 | `--callback-url URL` | Notification URL for `--approval=webhook`. |
 | `-d, --dir PATH` | Project root. |
+
+When stdin and stdout are both a terminal, `zymi run` asks for every declared input you didn't pass with `-i`, showing its description. Required inputs re-ask on an empty answer; optional ones are skipped. Scripts, CI and agents (no TTY) get the old non-interactive behaviour.
+
+Whether an LLM is required is judged by the pipeline being run: a tool-only pipeline runs even if other pipelines in the project have agent steps and there is no `llm:`.
 
 ## `zymi serve`
 
@@ -98,9 +119,17 @@ zymi runs --raw                              # one JSON record per line
 | `--raw` | Emit raw JSON, one run per line. |
 | `-d, --dir PATH` | Project root. |
 
+## `zymi ls`
+
+Compact listing — what can I run: name, first line of the description, inputs (`*` = required). Outside a project it lists the home project.
+
+```bash
+zymi ls
+```
+
 ## `zymi pipelines`
 
-List pipelines defined in the project.
+List pipelines defined in the project, with their steps, dependencies and outputs.
 
 ```bash
 zymi pipelines

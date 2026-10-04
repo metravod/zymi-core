@@ -1,7 +1,7 @@
 # ops/ — zymi-core releases itself
 
 A zymi project that cuts zymi-core releases. Dogfood: the release runs
-as a [pipeline-as-MCP-tool](../README.md#zymi-as-an-mcp-server--pipelines-as-tools-for-any-agent)
+as a [pipeline-as-MCP-tool](../README.md#zymi-as-an-mcp-server)
 with the point-of-no-return step behind a human approval form.
 
 ## Release via an MCP host (Claude Code)

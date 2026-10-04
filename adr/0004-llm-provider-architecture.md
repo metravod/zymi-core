@@ -1,6 +1,7 @@
 # LLM Provider Architecture — Unified Trait, OpenAI-Compatible + Anthropic
 
 Date: 2026-04-04
+Status: Amended by 0044 (`llm:` may reference a named provider from `$ZYMI_HOME/providers.yml`)
 
 ## Context
 

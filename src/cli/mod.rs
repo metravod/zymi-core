@@ -119,6 +119,12 @@ enum Command {
         /// Scaffold from a built-in example. Currently only "telegram".
         #[arg(long)]
         example: Option<String>,
+
+        /// Scaffold the personal home project at `$ZYMI_HOME` (default
+        /// `~/.zymi`) instead of the current directory (ADR-0044). Commands
+        /// run outside any project fall back to it.
+        #[arg(long, conflicts_with = "example")]
+        home: bool,
     },
 
     /// Run a pipeline
@@ -229,7 +235,18 @@ enum Command {
         dir: Option<PathBuf>,
     },
 
-    /// List pipelines defined in the project
+    /// List the project's pipelines compactly: name, description, inputs
+    ///
+    /// Outside a project this lists the home project (`~/.zymi`), so it
+    /// doubles as "what can I run". `*` marks a required input. For the
+    /// step-by-step view use `zymi pipelines`.
+    Ls {
+        /// Project root directory
+        #[arg(short = 'd', long)]
+        dir: Option<PathBuf>,
+    },
+
+    /// List pipelines defined in the project, with their steps
     Pipelines {
         /// Project root directory
         #[arg(short = 'd', long)]
@@ -341,9 +358,13 @@ pub fn run_from_args(args: impl IntoIterator<Item = String>) {
 }
 
 fn dispatch(cli: Cli) {
-    load_dotenv(command_dir(&cli.command));
+    load_dotenv(project_dir_arg(&cli.command).map(|dir| locate_root(dir).0));
     let result = match cli.command {
-        Command::Init { name, example } => init::exec(name, example.as_deref()),
+        Command::Init {
+            name,
+            example,
+            home,
+        } => init::exec(name, example.as_deref(), home),
         Command::Run {
             pipeline,
             inputs,
@@ -368,6 +389,7 @@ fn dispatch(cli: Cli) {
         ),
         Command::Fetch { dir } => fetch::exec(resolve_root(dir.as_deref())),
         Command::Pipelines { dir } => pipelines::exec(resolve_root(dir.as_deref())),
+        Command::Ls { dir } => pipelines::exec_ls(resolve_root(dir.as_deref())),
         Command::Runs {
             pipeline,
             limit,
@@ -446,55 +468,90 @@ fn dispatch(cli: Cli) {
     }
 }
 
-/// Resolve the project root: use --dir if given, otherwise cwd.
+/// Resolve the project root (ADR-0044) and announce a home-project
+/// fallback on stderr — stderr so it never corrupts `mcp serve`'s stdout.
 fn resolve_root(dir: Option<&Path>) -> PathBuf {
-    dir.map(|d| d.to_path_buf())
-        .unwrap_or_else(|| std::env::current_dir().expect("cannot determine current directory"))
+    let (root, from_home) = locate_root(dir);
+    if from_home {
+        eprintln!(
+            "zymi: no project.yml here — using home project {}",
+            root.display()
+        );
+    }
+    root
 }
 
-/// Inspect the parsed subcommand for its `--dir` argument, if it carries
-/// one. Used solely to seed `.env` loading before dispatch.
-fn command_dir(cmd: &Command) -> Option<&Path> {
+/// Project resolution order (ADR-0044): `--dir`; cwd if it holds
+/// `project.yml`; the home project (`$ZYMI_HOME`, default `~/.zymi`) if it
+/// holds one; otherwise cwd, so the usual "no project.yml" errors surface
+/// unchanged. The bool is true when the home fallback was taken.
+///
+/// Pure (no output) so the venv re-exec and `.env` loading can call it
+/// without announcing the fallback twice.
+pub(crate) fn locate_root(dir: Option<&Path>) -> (PathBuf, bool) {
+    if let Some(d) = dir {
+        return (d.to_path_buf(), false);
+    }
+    let cwd = std::env::current_dir().expect("cannot determine current directory");
+    if cwd.join("project.yml").is_file() {
+        return (cwd, false);
+    }
+    if let Some(home) = crate::config::home::zymi_home() {
+        if home.join("project.yml").is_file() {
+            return (home, true);
+        }
+    }
+    (cwd, false)
+}
+
+/// `Some(--dir)` for project-scoped subcommands (whose root goes through
+/// [`resolve_root`]), `None` for the rest. Used to seed `.env` loading
+/// before dispatch.
+fn project_dir_arg(cmd: &Command) -> Option<Option<&Path>> {
     match cmd {
         Command::Run { dir, .. }
         | Command::Events { dir, .. }
         | Command::Pipelines { dir }
+        | Command::Ls { dir }
         | Command::Runs { dir, .. }
         | Command::Observe { dir, .. }
         | Command::Verify { dir, .. }
         | Command::Serve { dir, .. }
-        | Command::Resume { dir, .. } => dir.as_deref(),
-        Command::Fetch { dir } => dir.as_deref(),
+        | Command::Resume { dir, .. }
+        | Command::Fetch { dir } => Some(dir.as_deref()),
         Command::Mcp { command } => match command {
-            McpCommand::Serve { dir, .. } => dir.as_deref(),
+            McpCommand::Serve { dir, .. } => Some(dir.as_deref()),
             McpCommand::Probe { .. } => None,
         },
         Command::Init { .. } | Command::Schema { .. } => None,
     }
 }
 
-/// Load `.env` next to `project.yml` so users don't have to remember
+/// Load `.env` files so users don't have to remember
 /// `set -a; source .env; set +a` before every CLI invocation.
 ///
-/// Resolution order:
-///   1. The path passed via `--dir`, if the subcommand has one;
-///   2. The current working directory.
+/// Resolution order (ADR-0044), earlier wins:
+///   1. The resolved project root, for project-scoped subcommands;
+///   2. The current working directory;
+///   3. The home project (`$ZYMI_HOME/.env`) — where machine-wide keys,
+///      e.g. for named providers, live.
 ///
 /// Existing process env vars always win — `.env` only fills holes. We
 /// log on parse error but never fail the command: a malformed `.env`
 /// shouldn't take down `zymi schema`.
-fn load_dotenv(explicit_dir: Option<&Path>) {
+fn load_dotenv(project_root: Option<PathBuf>) {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    candidates.extend(project_root);
+    candidates.extend(std::env::current_dir().ok());
+    candidates.extend(crate::config::home::zymi_home());
+
     let mut tried: Vec<PathBuf> = Vec::new();
-    if let Some(d) = explicit_dir {
-        tried.push(d.join(".env"));
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        let cwd_env = cwd.join(".env");
-        if !tried.iter().any(|p| p == &cwd_env) {
-            tried.push(cwd_env);
+    for dir in candidates {
+        let path = dir.join(".env");
+        if tried.contains(&path) {
+            continue;
         }
-    }
-    for path in tried {
+        tried.push(path.clone());
         if !path.exists() {
             continue;
         }

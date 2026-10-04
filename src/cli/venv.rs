@@ -48,13 +48,12 @@ pub fn maybe_reexec(cli: &Cli, forward_args: &[String]) {
     let Some(dir_opt) = pipeline_run_dir(cli) else {
         return;
     };
-    let root = match dir_opt {
-        Some(d) => d.to_path_buf(),
-        None => match std::env::current_dir() {
-            Ok(c) => c,
-            Err(_) => return,
-        },
-    };
+    if std::env::current_dir().is_err() {
+        return;
+    }
+    // Same resolution as dispatch, so a home-project fallback (ADR-0044)
+    // hops into `$ZYMI_HOME/.venv`.
+    let (root, _) = super::locate_root(dir_opt);
 
     let target = venv_zymi_path(&root);
     if !target.is_file() {

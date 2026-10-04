@@ -1,0 +1,11 @@
+name: say
+description: "Print a line of text"
+parameters:
+  type: object
+  properties:
+    text:
+      type: string
+  required: [text]
+implementation:
+  kind: shell
+  command_template: "echo ${args.text}"

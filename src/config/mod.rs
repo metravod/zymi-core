@@ -1,8 +1,10 @@
 pub mod agent;
 pub mod dag;
 pub mod error;
+pub mod home;
 pub mod pipeline;
 pub mod project;
+pub mod providers;
 pub mod template;
 pub mod tool;
 pub mod validate;

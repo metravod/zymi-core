@@ -32,8 +32,19 @@ pub struct ProjectConfig {
     pub version: Option<String>,
     #[serde(default)]
     pub variables: HashMap<String, String>,
-    #[serde(default)]
+    /// Inline provider config, or a provider name from
+    /// `$ZYMI_HOME/providers.yml` (`llm: name` / `llm: { use: name, ... }`,
+    /// ADR-0044), resolved at load time.
+    #[serde(default, deserialize_with = "super::providers::deserialize_llm")]
+    #[schemars(with = "Option<super::providers::LlmSetting>")]
     pub llm: Option<LlmConfig>,
+    /// Why a named `llm:` reference could not be resolved (unknown name,
+    /// unset key, …). Kept instead of failing the load so tool-only
+    /// pipelines still run; the runtime reports it if an agent step needs
+    /// the model (ADR-0044).
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub llm_error: Option<String>,
     #[serde(default)]
     pub defaults: DefaultsConfig,
     #[serde(default)]
@@ -471,8 +482,16 @@ pub fn load_project(path: &Path) -> Result<ProjectConfig, ConfigError> {
     // literal `${env.X}` values (e.g. api_key) downstream as a cryptic 401.
     let resolved = template::resolve_env_templates(&raw, path)?;
 
-    let config: ProjectConfig =
+    let mut config: ProjectConfig =
         serde_yml::from_str(&resolved).map_err(|e| parse_error(path, &resolved, e))?;
+
+    // Named provider (ADR-0044): resolved after the parse so a broken
+    // reference degrades to "no LLM" instead of an unloadable project.
+    match super::providers::resolve_project_llm(&resolved) {
+        Ok(Some(llm)) => config.llm = Some(llm),
+        Ok(None) => {}
+        Err(e) => config.llm_error = Some(e),
+    }
 
     Ok(config)
 }

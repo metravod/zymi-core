@@ -1,0 +1,19 @@
+# Named LLM providers, shared by every zymi project on this machine (ADR-0044).
+#
+# Reference one from any project.yml:
+#   llm: <name>
+#   llm: { use: <name>, model: <other-model> }   # override any field
+#
+# Keys belong in .env next to this file, never here. ${env.*} is resolved
+# only for the provider a project actually uses.
+#
+# neuraldeep:
+#   provider: openai                 # any OpenAI-compatible endpoint
+#   base_url: https://api.neuraldeep.ru/v1
+#   api_key: ${env.NEURALDEEP_API_KEY}
+#   model: qwen3.8-27b
+#
+# claude:
+#   provider: anthropic
+#   api_key: ${env.ANTHROPIC_API_KEY}
+#   model: claude-sonnet-5-5
