@@ -201,6 +201,7 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
         }
 
         let mut handles = Vec::new();
+        let mut handle_ids: Vec<String> = Vec::new();
 
         for step_id in level {
             if let Some(ctx) = &resume {
@@ -326,6 +327,7 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
                         .map(|c| c.mode)
                         .unwrap_or_default();
 
+                    handle_ids.push(step_id.to_string());
                     handles.push(tokio::spawn(async move {
                         run_agent_step(
                             &step_id_owned,
@@ -357,6 +359,7 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
                     let resolved_args =
                         resolve_args_value(args, &cmd.inputs, &step_outputs);
 
+                    handle_ids.push(step_id.to_string());
                     handles.push(tokio::spawn(async move {
                         run_tool_step(
                             &step_id_owned,
@@ -388,6 +391,7 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
                         rt.reasoning_channel(),
                     );
 
+                    handle_ids.push(step_id.to_string());
                     handles.push(tokio::spawn(async move {
                         run_ask_step(
                             &step_id_owned,
@@ -404,10 +408,40 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
             }
         }
 
-        for handle in handles {
-            let result = handle
-                .await
-                .map_err(|e| format!("step task panicked: {e}"))??;
+        for (step_id, handle) in handle_ids.into_iter().zip(handles) {
+            // A step that errors out (LLM unreachable, task panic) used to
+            // `?` straight out of the handler: no WorkflowNodeCompleted, no
+            // PipelineCompleted, no WAL checkpoint — the run sat in `zymi
+            // runs` as "running" forever and its tail was invisible to
+            // `zymi events`. Seal it as a failed step and halt instead.
+            let result = match handle.await {
+                Ok(Ok(result)) => Ok(result),
+                Ok(Err(e)) => Err(e),
+                Err(e) => Err(format!("step task panicked: {e}")),
+            };
+            let result = match result {
+                Ok(result) => result,
+                Err(e) => {
+                    emit_event(
+                        rt.bus(),
+                        &stream_id,
+                        correlation_id,
+                        EventKind::WorkflowNodeCompleted {
+                            node_id: step_id.clone(),
+                            success: false,
+                        },
+                    )
+                    .await;
+                    if is_local_cli_run {
+                        println!("    [{step_id}] FAILED");
+                    }
+                    overall_success = false;
+                    if halt.is_none() {
+                        halt = Some(e);
+                    }
+                    continue;
+                }
+            };
 
             if is_local_cli_run {
                 println!(

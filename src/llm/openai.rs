@@ -14,7 +14,12 @@ pub struct OpenAiProvider {
     base_url: String,
     api_key: Option<String>,
     model: String,
+    stream: bool,
 }
+
+/// A non-streamed request that fails after at least this long without a
+/// response is reported as [`LlmError::Dropped`] (gateway timeout hint).
+const DROPPED_AFTER: std::time::Duration = std::time::Duration::from_secs(45);
 
 impl OpenAiProvider {
     pub fn new(base_url: String, api_key: Option<String>, model: String) -> Self {
@@ -23,14 +28,25 @@ impl OpenAiProvider {
             base_url,
             api_key,
             model,
+            stream: false,
         }
+    }
+
+    /// Request the completion as an SSE stream (`LlmConfig::stream`).
+    pub fn with_stream(mut self, stream: bool) -> Self {
+        self.stream = stream;
+        self
     }
 }
 
 #[async_trait]
 impl LlmProvider for OpenAiProvider {
     async fn chat_completion(&self, request: &ChatRequest) -> Result<ChatResponse, LlmError> {
-        let oai_request = build_request(&self.model, request);
+        let mut oai_request = build_request(&self.model, request);
+        if self.stream {
+            oai_request.stream = Some(true);
+            oai_request.stream_options = Some(serde_json::json!({ "include_usage": true }));
+        }
         let url = format!("{}/chat/completions", self.base_url);
 
         let mut http = self.client.post(&url);
@@ -38,7 +54,21 @@ impl LlmProvider for OpenAiProvider {
             http = http.bearer_auth(key);
         }
 
-        let resp = http.json(&oai_request).send().await?;
+        let started = std::time::Instant::now();
+        let dropped = |e: reqwest::Error| -> LlmError {
+            let elapsed = started.elapsed();
+            if !self.stream && elapsed >= DROPPED_AFTER && !e.is_timeout() {
+                LlmError::Dropped {
+                    url: url.clone(),
+                    elapsed_secs: elapsed.as_secs(),
+                    cause: super::error::source_chain(&e),
+                }
+            } else {
+                LlmError::Http(e)
+            }
+        };
+
+        let mut resp = http.json(&oai_request).send().await.map_err(dropped)?;
 
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
@@ -49,12 +79,166 @@ impl LlmProvider for OpenAiProvider {
             });
         }
 
-        let oai_resp: OaiResponse = resp
-            .json()
-            .await
-            .map_err(|e| LlmError::Serialization(e.to_string()))?;
+        if !self.stream {
+            let oai_resp: OaiResponse = resp
+                .json()
+                .await
+                .map_err(|e| LlmError::Serialization(e.to_string()))?;
+            return parse_response(oai_resp);
+        }
 
-        parse_response(oai_resp)
+        let mut acc = StreamAcc::default();
+        let mut buf: Vec<u8> = Vec::new();
+        while let Some(chunk) = resp.chunk().await? {
+            buf.extend_from_slice(&chunk);
+            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = buf.drain(..=pos).collect();
+                let line = String::from_utf8_lossy(&line);
+                if acc.feed_line(line.trim_end())? {
+                    return parse_response(acc.finish());
+                }
+            }
+        }
+        if !buf.is_empty() {
+            acc.feed_line(String::from_utf8_lossy(&buf).trim_end())?;
+        }
+        parse_response(acc.finish())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Streaming (SSE) — accumulated into the same OaiResponse the plain path
+// parses, so the rest of the provider can't tell the difference.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default)]
+struct StreamAcc {
+    model: String,
+    content: String,
+    saw_content: bool,
+    tool_calls: Vec<OaiToolCall>,
+    usage: Option<OaiUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OaiChunk {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    choices: Vec<OaiChunkChoice>,
+    #[serde(default)]
+    usage: Option<OaiUsage>,
+    #[serde(default)]
+    error: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OaiChunkChoice {
+    #[serde(default)]
+    delta: Option<OaiDelta>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OaiDelta {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<OaiDeltaToolCall>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OaiDeltaToolCall {
+    #[serde(default)]
+    index: Option<usize>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<OaiDeltaFunction>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OaiDeltaFunction {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+impl StreamAcc {
+    /// Feed one SSE line. Returns `true` on the `[DONE]` sentinel.
+    fn feed_line(&mut self, line: &str) -> Result<bool, LlmError> {
+        let Some(data) = line.strip_prefix("data:") else {
+            return Ok(false); // blank separators, `event:` / `:` comments
+        };
+        let data = data.trim();
+        if data == "[DONE]" {
+            return Ok(true);
+        }
+        if data.is_empty() {
+            return Ok(false);
+        }
+        let chunk: OaiChunk = serde_json::from_str(data)
+            .map_err(|e| LlmError::Serialization(format!("bad stream chunk ({e}): {data}")))?;
+        if let Some(err) = chunk.error {
+            return Err(LlmError::Api {
+                status: 200,
+                message: err.to_string(),
+            });
+        }
+        if let Some(model) = chunk.model {
+            self.model = model;
+        }
+        if chunk.usage.is_some() {
+            self.usage = chunk.usage;
+        }
+        for choice in chunk.choices {
+            let Some(delta) = choice.delta else { continue };
+            if let Some(text) = delta.content {
+                self.saw_content = true;
+                self.content.push_str(&text);
+            }
+            for tc in delta.tool_calls.unwrap_or_default() {
+                let idx = tc.index.unwrap_or(self.tool_calls.len().saturating_sub(1));
+                while self.tool_calls.len() <= idx {
+                    self.tool_calls.push(OaiToolCall {
+                        id: String::new(),
+                        r#type: "function".into(),
+                        function: OaiFunction {
+                            name: String::new(),
+                            arguments: String::new(),
+                        },
+                    });
+                }
+                let slot = &mut self.tool_calls[idx];
+                if let Some(id) = tc.id {
+                    slot.id = id;
+                }
+                if let Some(f) = tc.function {
+                    if let Some(name) = f.name {
+                        slot.function.name.push_str(&name);
+                    }
+                    if let Some(args) = f.arguments {
+                        slot.function.arguments.push_str(&args);
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    fn finish(self) -> OaiResponse {
+        OaiResponse {
+            model: self.model,
+            choices: vec![OaiChoice {
+                message: OaiMessage {
+                    role: "assistant".into(),
+                    content: self.saw_content.then_some(self.content),
+                    tool_calls: (!self.tool_calls.is_empty()).then_some(self.tool_calls),
+                    tool_call_id: None,
+                },
+            }],
+            usage: self.usage,
+        }
     }
 }
 
@@ -74,6 +258,10 @@ struct OaiRequest {
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_completion_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -185,6 +373,8 @@ fn build_request(model: &str, request: &ChatRequest) -> OaiRequest {
         temperature,
         max_tokens,
         max_completion_tokens,
+        stream: None,
+        stream_options: None,
     }
 }
 
@@ -308,6 +498,76 @@ fn parse_response(resp: OaiResponse) -> Result<ChatResponse, LlmError> {
 mod tests {
     use super::*;
     use crate::types::ToolDefinition;
+
+    fn feed_all(sse: &str) -> ChatResponse {
+        let mut acc = StreamAcc::default();
+        for line in sse.lines() {
+            if acc.feed_line(line).unwrap() {
+                break;
+            }
+        }
+        parse_response(acc.finish()).unwrap()
+    }
+
+    #[test]
+    fn stream_accumulates_text_and_usage() {
+        // Shape captured from an OpenAI-compatible gateway (vLLM behind a
+        // proxy): role chunk, content deltas, finish chunk, usage-only chunk.
+        let sse = r#"data: {"id":"c1","model":"qwen3.8-27b","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}
+
+data: {"id":"c1","model":"qwen3.8-27b","choices":[{"index":0,"delta":{"content":"Рейк"}}]}
+
+data: {"id":"c1","model":"qwen3.8-27b","choices":[{"index":0,"delta":{"content":"ьявик"}}]}
+
+data: {"id":"c1","model":"qwen3.8-27b","choices":[{"finish_reason":"stop","index":0,"delta":{}}]}
+
+data: {"id":"c1","model":"qwen3.8-27b","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":3}}
+
+data: [DONE]
+"#;
+        let resp = feed_all(sse);
+        assert_eq!(resp.model, "qwen3.8-27b");
+        match resp.message {
+            Message::Assistant { content, tool_calls } => {
+                assert_eq!(content.as_deref(), Some("Рейкьявик"));
+                assert!(tool_calls.is_empty());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(resp.usage.input_tokens, 12);
+        assert_eq!(resp.usage.output_tokens, 3);
+    }
+
+    #[test]
+    fn stream_accumulates_tool_call_fragments() {
+        let sse = r#"data: {"model":"m","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"write_file","arguments":""}}]}}]}
+data: {"model":"m","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":"}}]}}]}
+data: {"model":"m","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"a.md\"}"}}]}}]}
+data: {"model":"m","choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_2","function":{"name":"read_file","arguments":"{}"}}]}}]}
+data: [DONE]
+"#;
+        let resp = feed_all(sse);
+        match resp.message {
+            Message::Assistant { content, tool_calls } => {
+                assert!(content.is_none());
+                assert_eq!(tool_calls.len(), 2);
+                assert_eq!(tool_calls[0].id, "call_1");
+                assert_eq!(tool_calls[0].name, "write_file");
+                assert_eq!(tool_calls[0].arguments, r#"{"path":"a.md"}"#);
+                assert_eq!(tool_calls[1].name, "read_file");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_error_chunk_is_an_api_error() {
+        let mut acc = StreamAcc::default();
+        let err = acc
+            .feed_line(r#"data: {"error":{"message":"overloaded"}}"#)
+            .unwrap_err();
+        assert!(err.to_string().contains("overloaded"), "{err}");
+    }
 
     #[test]
     fn build_request_basic() {

@@ -55,6 +55,7 @@ pub(crate) struct LlmRef {
     base_url: Option<String>,
     model: Option<String>,
     api_key: Option<String>,
+    stream: Option<bool>,
 }
 
 /// `deserialize_with` for `ProjectConfig::llm`: shape only. The inline form

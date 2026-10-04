@@ -190,6 +190,8 @@ llm: neuraldeep
 llm: { use: neuraldeep, model: qwen3-coder }
 ```
 
+**Long generations behind a gateway.** Many OpenAI-compatible endpoints sit behind a proxy that cuts a request with no response after ~60s — a long or reasoning-heavy generation then fails with `connection closed after 60s without a response`. Add `stream: true` to the provider (inline `llm:` or a `providers.yml` entry): the completion arrives as an SSE stream, so the connection stays busy while the model writes ([ADR-0045](../adr/0045-opt-in-sse-streaming-for-openai-compatible-providers.md)). OpenAI-compatible providers only.
+
 The name is resolved when the project loads; the runtime sees an ordinary inline config. `${env.*}` is resolved only for the provider actually used. A reference that doesn't resolve (unknown name, missing `providers.yml`, unset key) doesn't break the project: tool-only pipelines still run, and only a pipeline with an agent step fails — with the file path and the list of providers that do exist. Named references are machine-local — a project meant to be shared should keep its `llm:` inline.
 
 ## Gotchas

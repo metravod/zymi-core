@@ -12,6 +12,7 @@
 #   base_url: https://api.neuraldeep.ru/v1
 #   api_key: ${env.NEURALDEEP_API_KEY}
 #   model: qwen3.8-27b
+#   stream: true                     # behind a gateway that cuts requests at ~60s
 #
 # claude:
 #   provider: anthropic

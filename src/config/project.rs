@@ -269,6 +269,12 @@ pub struct LlmConfig {
     pub model: String,
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Stream the completion (SSE) instead of waiting for one JSON body.
+    /// OpenAI-compatible providers only. Turn it on for endpoints behind a
+    /// gateway that cuts idle requests (commonly at 60s) — a long generation
+    /// otherwise dies with "connection closed" before the first byte.
+    #[serde(default)]
+    pub stream: bool,
 }
 
 /// Default values inherited by agents unless overridden.

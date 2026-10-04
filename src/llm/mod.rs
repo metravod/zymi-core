@@ -77,7 +77,8 @@ pub fn create_provider(config: &LlmConfig) -> Result<Box<dyn LlmProvider>, LlmEr
                 base_url,
                 config.api_key.clone(),
                 config.model.clone(),
-            )))
+            )
+            .with_stream(config.stream)))
         }
         "ollama" => {
             let base_url = config
@@ -88,7 +89,8 @@ pub fn create_provider(config: &LlmConfig) -> Result<Box<dyn LlmProvider>, LlmEr
                 base_url,
                 config.api_key.clone(),
                 config.model.clone(),
-            )))
+            )
+            .with_stream(config.stream)))
         }
         "vllm" => {
             let base_url = config
@@ -99,7 +101,8 @@ pub fn create_provider(config: &LlmConfig) -> Result<Box<dyn LlmProvider>, LlmEr
                 base_url,
                 config.api_key.clone(),
                 config.model.clone(),
-            )))
+            )
+            .with_stream(config.stream)))
         }
         "together" => {
             let base_url = config
@@ -110,9 +113,15 @@ pub fn create_provider(config: &LlmConfig) -> Result<Box<dyn LlmProvider>, LlmEr
                 base_url,
                 config.api_key.clone(),
                 config.model.clone(),
-            )))
+            )
+            .with_stream(config.stream)))
         }
         "anthropic" => {
+            if config.stream {
+                return Err(LlmError::InvalidConfig(
+                    "`stream: true` is only supported for OpenAI-compatible providers".into(),
+                ));
+            }
             let api_key = config.api_key.clone().ok_or_else(|| {
                 LlmError::InvalidConfig("Anthropic provider requires an api_key".into())
             })?;
@@ -142,6 +151,7 @@ mod tests {
             base_url: None,
             model: "test-model".into(),
             api_key: Some("sk-test".into()),
+            stream: false,
         }
     }
 
@@ -189,6 +199,7 @@ mod tests {
             base_url: None,
             model: "claude-sonnet-4-20250514".into(),
             api_key: None,
+            stream: false,
         };
         let err = create_provider(&cfg).unwrap_err();
         assert!(matches!(err, LlmError::InvalidConfig(_)));
@@ -202,6 +213,7 @@ mod tests {
             base_url: Some("http://localhost:1234/v1".into()),
             model: "local-model".into(),
             api_key: None,
+            stream: false,
         };
         assert!(create_provider(&cfg).is_ok());
     }
