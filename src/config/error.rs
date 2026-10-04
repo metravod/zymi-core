@@ -17,7 +17,9 @@ pub enum ConfigError {
         source: std::io::Error,
     },
 
-    #[error("invalid YAML in {path}")]
+    // `detail` is in the message itself: the CLI prints errors via Display,
+    // which drops miette's `#[help]`, leaving a bare "invalid YAML".
+    #[error("invalid YAML in {path}: {detail}")]
     #[diagnostic(code(zymi::config::parse))]
     Parse {
         path: PathBuf,

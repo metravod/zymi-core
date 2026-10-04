@@ -1,0 +1,19 @@
+# A deterministic pipeline: tool steps only, no LLM involved.
+# Try it:  zymi run hello        (asks for `who`)
+#          zymi run hello -i who=world
+name: hello
+description: "Example — greet someone without any LLM"
+
+inputs:
+  - name: who
+    required: true
+    description: "Who to greet"
+
+steps:
+  - id: greet
+    tool: say
+    args:
+      text: "hello, ${inputs.who}"
+
+output:
+  step: greet

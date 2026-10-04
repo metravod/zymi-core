@@ -629,9 +629,17 @@ impl RuntimeBuilder {
                 )),
                 None => {
                     if workspace.has_agent_step() {
+                        if let Some(e) = &workspace.project.llm_error {
+                            return Err(format!("cannot resolve `llm:` in project.yml: {e}"));
+                        }
                         return Err("no 'llm' section in project.yml — a pipeline has an \
                              agent step; configure a provider to run it"
                             .into());
+                    }
+                    // A named provider that didn't resolve is harmless until an
+                    // agent step needs it (ADR-0044) — say so, don't fail.
+                    if let Some(e) = &workspace.project.llm_error {
+                        log::warn!("`llm:` not resolved, agent steps unavailable: {e}");
                     }
                     None
                 }

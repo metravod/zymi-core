@@ -26,6 +26,14 @@ const DEFAULT_PROJECT_YML: &str = include_str!("../../assets/scaffold/default/pr
 const DEFAULT_AGENT_YML: &str = include_str!("../../assets/scaffold/default/agents/default.yml");
 const DEFAULT_PIPELINE_YML: &str = include_str!("../../assets/scaffold/default/pipelines/main.yml");
 
+// Home project scaffold (ADR-0044) — a lean personal library: no agent
+// pipeline (so it runs without an LLM), plus the machine-wide providers.yml.
+const HOME_PROJECT_YML: &str = include_str!("../../assets/scaffold/home/project.yml");
+const HOME_PROVIDERS_YML: &str = include_str!("../../assets/scaffold/home/providers.yml");
+const HOME_ENV_EXAMPLE: &str = include_str!("../../assets/scaffold/home/.env.example");
+const HOME_HELLO_PIPELINE_YML: &str = include_str!("../../assets/scaffold/home/pipelines/hello.yml");
+const HOME_SAY_TOOL: &str = include_str!("../../assets/scaffold/home/tools/say.yml");
+
 // Telegram example scaffold.
 const TG_PROJECT_YML: &str = include_str!("../../assets/scaffold/telegram/project.yml");
 const TG_ASSISTANT_YML: &str = include_str!("../../assets/scaffold/telegram/agents/assistant.yml");
@@ -64,7 +72,7 @@ fn ensure_gitignore(root: &Path, lines: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
-pub fn exec(name: Option<String>, example: Option<&str>) -> Result<(), String> {
+pub fn exec(name: Option<String>, example: Option<&str>, home: bool) -> Result<(), String> {
     if let Some(ex) = example {
         if !KNOWN_EXAMPLES.contains(&ex) {
             return Err(format!(
@@ -74,9 +82,21 @@ pub fn exec(name: Option<String>, example: Option<&str>) -> Result<(), String> {
         }
     }
 
-    let cwd = std::env::current_dir().map_err(|e| format!("cannot determine cwd: {e}"))?;
+    // `--home` targets the personal home project (ADR-0044); its dir name
+    // (`.zymi`) makes a poor project name, hence the "home" default.
+    let (cwd, default_name) = if home {
+        let dir = crate::config::home::zymi_home().ok_or(
+            "cannot locate the home project: set ZYMI_HOME or HOME",
+        )?;
+        fs::create_dir_all(&dir)
+            .map_err(|e| format!("failed to create {}: {e}", dir.display()))?;
+        (dir, Some("home".to_string()))
+    } else {
+        let cwd = std::env::current_dir().map_err(|e| format!("cannot determine cwd: {e}"))?;
+        (cwd, None)
+    };
 
-    let project_name = name.unwrap_or_else(|| {
+    let project_name = name.or(default_name).unwrap_or_else(|| {
         cwd.file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("my-project")
@@ -93,6 +113,7 @@ pub fn exec(name: Option<String>, example: Option<&str>) -> Result<(), String> {
     create_dir(&cwd, ".zymi")?;
 
     match example {
+        _ if home => scaffold_home(&cwd, &project_name)?,
         Some("telegram") => scaffold_telegram(&cwd, &project_name)?,
         _ => scaffold_default(&cwd, &project_name)?,
     }
@@ -136,6 +157,43 @@ fn scaffold_default(root: &Path, project_name: &str) -> Result<(), String> {
     println!("  3. zymi run main             # or `zymi serve main` for long-lived service");
     println!();
     println!("If `zymi` is not on PATH yet:  uv tool install zymi-core");
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Home project scaffold (ADR-0044)
+// ---------------------------------------------------------------------------
+
+fn scaffold_home(root: &Path, project_name: &str) -> Result<(), String> {
+    write_file(&root.join("project.yml"), &render(HOME_PROJECT_YML, project_name))?;
+    write_file(&root.join("providers.yml"), HOME_PROVIDERS_YML)?;
+    write_file(&root.join(".env.example"), HOME_ENV_EXAMPLE)?;
+    write_file(&root.join("pipelines/hello.yml"), HOME_HELLO_PIPELINE_YML)?;
+    write_file(&root.join("tools/say.yml"), HOME_SAY_TOOL)?;
+    write_file(&root.join("AGENTS.md"), AGENTS_DOC)?;
+    write_file(
+        &root.join("pyproject.toml"),
+        &render_pyproject(SHARED_PYPROJECT_TOML, project_name),
+    )?;
+    write_file(&root.join(".python-version"), SHARED_PYTHON_VERSION)?;
+    ensure_gitignore(root, &[".env", ".venv/", ".zymi/", "__pycache__/"])?;
+
+    println!("Initialized home project at {}", root.display());
+    println!();
+    println!("  project.yml              — library config (no LLM needed for tool-only pipelines)");
+    println!("  providers.yml            — named LLM providers, usable as `llm: <name>` in any project");
+    println!("  .env.example             — machine-wide keys; copy to .env");
+    println!("  pipelines/hello.yml      — example deterministic pipeline");
+    println!("  tools/say.yml            — the shell tool it uses");
+    println!("  AGENTS.md                — guide for AI assistants editing this project");
+    println!("  pyproject.toml           — Python deps for @tool files (`zymi fetch`)");
+    println!();
+    println!("From any directory that is not itself a zymi project:");
+    println!("  zymi ls                  # what can I run");
+    println!("  zymi run hello           # missing inputs are asked interactively");
+    println!();
+    println!("Worth keeping in a private git repo — .env is already ignored.");
 
     Ok(())
 }

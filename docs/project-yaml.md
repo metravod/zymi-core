@@ -98,7 +98,7 @@ store: sqlite                 # default. Or:
 | `name` | yes | Logical project name |
 | `schema_version` | no | YAML contract version (currently `"1"`) |
 | `version` | no | Free-form project version |
-| `llm` | no\* | LLM provider config — required for any agent step |
+| `llm` | no\* | LLM provider config — required for any agent step. Inline, or a [named provider](#named-providers) |
 | `variables` | no | Named values reusable as `${var_name}` |
 | `defaults` | no | `timeout_secs`, `max_iterations` defaults for agents |
 | `policy` | no | Shell command allow/deny lists |
@@ -169,6 +169,28 @@ approvals:
 
 store: ${env.DATABASE_URL}    # postgres://...
 ```
+
+## Named providers
+
+Declare an endpoint once per machine in `$ZYMI_HOME/providers.yml` (default `~/.zymi/providers.yml`, ADR-0044) and reference it from any project:
+
+```yaml
+# ~/.zymi/providers.yml
+neuraldeep:
+  provider: openai                   # any OpenAI-compatible endpoint
+  base_url: https://api.neuraldeep.ru/v1
+  api_key: ${env.NEURALDEEP_API_KEY} # key in ~/.zymi/.env
+  model: qwen3.8-27b
+```
+
+```yaml
+# project.yml
+llm: neuraldeep
+# or, overriding any field:
+llm: { use: neuraldeep, model: qwen3-coder }
+```
+
+The name is resolved when the project loads; the runtime sees an ordinary inline config. `${env.*}` is resolved only for the provider actually used. A reference that doesn't resolve (unknown name, missing `providers.yml`, unset key) doesn't break the project: tool-only pipelines still run, and only a pipeline with an agent step fails — with the file path and the list of providers that do exist. Named references are machine-local — a project meant to be shared should keep its `llm:` inline.
 
 ## Gotchas
 

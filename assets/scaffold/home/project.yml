@@ -1,0 +1,23 @@
+name: __PROJECT_NAME__
+version: "0.1"
+
+# Your personal pipeline library (ADR-0044). Any zymi command run outside a
+# zymi project lands here: `zymi ls` to browse, `zymi run <name>` to run —
+# missing inputs are asked interactively.
+#
+# Pipelines built only from tool steps need no LLM at all, so they keep
+# working when no model (or coding agent) is available. For agent steps,
+# name a provider from providers.yml — or write the full config inline:
+#
+# llm: neuraldeep
+# llm: { use: neuraldeep, model: qwen3-coder }   # same endpoint, other model
+
+# Shell commands of tools/*.yml go through this policy. Without it every
+# command asks for approval; with it, `allow:` runs unattended, anything
+# unlisted asks first. Pipelines that touch real servers deserve
+# `require_approval:` — `zymi run` from the wrong terminal lands here too.
+policy:
+  enabled: true
+  allow: ["echo *"]
+  # require_approval: ["ssh *"]
+  deny: ["rm -rf *"]
