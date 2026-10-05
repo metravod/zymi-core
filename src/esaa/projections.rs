@@ -215,6 +215,7 @@ mod tests {
                 has_tool_calls: false,
                 usage: None,
                 content_preview: None,
+                finish_reason: None,
             },
         ));
 
@@ -264,6 +265,7 @@ mod tests {
                     ..Default::default()
                 }),
                 content_preview: None,
+                finish_reason: None,
             },
         ));
 
@@ -303,6 +305,7 @@ mod tests {
                     ..Default::default()
                 }),
                 content_preview: Some("hello world".into()),
+                finish_reason: None,
             },
         ));
 
@@ -430,6 +433,7 @@ mod tests {
                 has_tool_calls: false,
                 usage: None,
                 content_preview: None,
+                finish_reason: None,
             },
         ));
         assert!(proj.is_empty());
@@ -462,6 +466,7 @@ mod tests {
                         ..Default::default()
                     }),
                     content_preview: None,
+                    finish_reason: None,
                 },
             ),
             make_event(

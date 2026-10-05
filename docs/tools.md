@@ -160,6 +160,8 @@ Set `requires_approval: true` on a tool (declarative, MCP, or via `@tool(require
 
 ## Gotchas
 
+- **Tool output is never truncated** (≥0.9.3, ADR-0046). Shell stdout, HTTP bodies and `read_file` go into the event log and the model's context whole. Above 1 MB the call fails with an explicit "narrow the command" error instead — a silently cut prefix gets its gaps filled in by the model. If a tool is chatty, make it print less (or write a file and read the part you need).
+
 - **Tool name collisions are a startup error.** Pick globally unique names.
 - **`${args.X}` is call-time, `${env.X}` is parse-time.** Mixing them up means stale or empty values.
 - **Explicit `requires_approval: true` always prompts; the shell default defers to `policy:`.** To run a read-only shell utility without prompting, allowlist its command in `policy.allow` and don't mark the tool. Explicit `requires_approval: false` does *not* bypass the policy gate — non-allowlisted commands still ask.

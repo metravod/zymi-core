@@ -88,7 +88,7 @@ List and inspect events from the store.
 
 ```bash
 zymi events                                  # last 50 events across all streams
-zymi events --stream <stream-id>             # all events for one stream
+zymi events --stream <stream-id>             # one run, incl. its per-step tool/LLM events
 zymi events --kind WorkflowNodeCompleted
 zymi events --raw                            # one JSON event per line
 ```
@@ -101,6 +101,8 @@ zymi events --raw                            # one JSON event per line
 | `--raw` | Emit raw JSON, one event per line. |
 | `-v, --verbose` | Extended detail per event. |
 | `-d, --dir PATH` | Project root. |
+
+`--stream` merges in the run's per-step sub-streams (`<run>:step:<id>`, where tool calls and LLM calls are recorded) in time order, tagging those events with `[step]`. A failed model call shows up as `llm_call_failed` with the error and elapsed time.
 
 ## `zymi runs`
 

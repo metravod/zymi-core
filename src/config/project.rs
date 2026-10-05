@@ -284,6 +284,10 @@ pub struct DefaultsConfig {
     pub timeout_secs: u64,
     #[serde(default = "default_max_iterations")]
     pub max_iterations: usize,
+    /// Default cap on one model answer, in tokens; agents override it
+    /// with their own `max_tokens:`.
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: u32,
 }
 
 impl Default for DefaultsConfig {
@@ -291,6 +295,7 @@ impl Default for DefaultsConfig {
         Self {
             timeout_secs: default_timeout(),
             max_iterations: default_max_iterations(),
+            max_tokens: default_max_tokens(),
         }
     }
 }
@@ -300,6 +305,9 @@ fn default_timeout() -> u64 {
 }
 fn default_max_iterations() -> usize {
     10
+}
+fn default_max_tokens() -> u32 {
+    4096
 }
 
 /// Boundary contract configuration.

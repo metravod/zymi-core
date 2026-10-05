@@ -647,6 +647,7 @@ mod tests {
                     ..Default::default()
                 }),
                 content_preview: Some(content.into()),
+                finish_reason: None,
             },
             correlation_id: None,
             causation_id: None,
@@ -668,6 +669,7 @@ mod tests {
                 has_tool_calls: false,
                 usage: None,
                 content_preview: Some("pre-enrichment".into()),
+                finish_reason: None,
             },
             correlation_id: None,
             causation_id: None,
@@ -791,6 +793,7 @@ mod tests {
                     ..Default::default()
                 },
                 model: "mock".into(),
+                finish_reason: None,
             })
         }
     }
@@ -810,6 +813,7 @@ mod tests {
                 system_prompt: Some("you are researcher".into()),
                 tools: vec![],
                 max_iterations: Some(3),
+                max_tokens: None,
                 timeout_secs: None,
                 policy: None,
             },
@@ -875,6 +879,84 @@ mod tests {
             }
         }
         Err("no parent stream found".into())
+    }
+
+    /// Provider that fails every call, or answers cut off at max_tokens.
+    #[derive(Debug)]
+    enum BrokenProvider {
+        Unreachable,
+        CutOff,
+    }
+
+    #[async_trait]
+    impl LlmProvider for BrokenProvider {
+        async fn chat_completion(
+            &self,
+            _request: &ChatRequest,
+        ) -> Result<ChatResponse, LlmError> {
+            match self {
+                Self::Unreachable => Err(LlmError::Api {
+                    status: 502,
+                    message: "gateway reset".into(),
+                }),
+                Self::CutOff => Ok(ChatResponse {
+                    message: Message::Assistant {
+                        content: Some("# Report\n| host | disk |\n| a | 4".into()),
+                        tool_calls: vec![],
+                    },
+                    usage: TokenUsage::default(),
+                    model: "mock".into(),
+                    finish_reason: Some("length".into()),
+                }),
+            }
+        }
+    }
+
+    async fn run_with(provider: BrokenProvider) -> (Result<String, String>, Vec<EventKind>, Arc<dyn EventStore>) {
+        let dir = TempDir::new().unwrap();
+        let store = open_store(StoreBackend::Sqlite { path: dir.path().join("events.db") }).unwrap();
+        let rt = Runtime::builder(make_workspace(), dir.path().to_path_buf())
+            .with_store(store.clone())
+            .with_llm_provider(Arc::new(provider) as Arc<dyn LlmProvider>)
+            .build()
+            .unwrap();
+        let cmd = crate::commands::RunPipeline::new("research", HashMap::new());
+        let result = run_pipeline_handler::handle(&rt, cmd).await.map(|r| r.stream_id);
+        let mut kinds = Vec::new();
+        for (sid, _) in store.list_streams().await.unwrap() {
+            for e in store.read_stream(&sid, 1).await.unwrap() {
+                kinds.push(e.kind);
+            }
+        }
+        (result, kinds, store)
+    }
+
+    // ADR-0046: a failed provider call is recorded, and the run is sealed
+    // (it used to `?` out, leaving the run "running" with no terminal event).
+    #[tokio::test]
+    async fn failed_llm_call_is_an_event_and_seals_the_run() {
+        let (result, kinds, _store) = run_with(BrokenProvider::Unreachable).await;
+        let err = result.unwrap_err();
+        assert!(err.contains("gateway reset"), "{err}");
+        assert!(kinds.iter().any(|k| matches!(k,
+            EventKind::LlmCallFailed { error, .. } if error.contains("gateway reset"))));
+        assert!(kinds.iter().any(|k| matches!(k,
+            EventKind::WorkflowNodeCompleted { node_id, success: false } if node_id == "search")));
+        assert!(kinds.iter().any(|k| matches!(k,
+            EventKind::PipelineCompleted { success: false, error: Some(_), .. })));
+    }
+
+    // ADR-0046: an answer cut at max_tokens fails the step instead of being
+    // passed on as if complete; the partial text stays in the record.
+    #[tokio::test]
+    async fn answer_cut_at_max_tokens_fails_the_step() {
+        let (result, kinds, _store) = run_with(BrokenProvider::CutOff).await;
+        let err = result.unwrap_err();
+        assert!(err.contains("max_tokens (4096)"), "{err}");
+        assert!(kinds.iter().any(|k| matches!(k,
+            EventKind::LlmCallCompleted { finish_reason: Some(r), .. } if r == "length")));
+        assert!(kinds.iter().any(|k| matches!(k,
+            EventKind::PipelineCompleted { success: false, .. })));
     }
 
     #[tokio::test]

@@ -588,6 +588,7 @@ mod tests {
                     ..Default::default()
                 },
                 model: "mock".into(),
+                finish_reason: None,
             })
         }
     }
@@ -628,6 +629,7 @@ mod tests {
                 system_prompt: Some("be terse".into()),
                 tools: vec![],
                 max_iterations: Some(1),
+                max_tokens: None,
                 timeout_secs: None,
                 policy: None,
             },

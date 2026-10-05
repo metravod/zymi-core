@@ -513,6 +513,7 @@ mod tests {
             system_prompt: None,
             tools: tools.into_iter().map(String::from).collect(),
             max_iterations: None,
+            max_tokens: None,
             timeout_secs: None,
             policy: None,
         }

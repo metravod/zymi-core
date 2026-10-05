@@ -23,6 +23,11 @@ pub struct AgentConfig {
     pub tools: Vec<String>,
     #[serde(default)]
     pub max_iterations: Option<usize>,
+    /// Cap on one model answer, in tokens (reasoning tokens count too).
+    /// Falls back to `defaults.max_tokens`. An answer that hits it fails
+    /// the step instead of passing on cut-off text (ADR-0046).
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
     #[serde(default)]
     pub timeout_secs: Option<u64>,
     #[serde(default)]

@@ -351,6 +351,7 @@ impl ContextBuilder {
                 has_tool_calls: false,
                 usage: Some(response.usage),
                 content_preview: Some(truncate_str(&summary, 100).to_string()),
+                finish_reason: None,
             },
         )
         .await;
@@ -690,6 +691,7 @@ mod tests {
                 has_tool_calls: true,
                 usage: Some(TokenUsage { input_tokens: 100, output_tokens: 50, ..Default::default() }),
                 content_preview: Some("I'll read the file.".into()),
+                finish_reason: None,
             },
         )
         .await;
@@ -755,6 +757,7 @@ mod tests {
                 has_tool_calls: true,
                 usage: None,
                 content_preview: Some("Let me check.".into()),
+                finish_reason: None,
             },
         )
         .await;
@@ -824,6 +827,7 @@ mod tests {
                     has_tool_calls: true,
                     usage: None,
                     content_preview: None,
+                    finish_reason: None,
                 },
             )
             .await;
@@ -902,6 +906,7 @@ mod tests {
                 has_tool_calls: true,
                 usage: None,
                 content_preview: None,
+                finish_reason: None,
             },
         )
         .await;
@@ -1020,6 +1025,7 @@ mod tests {
                 has_tool_calls: true,
                 usage: None,
                 content_preview: None,
+                finish_reason: None,
             },
         )
         .await;
@@ -1052,6 +1058,7 @@ mod tests {
                 has_tool_calls: false,
                 usage: None,
                 content_preview: None,
+                finish_reason: None,
             },
         )
         .await;
@@ -1097,6 +1104,7 @@ mod tests {
                     has_tool_calls: true,
                     usage: None,
                     content_preview: None,
+                    finish_reason: None,
                 },
             )
             .await;
@@ -1171,6 +1179,7 @@ mod tests {
                     has_tool_calls: true,
                     usage: None,
                     content_preview: None,
+                    finish_reason: None,
                 },
             )
             .await;
@@ -1237,6 +1246,7 @@ mod tests {
                 has_tool_calls: true,
                 usage: None,
                 content_preview: None,
+                finish_reason: None,
             },
         )
         .await;
@@ -1290,6 +1300,7 @@ mod tests {
                 has_tool_calls: true,
                 usage: None,
                 content_preview: None,
+                finish_reason: None,
             },
         )
         .await;
@@ -1376,6 +1387,7 @@ mod tests {
                     ..Default::default()
                 },
                 model: "mock".into(),
+                finish_reason: None,
             })
         }
     }
@@ -1409,6 +1421,7 @@ mod tests {
                     has_tool_calls: true,
                     usage: None,
                     content_preview: None,
+                    finish_reason: None,
                 },
             )
             .await;

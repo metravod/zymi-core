@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::config::tool::{HttpMethod, ImplementationConfig};
-use crate::engine::tools::{execute_builtin_tool, MemoryStore};
+use crate::engine::tools::{execute_builtin_tool, full_output, output_for_error, MemoryStore};
 use crate::mcp::McpRegistry;
 use super::shell_session::{ShellSessionPool};
 use super::tool_catalog::ToolCatalog;
@@ -346,21 +346,21 @@ impl CatalogActionExecutor {
         if output.timed_out {
             Err(format!(
                 "command timed out after {timeout_secs}s\nstdout: {}\nstderr: {}",
-                truncate_output(&output.stdout, 2000),
-                truncate_output(&output.stderr, 2000),
+                output_for_error(&output.stdout),
+                output_for_error(&output.stderr),
             ))
         } else if output.exit_code == 0 {
-            Ok(if output.stdout.is_empty() {
-                "(no output)".to_string()
+            if output.stdout.is_empty() {
+                Ok("(no output)".to_string())
             } else {
-                truncate_output(&output.stdout, 4000)
-            })
+                full_output(&output.stdout, "stdout")
+            }
         } else {
             Err(format!(
                 "exit code {}\nstdout: {}\nstderr: {}",
                 output.exit_code,
-                truncate_output(&output.stdout, 2000),
-                truncate_output(&output.stderr, 2000),
+                output_for_error(&output.stdout),
+                output_for_error(&output.stderr),
             ))
         }
     }
@@ -397,21 +397,21 @@ impl CatalogActionExecutor {
         if output.timed_out {
             Err(format!(
                 "command timed out after {timeout_secs}s\nstdout: {}\nstderr: {}",
-                truncate_output(&output.stdout, 2000),
-                truncate_output(&output.stderr, 2000),
+                output_for_error(&output.stdout),
+                output_for_error(&output.stderr),
             ))
         } else if output.exit_code == 0 {
-            Ok(if output.stdout.is_empty() {
-                "(no output)".to_string()
+            if output.stdout.is_empty() {
+                Ok("(no output)".to_string())
             } else {
-                truncate_output(&output.stdout, 4000)
-            })
+                full_output(&output.stdout, "stdout")
+            }
         } else {
             Err(format!(
                 "exit code {}\nstdout: {}\nstderr: {}",
                 output.exit_code,
-                truncate_output(&output.stdout, 2000),
-                truncate_output(&output.stderr, 2000),
+                output_for_error(&output.stdout),
+                output_for_error(&output.stderr),
             ))
         }
     }
@@ -463,9 +463,9 @@ async fn execute_declarative_http(
                 .map_err(|e| format!("failed to read response body: {e}"))?;
 
             if status.is_success() {
-                Ok(truncate_output(&body, 8000))
+                full_output(&body, "HTTP response body")
             } else {
-                Err(format!("HTTP {status}: {}", truncate_output(&body, 2000)))
+                Err(format!("HTTP {status}: {}", output_for_error(&body)))
             }
         }
         // Shell tools are dispatched by CatalogActionExecutor before reaching
@@ -536,14 +536,6 @@ fn resolve_args_json(template: &str, args: &HashMap<String, String>) -> String {
     result
 }
 
-fn truncate_output(s: &str, max_chars: usize) -> String {
-    if s.len() <= max_chars {
-        s.to_string()
-    } else {
-        let end = s.floor_char_boundary(max_chars);
-        format!("{}...\n[truncated at {max_chars} chars]", &s[..end])
-    }
-}
 
 #[cfg(test)]
 mod tests {

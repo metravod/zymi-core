@@ -244,19 +244,19 @@ async fn execute_shell_command(
         // it may have written to stderr. Reporting "(no output)" in that case
         // discards the only output there was, and makes a talkative command
         // indistinguishable from a mute one.
-        Ok(if !stdout.is_empty() {
-            truncate_output(&stdout, 4000)
+        if !stdout.is_empty() {
+            full_output(&stdout, "stdout")
         } else if !stderr.is_empty() {
-            format!("(no stdout)\nstderr: {}", truncate_output(&stderr, 4000))
+            full_output(&stderr, "stderr").map(|e| format!("(no stdout)\nstderr: {e}"))
         } else {
-            "(no output)".to_string()
-        })
+            Ok("(no output)".to_string())
+        }
     } else {
         let code = output.status.code().unwrap_or(-1);
         Err(format!(
             "exit code {code}\nstdout: {}\nstderr: {}",
-            truncate_output(&stdout, 2000),
-            truncate_output(&stderr, 2000),
+            output_for_error(&stdout),
+            output_for_error(&stderr),
         ))
     }
 }
@@ -266,7 +266,7 @@ async fn read_file(path: &str, project_root: &Path) -> Result<String, String> {
     let content = tokio::fs::read_to_string(&full_path)
         .await
         .map_err(|e| format!("failed to read {}: {e}", full_path.display()))?;
-    Ok(truncate_output(&content, 8000))
+    full_output(&content, &format!("{path} ({} bytes)", content.len()))
 }
 
 async fn write_file(path: &str, content: &str, project_root: &Path) -> Result<String, String> {
@@ -282,12 +282,34 @@ async fn write_file(path: &str, content: &str, project_root: &Path) -> Result<St
     Ok(format!("Written {} bytes to {path}", content.len()))
 }
 
-fn truncate_output(s: &str, max_chars: usize) -> String {
-    if s.len() <= max_chars {
+/// Largest tool output handed on (ADR-0046). Below it the output goes into
+/// the event log and the model's context **whole**; above it the call fails.
+/// There is deliberately no middle ground: a cut-off prefix — even one
+/// marked `[truncated]` — gets the gaps filled in by the model. That is how
+/// a fleet report "covered" hosts it never saw.
+pub(crate) const MAX_TOOL_OUTPUT: usize = 1024 * 1024;
+
+/// `s` unchanged, or an error telling the caller to narrow the command.
+pub(crate) fn full_output(s: &str, what: &str) -> Result<String, String> {
+    if s.len() <= MAX_TOOL_OUTPUT {
+        Ok(s.to_string())
+    } else {
+        Err(format!(
+            "{what} is {:.1} MB — over the {} MB limit for one tool result. \
+             Narrow it (grep / head / tail / jq), or write it to a file and read the part you need",
+            s.len() as f64 / (1024.0 * 1024.0),
+            MAX_TOOL_OUTPUT / (1024 * 1024),
+        ))
+    }
+}
+
+/// For error messages, where the call has already failed: the whole stream,
+/// or a size note when it's oversized.
+pub(crate) fn output_for_error(s: &str) -> String {
+    if s.len() <= MAX_TOOL_OUTPUT {
         s.to_string()
     } else {
-        let end = s.floor_char_boundary(max_chars);
-        format!("{}...\n[truncated at {max_chars} chars]", &s[..end])
+        format!("({:.1} MB, omitted)", s.len() as f64 / (1024.0 * 1024.0))
     }
 }
 
@@ -457,16 +479,19 @@ mod tests {
     }
 
     #[test]
-    fn truncate_output_short() {
-        assert_eq!(truncate_output("hello", 100), "hello");
+    fn full_output_passes_large_output_whole() {
+        // Six KB of the fleet recon — cut at 4000 before ADR-0046.
+        let recon = "═".repeat(2000);
+        assert_eq!(full_output(&recon, "stdout").unwrap(), recon);
     }
 
     #[test]
-    fn truncate_output_long() {
-        let long = "a".repeat(100);
-        let result = truncate_output(&long, 50);
-        assert!(result.contains("[truncated"));
-        assert!(result.len() < 100);
+    fn full_output_refuses_instead_of_truncating() {
+        let huge = "a".repeat(MAX_TOOL_OUTPUT + 1);
+        let err = full_output(&huge, "stdout").unwrap_err();
+        assert!(err.contains("over the 1 MB limit"), "{err}");
+        assert!(err.contains("Narrow it"), "{err}");
+        assert!(output_for_error(&huge).contains("omitted"));
     }
 
     #[tokio::test]

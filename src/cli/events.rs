@@ -31,9 +31,29 @@ pub fn exec(
 
     match stream {
         Some(stream_id) => {
-            let events = rt
+            let mut events = rt
                 .block_on(store.read_stream(stream_id, 1))
                 .map_err(|e| format!("failed to read stream: {e}"))?;
+
+            // A run's tool calls and LLM calls live in per-step sub-streams
+            // (`<run>:step:<id>`, ADR-0016 §6). Showing only the parent hid
+            // exactly the events a failure investigation needs, so merge them
+            // in, in time order.
+            let step_prefix = format!("{stream_id}:step:");
+            let sub_streams: Vec<String> = rt
+                .block_on(store.list_streams())
+                .map_err(|e| format!("failed to list streams: {e}"))?
+                .into_iter()
+                .map(|(sid, _)| sid)
+                .filter(|sid| sid.starts_with(&step_prefix))
+                .collect();
+            for sid in &sub_streams {
+                events.extend(
+                    rt.block_on(store.read_stream(sid, 1))
+                        .map_err(|e| format!("failed to read stream {sid}: {e}"))?,
+                );
+            }
+            events.sort_by_key(|e| e.timestamp);
 
             let filtered: Vec<_> = events
                 .iter()
@@ -50,11 +70,16 @@ pub fn exec(
 
             if !raw {
                 println!(
-                    "{}Stream '{}'{}: {} event(s){}",
+                    "{}Stream '{}'{}: {} event(s){}{}",
                     BOLD,
                     stream_id,
                     RESET,
                     filtered.len(),
+                    if sub_streams.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" {DIM}(incl. {} step stream(s)){RESET}", sub_streams.len())
+                    },
                     if let Some(k) = kind {
                         format!(" {DIM}(filtered: {k}){RESET}")
                     } else {
@@ -68,7 +93,8 @@ pub fn exec(
                 if raw {
                     print_raw(event)?;
                 } else {
-                    print_rich(event, verbose);
+                    let step = event.stream_id.strip_prefix(&step_prefix);
+                    print_rich(event, verbose, step);
                 }
             }
         }
@@ -109,7 +135,7 @@ pub fn exec(
                 if raw {
                     print_raw(event)?;
                 } else {
-                    print_rich(event, verbose);
+                    print_rich(event, verbose, None);
                 }
             }
         }
@@ -124,15 +150,18 @@ fn print_raw(event: &Event) -> Result<(), String> {
     Ok(())
 }
 
-fn print_rich(event: &Event, verbose: bool) {
+/// `step`: the step id when the event comes from a `<run>:step:<id>`
+/// sub-stream, shown so merged step events stay attributable.
+fn print_rich(event: &Event, verbose: bool, step: Option<&str>) {
     let formatted = format_event(event);
     let pad = "  ".repeat(formatted.indent as usize);
     let color = formatted.color.ansi();
     let ts = event.timestamp.format("%H:%M:%S%.3f");
     let tag = event.kind_tag();
 
+    let step = step.map(|s| format!(" [{s}]")).unwrap_or_default();
     println!(
-        "{pad}{DIM}#{:<4} {ts}{RESET} {color}{BOLD}{tag}{RESET} {DIM}source={}{RESET}",
+        "{pad}{DIM}#{:<4} {ts}{RESET}{step} {color}{BOLD}{tag}{RESET} {DIM}source={}{RESET}",
         event.sequence, event.source,
     );
 
