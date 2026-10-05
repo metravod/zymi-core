@@ -345,6 +345,7 @@ pub async fn handle(rt: &Runtime, cmd: RunPipeline) -> Result<PipelineResult, St
                             correlation_id,
                             &project_root,
                             defaults.max_iterations,
+                            defaults.max_tokens,
                             approval_channel,
                             approval_timeout,
                             context_config,
@@ -612,6 +613,7 @@ async fn run_agent_step(
     correlation_id: Uuid,
     project_root: &std::path::Path,
     default_max_iterations: usize,
+    default_max_tokens: u32,
     approval_channel: Option<String>,
     approval_timeout: std::time::Duration,
     context_config: ContextConfig,
@@ -628,6 +630,7 @@ async fn run_agent_step(
     is_resume_reexec: bool,
 ) -> Result<StepResult, String> {
     let max_iterations = agent.max_iterations.unwrap_or(default_max_iterations);
+    let max_tokens = agent.max_tokens.unwrap_or(default_max_tokens);
     let tool_defs = tool_catalog.definitions_for_agent(&agent.tools);
 
     // Per-step sub-stream isolates this step's LLM/tool events from other
@@ -725,13 +728,30 @@ async fn run_agent_step(
             messages,
             tools: tool_defs.clone(),
             temperature: Some(0.7),
-            max_tokens: Some(4096),
+            max_tokens: Some(max_tokens),
         };
 
-        let response: ChatResponse = provider
-            .chat_completion(&request)
-            .await
-            .map_err(|e| format!("[{step_id}] LLM call failed: {e}"))?;
+        let call_started = Instant::now();
+        let response: ChatResponse = match provider.chat_completion(&request).await {
+            Ok(response) => response,
+            Err(e) => {
+                // ADR-0046: the failure is part of the record, not just the
+                // process's stderr — LlmCallStarted gets its terminal event.
+                emit_event(
+                    bus,
+                    &step_stream_id,
+                    correlation_id,
+                    EventKind::LlmCallFailed {
+                        iteration,
+                        error: e.to_string(),
+                        elapsed_ms: call_started.elapsed().as_millis() as u64,
+                    },
+                )
+                .await;
+                return Err(format!("[{step_id}] LLM call failed: {e}"));
+            }
+        };
+        let cut_off = response.finish_reason.as_deref() == Some("length");
 
         match &response.message {
             Message::Assistant {
@@ -751,9 +771,23 @@ async fn run_agent_step(
                         has_tool_calls,
                         usage: Some(response.usage.clone()),
                         content_preview: content.as_ref().map(|c| truncate(c, 100).to_string()),
+                        finish_reason: response.finish_reason.clone(),
                     },
                 )
                 .await;
+
+                // ADR-0046: an answer that hit max_tokens is cut off — its
+                // text (or tool-call JSON) is partial. Passing it on is how a
+                // report "ends" mid-word with the run marked ✓ ok. Fail loud;
+                // the partial answer stays in the LlmCallCompleted above.
+                if cut_off {
+                    return Err(format!(
+                        "[{step_id}] the model's answer hit max_tokens ({max_tokens}) and is cut off \
+                         (finish_reason=length; reasoning tokens count toward it). Raise \
+                         `max_tokens` in agents/{}.yml or `defaults.max_tokens` in project.yml",
+                        agent.name
+                    ));
+                }
 
                 if !has_tool_calls {
                     final_output = content.clone().unwrap_or_default();
@@ -790,7 +824,9 @@ async fn run_agent_step(
                         correlation_id,
                         EventKind::ToolCallRequested {
                             tool_name: tc.name.clone(),
-                            arguments: truncate(&tc.arguments, 200).to_string(),
+                            // Whole, not a 200-char preview: the journal is the
+                            // record of what the model asked for (ADR-0046).
+                            arguments: tc.arguments.clone(),
                             call_id: tc.id.clone(),
                         },
                     )
@@ -936,7 +972,7 @@ async fn run_tool_step(
         correlation_id,
         EventKind::ToolCallRequested {
             tool_name: tool_name.to_string(),
-            arguments: truncate(&args_json, 200).to_string(),
+            arguments: args_json.clone(),
             call_id: call_id.clone(),
         },
     )

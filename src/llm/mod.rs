@@ -50,6 +50,9 @@ pub struct ChatResponse {
     pub message: Message,
     pub usage: TokenUsage,
     pub model: String,
+    /// Provider's stop reason, normalised to OpenAI vocabulary (`stop`,
+    /// `length`, `tool_calls`, …). `None` when the provider didn't say.
+    pub finish_reason: Option<String>,
 }
 
 /// Unified interface for LLM providers.

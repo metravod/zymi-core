@@ -122,6 +122,8 @@ struct AnthResponse {
     model: String,
     content: Vec<ContentBlock>,
     usage: AnthUsage,
+    #[serde(default)]
+    stop_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -268,6 +270,13 @@ fn parse_response(resp: AnthResponse) -> Result<ChatResponse, LlmError> {
         message,
         usage,
         model: resp.model,
+        // Normalise to the OpenAI vocabulary the runtime checks.
+        finish_reason: resp.stop_reason.map(|r| match r.as_str() {
+            "max_tokens" => "length".to_string(),
+            "end_turn" | "stop_sequence" => "stop".to_string(),
+            "tool_use" => "tool_calls".to_string(),
+            _ => r,
+        }),
     })
 }
 

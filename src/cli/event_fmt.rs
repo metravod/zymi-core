@@ -90,6 +90,7 @@ pub fn indent_level(kind: &EventKind) -> u8 {
 
         EventKind::LlmCallStarted { .. }
         | EventKind::LlmCallCompleted { .. }
+        | EventKind::LlmCallFailed { .. }
         | EventKind::ToolCallRequested { .. }
         | EventKind::ToolCallCompleted { .. }
         | EventKind::ApprovalRequested { .. }
@@ -224,10 +225,27 @@ pub fn format_event(event: &Event) -> FormattedEvent {
                 indent,
             }
         }
+        EventKind::LlmCallFailed {
+            iteration,
+            error,
+            elapsed_ms,
+        } => FormattedEvent {
+            icon: "✗",
+            label: "LLM failed".into(),
+            short_detail: format!(
+                "iter={iteration} after {:.1}s: {}",
+                *elapsed_ms as f64 / 1000.0,
+                truncate(error, 80)
+            ),
+            full_detail: format!("iteration: {iteration}\nelapsed: {elapsed_ms} ms\nerror: {error}"),
+            color: EventColor::Failure,
+            indent,
+        },
         EventKind::LlmCallCompleted {
             has_tool_calls,
             usage,
             content_preview,
+            finish_reason,
             ..
         } => {
             let tokens = usage
@@ -237,7 +255,12 @@ pub fn format_event(event: &Event) -> FormattedEvent {
             let tools = if *has_tool_calls { " +tools" } else { "" };
             let preview = content_preview.as_deref().unwrap_or("");
             let short = format!("tokens={tokens}{tools} {}", truncate(preview, 60));
+            let cut = finish_reason.as_deref() == Some("length");
+            let short = if cut { format!("CUT AT max_tokens · {short}") } else { short };
             let mut full = format!("tokens: {tokens}\ntool_calls: {has_tool_calls}\n");
+            if let Some(reason) = finish_reason {
+                full.push_str(&format!("finish_reason: {reason}\n"));
+            }
             if !preview.is_empty() {
                 full.push_str(&format!("response: {preview}"));
             }
@@ -246,7 +269,7 @@ pub fn format_event(event: &Event) -> FormattedEvent {
                 label: "LLM done".into(),
                 short_detail: short,
                 full_detail: full,
-                color: EventColor::Success,
+                color: if cut { EventColor::Failure } else { EventColor::Success },
                 indent,
             }
         }

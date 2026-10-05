@@ -119,6 +119,19 @@ pub enum EventKind {
         has_tool_calls: bool,
         usage: Option<TokenUsage>,
         content_preview: Option<String>,
+        /// Why the model stopped (`stop`, `length`, `tool_calls`, …) when the
+        /// provider says. `length` means the answer hit `max_tokens` and is
+        /// cut off — the step fails on it (ADR-0046).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        finish_reason: Option<String>,
+    },
+    /// The provider call errored (unreachable, reset, HTTP error, bad
+    /// payload). Without it a failed call left `LlmCallStarted` with no
+    /// terminal event and the cause outside the log (ADR-0046).
+    LlmCallFailed {
+        iteration: usize,
+        error: String,
+        elapsed_ms: u64,
     },
 
     // -- Tool lifecycle --
@@ -391,6 +404,7 @@ impl EventKind {
             EventKind::AgentProcessingCompleted { .. } => "agent_processing_completed",
             EventKind::LlmCallStarted { .. } => "llm_call_started",
             EventKind::LlmCallCompleted { .. } => "llm_call_completed",
+            EventKind::LlmCallFailed { .. } => "llm_call_failed",
             EventKind::ToolCallRequested { .. } => "tool_call_requested",
             EventKind::ApprovalRequested { .. } => "approval_requested",
             EventKind::ApprovalGranted { .. } => "approval_granted",
@@ -643,6 +657,7 @@ mod tests {
             has_tool_calls: true,
             usage: None,
             content_preview: Some("I'll help.".into()),
+            finish_reason: None,
         };
         let json = serde_json::to_string(&kind).unwrap();
         let back: EventKind = serde_json::from_str(&json).unwrap();

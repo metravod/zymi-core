@@ -428,6 +428,7 @@ mod tests {
                     ..Default::default()
                 }),
                 content_preview: Some("hello world".into()),
+                finish_reason: None,
             },
             Some(corr),
         );
@@ -595,6 +596,7 @@ mod tests {
                     ..Default::default()
                 }),
                 content_preview: None,
+                finish_reason: None,
             },
             Some(corr),
         );
@@ -666,6 +668,7 @@ mod tests {
                     ..Default::default()
                 }),
                 content_preview: Some("Final answer".into()),
+                finish_reason: None,
             },
             Some(corr),
         );

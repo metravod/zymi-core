@@ -118,6 +118,7 @@ struct StreamAcc {
     saw_content: bool,
     tool_calls: Vec<OaiToolCall>,
     usage: Option<OaiUsage>,
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -136,6 +137,8 @@ struct OaiChunk {
 struct OaiChunkChoice {
     #[serde(default)]
     delta: Option<OaiDelta>,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -192,6 +195,9 @@ impl StreamAcc {
             self.usage = chunk.usage;
         }
         for choice in chunk.choices {
+            if choice.finish_reason.is_some() {
+                self.finish_reason = choice.finish_reason;
+            }
             let Some(delta) = choice.delta else { continue };
             if let Some(text) = delta.content {
                 self.saw_content = true;
@@ -236,6 +242,7 @@ impl StreamAcc {
                     tool_calls: (!self.tool_calls.is_empty()).then_some(self.tool_calls),
                     tool_call_id: None,
                 },
+                finish_reason: self.finish_reason,
             }],
             usage: self.usage,
         }
@@ -312,6 +319,8 @@ struct OaiResponse {
 #[derive(Debug, Deserialize)]
 struct OaiChoice {
     message: OaiMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -456,6 +465,7 @@ fn parse_response(resp: OaiResponse) -> Result<ChatResponse, LlmError> {
         .next()
         .ok_or_else(|| LlmError::Serialization("empty choices array".into()))?;
 
+    let finish_reason = choice.finish_reason;
     let tool_calls = choice
         .message
         .tool_calls
@@ -491,6 +501,7 @@ fn parse_response(resp: OaiResponse) -> Result<ChatResponse, LlmError> {
         message,
         usage,
         model: resp.model,
+        finish_reason,
     })
 }
 

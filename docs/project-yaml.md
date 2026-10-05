@@ -28,6 +28,7 @@ variables:
 defaults:
   timeout_secs: 30            # default 30
   max_iterations: 10          # default 10
+  max_tokens: 4096            # default 4096 — cap on one model answer; agents override
 
 # --- Shell + tool-call policy ---------------------------------------------
 policy:

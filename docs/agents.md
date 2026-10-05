@@ -19,6 +19,7 @@ tools:                      # optional. List of tool names callable by this agen
   - get_weather
   - mcp__fs__read_text_file
 max_iterations: 10          # optional. Defaults to project.yml `defaults.max_iterations` (10).
+max_tokens: 8000            # optional. Defaults to project.yml `defaults.max_tokens` (4096).
 timeout_secs: 60            # optional. Defaults to project.yml `defaults.timeout_secs` (30).
 policy:                     # optional. Per-agent shell allow/deny override.
   enabled: true
@@ -36,6 +37,7 @@ policy:                     # optional. Per-agent shell allow/deny override.
 | `system_prompt` | no | empty | Strongly recommended — sets behaviour |
 | `tools` | no | `[]` | Tool names from any of the four catalogues (declarative, Python, MCP, builtin) |
 | `max_iterations` | no | `defaults.max_iterations` (10) | Caps the ReAct loop |
+| `max_tokens` | no | `defaults.max_tokens` (4096) | Cap on one model answer. Reasoning tokens count toward it. An answer that hits it (`finish_reason=length`) **fails the step** rather than passing on cut-off text (ADR-0046) — raise it for long reports or reasoning models |
 | `timeout_secs` | no | `defaults.timeout_secs` (30) | Per-call LLM timeout |
 | `policy` | no | inherits project | Tightens shell allow/deny only |
 
